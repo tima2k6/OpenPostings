@@ -59,7 +59,10 @@ watch_paths_for() {
   case "$target" in
     server) candidates=(server package.json) ;;
     mcp)    candidates=(server/mcp-apply-server.js package.json) ;;
-    web)    candidates=(App.js src app.json babel.config.js metro.config.js package.json) ;;
+    # Metro watches App.js and src/ and rebuilds them on the fly, so only config
+    # and dependency changes actually require restarting the bundler. (Watch mode
+    # depends on CI being unset for this unit — see 20-hot-reload.conf.)
+    web)    candidates=(app.json babel.config.js metro.config.js package.json) ;;
   esac
   local p
   for p in "${candidates[@]}"; do
@@ -237,15 +240,6 @@ if [[ ${#targets[@]} -eq 0 ]]; then
   fi
 fi
 
-# The web bundler hot-reloads JS, so a restart is usually unnecessary noise.
-if [[ " ${targets[*]} " == *" web "* ]] && (( ${#REQUESTED[@]} == 0 )); then
-  warn "web: Metro hot-reloads JS changes, so a restart is usually unnecessary."
-  warn "     Skipping it. Run 'scripts/apply.sh web' if you changed config or deps."
-  filtered=()
-  for t in "${targets[@]}"; do [[ "$t" != web ]] && filtered+=("$t"); done
-  targets=("${filtered[@]}")
-  [[ ${#targets[@]} -eq 0 ]] && { ok "Nothing else to restart."; exit 0; }
-fi
 
 if (( VERIFY )); then
   info ""
