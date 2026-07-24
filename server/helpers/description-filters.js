@@ -617,22 +617,20 @@ function buildWordNgrams(words, minSize = 2, maxSize = 3) {
 function hasStateLikeMatch(locationText, stateCode) {
   const code = String(stateCode || "").trim().toUpperCase();
   if (!code) return false;
-
   const upperLocation = String(locationText || "").toUpperCase();
   const codeRegex = new RegExp(`(^|[^A-Z])${escapeRegExp(code)}([^A-Z]|$)`);
   if (codeRegex.test(upperLocation)) return true;
-
   const stateName = STATE_CODE_TO_NAME[code];
   if (!stateName) return false;
   const normalizedGeoLocation = normalizeGeoText(locationText);
   if (!containsGeoPhrase(normalizedGeoLocation, stateName)) return false;
-
   if (code === "WA") {
     if (containsGeoPhrase(normalizedGeoLocation, STATE_CODE_TO_NAME.DC)) return false;
     if (containsGeoPhrase(normalizedGeoLocation, "washington dc")) return false;
     if (containsGeoPhrase(normalizedGeoLocation, "washington d c")) return false;
+    // Catches fused/slug variants: "washington dcmetro area", "washington-dc", "washingtondc"
+    if (/\bwashington\s*[- ]?\s*dc/i.test(normalizedGeoLocation)) return false;
   }
-
   return true;
 }
 

@@ -815,7 +815,16 @@ function hasStateLikeMatch(locationText, stateCode) {
 
   const stateName = STATE_CODE_TO_NAME[code];
   if (!stateName) return false;
-  return normalizeLikeText(locationText).includes(stateName);
+
+  const normalizedLocation = normalizeLikeText(locationText);
+  if (!normalizedLocation.includes(stateName)) return false;
+
+  if (code === "WA") {
+    if (normalizedLocation.includes(STATE_CODE_TO_NAME.DC)) return false;
+    if (/\bwashington\s*[- ]?\s*dc/i.test(normalizedLocation)) return false;
+  }
+
+  return true;
 }
 
 function rowMatchesLocationFilters(locationText, selectedStateCodes, countyFilters) {
