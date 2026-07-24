@@ -624,7 +624,16 @@ function hasStateLikeMatch(locationText, stateCode) {
 
   const stateName = STATE_CODE_TO_NAME[code];
   if (!stateName) return false;
-  return normalizeLikeText(locationText).includes(stateName);
+  const normalizedGeoLocation = normalizeGeoText(locationText);
+  if (!containsGeoPhrase(normalizedGeoLocation, stateName)) return false;
+
+  if (code === "WA") {
+    if (containsGeoPhrase(normalizedGeoLocation, STATE_CODE_TO_NAME.DC)) return false;
+    if (containsGeoPhrase(normalizedGeoLocation, "washington dc")) return false;
+    if (containsGeoPhrase(normalizedGeoLocation, "washington d c")) return false;
+  }
+
+  return true;
 }
 
 function classifyLocationWorkMode(locationText) {
@@ -654,16 +663,6 @@ function isWeakPhraseNgram(ngram, phraseNgramIndustryCoverage) {
   return industryCoverage >= PHRASE_NGRAM_INDUSTRY_COVERAGE_THRESHOLD;
 }
 
-
-
-
-function normalizeCompensationPayPeriod(value) {
-  const normalized = String(value || "").trim().toLowerCase();
-  if (normalized === "hour" || normalized === "week" || normalized === "month" || normalized === "year") {
-    return normalized;
-  }
-  return null;
-}
 
 
 
