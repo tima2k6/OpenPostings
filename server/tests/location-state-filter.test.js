@@ -74,6 +74,30 @@ function run() {
     "VA filter should still match plain Virginia locations"
   );
 
+  assert.equal(
+    rowMatchesLocationFilters("Fort Washington, PA, United States", ["WA"], [], [], []),
+    false,
+    "WA filter should not match Fort Washington, PA"
+  );
+
+  assert.equal(
+    rowMatchesLocationFilters("Fort Washington, MD, United States", ["WA"], [], [], []),
+    false,
+    "WA filter should not match Fort Washington, MD"
+  );
+
+  assert.equal(
+    rowMatchesLocationFilters("New Washington, OH, United States", ["WA"], [], [], []),
+    false,
+    "WA filter should not match New Washington, OH"
+  );
+
+  assert.equal(
+    rowMatchesLocationFilters("Fort Washington, PA, United States", ["PA"], [], [], []),
+    true,
+    "PA filter should still match Fort Washington, PA"
+  );
+
   console.log("location-state-filter tests passed");
 }
 

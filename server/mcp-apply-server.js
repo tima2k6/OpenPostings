@@ -192,20 +192,6 @@ const STATE_CODE_TO_NAME = {
   DC: "district of columbia"
 };
 
-const STATE_NAME_SUFFIX_CONFLICTS = buildStateNameSuffixConflicts();
-
-function buildStateNameSuffixConflicts() {
-  const names = Array.from(new Set(Object.values(STATE_CODE_TO_NAME)));
-  const conflicts = new Map();
-  for (const shortName of names) {
-    const longerNames = names.filter(
-      (longName) => longName !== shortName && longName.endsWith(` ${shortName}`)
-    );
-    if (longerNames.length > 0) conflicts.set(shortName, longerNames);
-  }
-  return conflicts;
-}
-
 function splitLocationIntoSegments(locationText) {
   return String(locationText || "")
     .split(/[,/|;]+|\s+-\s+/)
@@ -841,6 +827,14 @@ function hasBareStateCodeSegmentMatch(locationText, code) {
   return false;
 }
 
+// Only treats a state name (e.g. "washington") as a match when it's the entire content of a
+// comma/dash-separated segment, e.g. "Seattle, Washington" — not when it's merely one word inside
+// a longer place name segment like "Fort Washington" or "West Virginia".
+function hasStateNameSegmentMatch(locationText, stateName) {
+  const segments = splitLocationIntoSegments(locationText);
+  return segments.some((segment) => normalizeLikeText(segment) === stateName);
+}
+
 function hasStateLikeMatch(locationText, stateCode) {
   const code = String(stateCode || "").trim().toUpperCase();
   if (!code) return false;
@@ -850,14 +844,9 @@ function hasStateLikeMatch(locationText, stateCode) {
   const stateName = STATE_CODE_TO_NAME[code];
   if (!stateName) return false;
 
+  if (!hasStateNameSegmentMatch(locationText, stateName)) return false;
+
   const normalizedLocation = normalizeLikeText(locationText);
-  if (!normalizedLocation.includes(stateName)) return false;
-
-  const conflictingLongerNames = STATE_NAME_SUFFIX_CONFLICTS.get(stateName) || [];
-  for (const longerName of conflictingLongerNames) {
-    if (normalizedLocation.includes(longerName)) return false;
-  }
-
   if (code === "WA") {
     if (normalizedLocation.includes(STATE_CODE_TO_NAME.DC)) return false;
     if (/\bwashington\s*[- ]?\s*dc/i.test(normalizedLocation)) return false;
