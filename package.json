@@ -49,5 +49,9 @@
       "namespace": "openpostings",
       "template": "cpp-app"
     }
+  },
+  "allowScripts": {
+    "sqlite3@6.0.1": true,
+    "nodejs-mobile-react-native": false
   }
 }
