@@ -954,6 +954,19 @@ async function runAtsSyncInternal() {
         message: `post-sync prunePostingsOutsideDateWindow failed: ${String(error?.message || error)}`
       });
     }
+    try {
+      const activeJobPostingUrls = await getActiveJobPostingUrls();
+      for (const jobPostingUrl of nextPostingLocationByJobUrl.keys()) {
+        if (!activeJobPostingUrls.has(jobPostingUrl)) {
+          nextPostingLocationByJobUrl.delete(jobPostingUrl);
+        }
+      }
+    } catch (error) {
+      errors.push({
+        company_name: "__system__",
+        message: `pruning postingLocationByJobUrl cache failed: ${String(error?.message || error)}`
+      });
+    }
     setPostingLocationByJobUrl(nextPostingLocationByJobUrl);
     let syncScopeStats = {
       sync_enabled_company_count: 0,
@@ -1170,6 +1183,14 @@ async function prunePostingsOutsideDateWindow(referenceEpoch = nowEpochSeconds()
   }
 
   return totalHidden;
+}
+
+async function getActiveJobPostingUrls() {
+  const db = getDb();
+  const rows = await db.all(
+    `SELECT job_posting_url FROM Postings WHERE COALESCE(hidden, 0) = 0;`
+  );
+  return new Set(rows.map((row) => String(row?.job_posting_url || "")));
 }
 
 function isRecoverablePostingStorageError(error) {
