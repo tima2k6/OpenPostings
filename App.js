@@ -27,10 +27,12 @@ import {
   fetchBlockedCompanies,
   fetchMcpCandidates,
   fetchMcpSettings,
+  fetchCodeStatus,
   fetchPostingFilterOptions,
   fetchPersonalInformation,
   fetchPostings,
   fetchSettingsExport,
+  restartServer,
   postFrontendLog,
   fetchSyncServiceSettings,
   fetchSyncStatus,
@@ -1378,6 +1380,10 @@ export default function App() {
   const [syncServiceSettingsLoading, setSyncServiceSettingsLoading] = useState(false);
   const [syncServiceSettingsSaving, setSyncServiceSettingsSaving] = useState(false);
   const [syncSettingsNotice, setSyncSettingsNotice] = useState("");
+  const [codeStatus, setCodeStatus] = useState(null);
+  const [restartingServer, setRestartingServer] = useState(false);
+  const [restartNotice, setRestartNotice] = useState("");
+  const [restartConfirmArmed, setRestartConfirmArmed] = useState(false);
   const [exportSettingsRunning, setExportSettingsRunning] = useState(false);
   const [migrationSourceDbPath, setMigrationSourceDbPath] = useState("");
   const [migrationSelection, setMigrationSelection] = useState({
@@ -1836,6 +1842,71 @@ export default function App() {
       setSyncing(false);
     }
   }, [loadStatus]);
+
+  const loadCodeStatus = useCallback(async () => {
+    try {
+      setCodeStatus(await fetchCodeStatus());
+    } catch {
+      // Older backends have no /system/code-status; treat that as "nothing to report".
+      setCodeStatus(null);
+    }
+  }, []);
+
+  const handleRestartServer = useCallback(async () => {
+    const syncRunning = Boolean(status?.running);
+    if (syncRunning && !restartConfirmArmed) {
+      setRestartConfirmArmed(true);
+      setRestartNotice("A sync is in progress. Restarting aborts it — press again to confirm.");
+      return;
+    }
+
+    setRestartConfirmArmed(false);
+    setRestartingServer(true);
+    setRestartNotice("Restarting server...");
+
+    try {
+      await restartServer();
+    } catch (e) {
+      // The backend refuses up front if the changed files don't compile, so surface
+      // that instead of leaving the user waiting for a server that never went down.
+      const raw = String(e?.message || e);
+      let detail = raw;
+      const jsonStart = raw.indexOf("{");
+      if (jsonStart >= 0) {
+        try {
+          const parsed = JSON.parse(raw.slice(jsonStart));
+          detail = parsed?.error || raw;
+          if (Array.isArray(parsed?.failures) && parsed.failures.length > 0) {
+            detail += ` (${parsed.failures.map((f) => f.file).join(", ")})`;
+          }
+        } catch {
+          // Not JSON after all; the raw message is the best available detail.
+        }
+      }
+      setRestartingServer(false);
+      setRestartNotice(`Restart failed: ${detail}`);
+      return;
+    }
+
+    // The process exits a moment after replying, so poll until it answers again.
+    const deadline = Date.now() + 90000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      try {
+        const nextCodeStatus = await fetchCodeStatus();
+        setCodeStatus(nextCodeStatus);
+        setRestartingServer(false);
+        setRestartNotice("Server restarted. Running the latest code.");
+        await loadStatus();
+        return;
+      } catch {
+        // Still down; keep waiting until the deadline.
+      }
+    }
+
+    setRestartingServer(false);
+    setRestartNotice("Server did not come back within 90s. Check the service logs.");
+  }, [status, restartConfirmArmed, loadStatus]);
 
   const handleSaveApplicanteeInformation = useCallback(async () => {
     setError("");
@@ -2640,6 +2711,11 @@ export default function App() {
     loadPostingFilterOptions();
   }, [effectiveActivePage, loadStatus, loadSyncServiceSettings, loadPostingFilterOptions]);
 
+  useEffect(() => {
+    if (effectiveActivePage !== PAGE_KEYS.SETTINGS_SYNC) return;
+    loadCodeStatus();
+  }, [effectiveActivePage, loadCodeStatus]);
+
   const renderPostingsPage = () => (
     <>
       <View style={styles.controls}>
@@ -2996,6 +3072,36 @@ export default function App() {
         <Text style={styles.settingsDescription}>
           Configure automatic posting sync timing. Wi-Fi-only gating applies only on Android.
         </Text>
+
+        {codeStatus?.restart_supported ? (
+          <View style={styles.formGroup}>
+            <Text style={styles.fieldLabel}>Server code</Text>
+            <Text style={styles.settingsInlineHint}>
+              {codeStatus.restart_required
+                ? `${codeStatus.changed_files.length} file(s) changed since the server started. Restart to apply them.`
+                : "The server is running the latest code on disk."}
+            </Text>
+            {codeStatus.restart_required && codeStatus.changed_files.length > 0 ? (
+              <Text style={styles.settingsInlineHint}>{codeStatus.changed_files.join(", ")}</Text>
+            ) : null}
+            <Pressable
+              onPress={handleRestartServer}
+              disabled={restartingServer}
+              style={[styles.settingsSaveButton, restartingServer ? styles.settingsSaveButtonDisabled : null]}
+            >
+              <Text style={styles.settingsSaveButtonText}>
+                {restartingServer
+                  ? "Restarting..."
+                  : restartConfirmArmed
+                    ? "Confirm restart (aborts sync)"
+                    : codeStatus.restart_required
+                      ? "Apply code changes & restart"
+                      : "Restart server"}
+              </Text>
+            </Pressable>
+            {restartNotice ? <Text style={styles.settingsInlineHint}>{restartNotice}</Text> : null}
+          </View>
+        ) : null}
 
         {failedCompaniesByAtsList.length > 0 ? (
           <View style={styles.formGroup}>

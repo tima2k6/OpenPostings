@@ -872,7 +872,80 @@ async function buildSettingsExportPayload(options = {}) {
   return payload;
 }
 
+// Recorded once at load so we can tell which source files were edited after this
+// process read them — those edits are only live after a restart.
+const PROCESS_START_MS = Date.now();
+const REPO_ROOT_PATH = path.join(__dirname, "..");
+const CODE_SCAN_SKIP_DIRECTORIES = new Set(["node_modules", ".git", "tests"]);
+// The MCP apply agent is a standalone stdio server, so its edits never require
+// restarting this process.
+const CODE_SCAN_SKIP_FILES = new Set(["mcp-apply-server.js"]);
 
+function listPendingCodeChanges() {
+  const changed = [];
+
+  const walk = (directory) => {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        if (CODE_SCAN_SKIP_DIRECTORIES.has(entry.name)) continue;
+        walk(fullPath);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.endsWith(".js")) continue;
+      if (CODE_SCAN_SKIP_FILES.has(entry.name)) continue;
+      try {
+        if (fs.statSync(fullPath).mtimeMs > PROCESS_START_MS) {
+          changed.push(path.relative(REPO_ROOT_PATH, fullPath));
+        }
+      } catch {
+        // Unreadable file: nothing useful to report, so leave it out.
+      }
+    }
+  };
+
+  walk(__dirname);
+  return changed.sort();
+}
+
+// Restarting into code that does not parse would leave systemd crash-looping the
+// service, taking the UI down with it, so every pending edit is checked first.
+function checkPendingCodeSyntax(relativeFilePaths) {
+  return Promise.all(
+    relativeFilePaths.map(
+      (relativeFilePath) =>
+        new Promise((resolve) => {
+          execFile(
+            process.execPath,
+            ["--check", path.join(REPO_ROOT_PATH, relativeFilePath)],
+            { timeout: 20000 },
+            (error, _stdout, stderr) => {
+              resolve({
+                file: relativeFilePath,
+                ok: !error,
+                message: error ? String(stderr || error.message || error).trim().slice(0, 2000) : ""
+              });
+            }
+          );
+        })
+    )
+  );
+}
+
+// systemd sets INVOCATION_ID for units it manages. Without it nothing would
+// bring the process back after it exits, so a restart request must be refused.
+function isManagedBySystemd() {
+  return Boolean(String(process.env.INVOCATION_ID || "").trim());
+}
+
+let restartInProgress = false;
 
 function createServer() {
   const app = express();
@@ -1051,6 +1124,56 @@ function createServer() {
       });
       return res.status(200).json(fallbackPayload);
     }
+  });
+
+  app.get("/system/code-status", (_req, res) => {
+    const changedFiles = listPendingCodeChanges();
+    return res.json(
+      sanitizeFrontendValue({
+        restart_required: changedFiles.length > 0,
+        changed_files: changedFiles,
+        restart_supported: isManagedBySystemd(),
+        process_started_at: new Date(PROCESS_START_MS).toISOString(),
+        uptime_seconds: Math.round(process.uptime())
+      })
+    );
+  });
+
+  // Exits the process so systemd's Restart=always starts it again on the new
+  // code. Deliberately takes no request parameters: there is nothing a caller
+  // can supply that reaches a shell or selects a different unit.
+  app.post("/system/restart", async (_req, res) => {
+    if (!isManagedBySystemd()) {
+      return res.status(503).json({
+        error:
+          "This server is not running under systemd, so it cannot restart itself. Restart it however it was started."
+      });
+    }
+
+    if (restartInProgress) {
+      return res.status(409).json({ error: "A restart is already in progress." });
+    }
+
+    const changedFiles = listPendingCodeChanges();
+    const syntaxResults = await checkPendingCodeSyntax(changedFiles);
+    const failures = syntaxResults.filter((result) => !result.ok);
+    if (failures.length > 0) {
+      return res.status(422).json(
+        sanitizeFrontendValue({
+          error: "Refusing to restart: some changed files do not compile.",
+          failures
+        })
+      );
+    }
+
+    restartInProgress = true;
+    res.status(202).json(sanitizeFrontendValue({ restarting: true, changed_files: changedFiles }));
+
+    // Give the response time to flush before dropping the process.
+    setTimeout(() => {
+      console.log("[OpenPostings API] restart requested via /system/restart; exiting for systemd");
+      process.exit(0);
+    }, 300);
   });
 
   app.post("/sync/workday", handleSyncRequest);

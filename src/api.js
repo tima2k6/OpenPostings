@@ -195,6 +195,14 @@ export function triggerWorkdaySync(wait = false) {
   return triggerAtsSync(wait);
 }
 
+export function fetchCodeStatus() {
+  return request(`/system/code-status?_ts=${Date.now()}`);
+}
+
+export function restartServer() {
+  return request("/system/restart", { method: "POST" });
+}
+
 export function fetchPersonalInformation() {
   return request("/settings/personal-information");
 }
