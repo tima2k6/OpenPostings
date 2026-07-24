@@ -45,6 +45,11 @@ import {
   unblockCompany,
   updateApplicationStatus
 } from "./src/api";
+import {
+  DEFAULT_POSTINGS_FILTERS,
+  loadPersistedFilters,
+  savePersistedFilters
+} from "./src/filter-storage";
 
 const PAGE_KEYS = {
   POSTINGS: "postings",
@@ -1328,16 +1333,11 @@ export default function App() {
   const [activePage, setActivePage] = useState(PAGE_KEYS.POSTINGS);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [search, setSearch] = useState("");
-  const [postingsFilters, setPostingsFilters] = useState({
-    ats: "all",
-    industries: [],
-    regions: [],
-    countries: [],
-    states: [],
-    counties: [],
-    remote: ["all"],
-    hide_no_date: false
-  });
+  const [postingsFilters, setPostingsFilters] = useState(() => ({ ...DEFAULT_POSTINGS_FILTERS }));
+  // Filters and the search term are restored from device storage on mount. The
+  // first fetch waits for this so it isn't issued with defaults and immediately
+  // repeated with the restored values.
+  const [filtersHydrated, setFiltersHydrated] = useState(false);
   const [postingFilterOptions, setPostingFilterOptions] = useState({
     ats: DEFAULT_ATS_FILTER_OPTIONS,
     industries: [],
@@ -2590,6 +2590,38 @@ export default function App() {
   }, [flushFrontendLogs]);
 
   useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      const persisted = await loadPersistedFilters();
+      if (cancelled) return;
+      if (persisted) {
+        setPostingsFilters(persisted.filters);
+        setSearch(persisted.search);
+        // Keep the refs in step immediately: the bootstrap fetch below reads them
+        // directly and would otherwise race the effects that sync them.
+        postingsFiltersRef.current = persisted.filters;
+        searchRef.current = persisted.search;
+      }
+      setFiltersHydrated(true);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!filtersHydrated) return undefined;
+    const timer = setTimeout(() => {
+      savePersistedFilters(postingsFilters, search);
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [filtersHydrated, postingsFilters, search]);
+
+  useEffect(() => {
+    if (!filtersHydrated) return;
+
     const bootstrap = async () => {
       setInitializing(true);
       setError("");
@@ -2616,6 +2648,7 @@ export default function App() {
 
     bootstrap();
   }, [
+    filtersHydrated,
     loadPostings,
     loadStatus,
     loadPersonalInformation,
@@ -2627,11 +2660,12 @@ export default function App() {
   ]);
 
   useEffect(() => {
+    if (!filtersHydrated) return undefined;
     const timer = setTimeout(() => {
       loadPostings(search, { filters: postingsFilters });
     }, 1800);
     return () => clearTimeout(timer);
-  }, [search, postingsFilters, loadPostings]);
+  }, [filtersHydrated, search, postingsFilters, loadPostings]);
 
   useEffect(() => {
     if (!syncSettings.autoSyncEnabled) return undefined;
