@@ -83,9 +83,11 @@ stale_file_for() {
   start_epoch="$(unit_start_epoch "$target")" || return 1
   [[ -z "$start_epoch" ]] && return 1
 
-  # The MCP server is standalone; changes to the rest of server/ don't affect it,
-  # and its own file shouldn't force an API-server restart.
-  [[ "$target" == server ]] && prune=(-not -name mcp-apply-server.js)
+  # The MCP server is standalone, so its file shouldn't force an API-server
+  # restart. Test files are never loaded by the running server either, so editing
+  # one is not a reason to restart it — this also keeps the report consistent with
+  # /system/code-status, which skips tests for the same reason.
+  [[ "$target" == server ]] && prune=(-not -name mcp-apply-server.js -not -path '*/tests/*')
 
   mapfile -t paths < <(watch_paths_for "$target")
   [[ ${#paths[@]} -eq 0 ]] && return 1
