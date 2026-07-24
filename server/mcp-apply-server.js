@@ -192,6 +192,27 @@ const STATE_CODE_TO_NAME = {
   DC: "district of columbia"
 };
 
+const STATE_NAME_SUFFIX_CONFLICTS = buildStateNameSuffixConflicts();
+
+function buildStateNameSuffixConflicts() {
+  const names = Array.from(new Set(Object.values(STATE_CODE_TO_NAME)));
+  const conflicts = new Map();
+  for (const shortName of names) {
+    const longerNames = names.filter(
+      (longName) => longName !== shortName && longName.endsWith(` ${shortName}`)
+    );
+    if (longerNames.length > 0) conflicts.set(shortName, longerNames);
+  }
+  return conflicts;
+}
+
+function splitLocationIntoSegments(locationText) {
+  return String(locationText || "")
+    .split(/[,/|;]+|\s+-\s+/)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+}
+
 const MCP_SETTINGS_DEFAULTS = {
   enabled: false,
   preferred_agent_name: "OpenPostings Agent",
@@ -805,19 +826,37 @@ function buildWordNgrams(words, minSize = 2, maxSize = 3) {
   return ngrams;
 }
 
+function hasBareStateCodeSegmentMatch(locationText, code) {
+  const segments = splitLocationIntoSegments(locationText).map((segment) => segment.toUpperCase());
+  for (const segment of segments) {
+    const words = segment.split(/\s+/).filter(Boolean);
+    if (words.length === 0) continue;
+    if (words[0] === code) return true;
+    const lastWord = words[words.length - 1];
+    if (lastWord === code) return true;
+    if (words.length >= 2 && words[words.length - 2] === code && /^\d{5}(-\d{4})?$/.test(lastWord)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function hasStateLikeMatch(locationText, stateCode) {
   const code = String(stateCode || "").trim().toUpperCase();
   if (!code) return false;
 
-  const upperLocation = String(locationText || "").toUpperCase();
-  const codeRegex = new RegExp(`(^|[^A-Z])${code}([^A-Z]|$)`);
-  if (codeRegex.test(upperLocation)) return true;
+  if (hasBareStateCodeSegmentMatch(locationText, code)) return true;
 
   const stateName = STATE_CODE_TO_NAME[code];
   if (!stateName) return false;
 
   const normalizedLocation = normalizeLikeText(locationText);
   if (!normalizedLocation.includes(stateName)) return false;
+
+  const conflictingLongerNames = STATE_NAME_SUFFIX_CONFLICTS.get(stateName) || [];
+  for (const longerName of conflictingLongerNames) {
+    if (normalizedLocation.includes(longerName)) return false;
+  }
 
   if (code === "WA") {
     if (normalizedLocation.includes(STATE_CODE_TO_NAME.DC)) return false;

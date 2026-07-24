@@ -1,4 +1,4 @@
-const { normalizeStringArray, normalizeLikeText, normalizeGeoText, escapeRegExp } = require("../helpers/normalize-strings")
+const { normalizeStringArray, normalizeLikeText, normalizeGeoText } = require("../helpers/normalize-strings")
 const { getDb, setDb } = require("../services/runtime-context")
 const COMPENSATION_TYPES = Object.freeze(["hourly", "salary", "both", "unknown"]);
 const COMPENSATION_TYPE_LABEL_BY_VALUE = Object.freeze({
@@ -161,6 +161,7 @@ const STATE_CODE_TO_NAME = {
   DC: "district of columbia"
 };
 const US_STATE_NAMES = new Set(Object.values(STATE_CODE_TO_NAME).map((name) => normalizeGeoText(name)));
+const STATE_NAME_SUFFIX_CONFLICTS = buildStateNameSuffixConflicts();
 const LOCATION_REGION_VALUES = new Set(LOCATION_REGION_OPTIONS.map((option) => option.value));
 const LOCATION_NON_COUNTRY_TERMS = new Set([
   "remote",
@@ -440,6 +441,13 @@ let phraseNgramIndustryCoverageCache = null;
 
 
 
+function splitLocationIntoCountryCandidateSegments(locationText) {
+  return String(locationText || "")
+    .split(/[,/|;]+|\s+-\s+/)
+    .map((segment) => String(segment || "").trim())
+    .filter(Boolean);
+}
+
 function inferLocationGeo(locationText) {
   const location = String(locationText || "").trim();
   if (!location) {
@@ -476,14 +484,6 @@ function inferLocationGeoUncached(locationText) {
       region: ""
     };
   }
-
-function splitLocationIntoCountryCandidateSegments(locationText) {
-  return String(locationText || "")
-    .split(/[,/|;]+|\s+-\s+/)
-    .map((segment) => String(segment || "").trim())
-    .filter(Boolean);
-}
-
 
 function toTitleCaseWords(value) {
   const source = normalizeGeoText(value);
@@ -614,16 +614,63 @@ function buildWordNgrams(words, minSize = 2, maxSize = 3) {
 }
 
 
+function buildStateNameSuffixConflicts() {
+  const names = Array.from(new Set(Object.values(STATE_CODE_TO_NAME)));
+  const conflicts = new Map();
+  for (const shortName of names) {
+    const longerNames = names.filter(
+      (longName) => longName !== shortName && longName.endsWith(` ${shortName}`)
+    );
+    if (longerNames.length > 0) conflicts.set(shortName, longerNames);
+  }
+  return conflicts;
+}
+
+// Only treats a bare code (e.g. "OR", "IN", "ME") as a state-code match when it stands alone
+// as a leading/trailing token of a comma/dash-separated segment (optionally with a trailing zip),
+// e.g. "Portland, OR" or "OR 97201" — not when it's just an English word inside a longer phrase
+// like "Chicago, IL or Remote" or "based in USA".
+function hasBareStateCodeSegmentMatch(locationText, code) {
+  const segments = splitLocationIntoCountryCandidateSegments(locationText).map((segment) =>
+    segment.toUpperCase()
+  );
+  for (const segment of segments) {
+    const words = segment.split(/\s+/).filter(Boolean);
+    if (words.length === 0) continue;
+    if (words[0] === code) return true;
+    const lastWord = words[words.length - 1];
+    if (lastWord === code) return true;
+    if (words.length >= 2 && words[words.length - 2] === code && /^\d{5}(-\d{4})?$/.test(lastWord)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function hasStateLikeMatch(locationText, stateCode) {
   const code = String(stateCode || "").trim().toUpperCase();
   if (!code) return false;
-  const upperLocation = String(locationText || "").toUpperCase();
-  const codeRegex = new RegExp(`(^|[^A-Z])${escapeRegExp(code)}([^A-Z]|$)`);
-  if (codeRegex.test(upperLocation)) return true;
+  const normalizedGeoLocation = normalizeGeoText(locationText);
+
+  if (hasBareStateCodeSegmentMatch(locationText, code)) {
+    // Guard against state-code / country-code collisions (e.g. IN/India, LA/Laos, IL/Israel,
+    // MT/Malta, ME/Montenegro) when the full country name is also explicitly present.
+    const inferredGeo = COUNTRY_BY_CODE.has(code) ? inferLocationGeo(locationText) : null;
+    const isActuallyThatCountry = Boolean(inferredGeo?.countryCode) && inferredGeo.countryCode === code;
+    if (!isActuallyThatCountry) return true;
+  }
+
   const stateName = STATE_CODE_TO_NAME[code];
   if (!stateName) return false;
-  const normalizedGeoLocation = normalizeGeoText(locationText);
   if (!containsGeoPhrase(normalizedGeoLocation, stateName)) return false;
+
+  // Exclude matches that are actually a different, longer state name, e.g. "Virginia"
+  // matching inside "West Virginia".
+  const conflictingLongerNames = STATE_NAME_SUFFIX_CONFLICTS.get(stateName) || [];
+  for (const longerName of conflictingLongerNames) {
+    if (containsGeoPhrase(normalizedGeoLocation, longerName)) return false;
+  }
+
   if (code === "WA") {
     if (containsGeoPhrase(normalizedGeoLocation, STATE_CODE_TO_NAME.DC)) return false;
     if (containsGeoPhrase(normalizedGeoLocation, "washington dc")) return false;

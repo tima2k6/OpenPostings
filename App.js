@@ -1624,6 +1624,15 @@ export default function App() {
     return base;
   }, [status, syncServiceSettings.active_posting_freshness_hours, syncServiceSettings.posting_freshness_hours]);
 
+  const failedCompaniesByAtsList = useMemo(() => {
+    const summary = status?.last_sync_summary || {};
+    const map = summary.failed_companies_by_ats || {};
+    return Object.entries(map)
+      .map(([atsName, count]) => ({ atsName, count: Number(count) || 0 }))
+      .filter((item) => item.count > 0)
+      .sort((a, b) => b.count - a.count);
+  }, [status]);
+
   useEffect(() => {
     if (postingsFilters.ats === "all") return;
     const selectedOption = (postingFilterOptions.ats || []).find(
@@ -2987,6 +2996,17 @@ export default function App() {
         <Text style={styles.settingsDescription}>
           Configure automatic posting sync timing. Wi-Fi-only gating applies only on Android.
         </Text>
+
+        {failedCompaniesByAtsList.length > 0 ? (
+          <View style={styles.formGroup}>
+            <Text style={styles.fieldLabel}>Failed companies by ATS (last sync)</Text>
+            {failedCompaniesByAtsList.map((item) => (
+              <Text key={item.atsName} style={styles.settingsInlineHint}>
+                {item.atsName}: {item.count}
+              </Text>
+            ))}
+          </View>
+        ) : null}
 
         <View style={styles.formGroup}>
           <ToggleRow

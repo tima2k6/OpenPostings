@@ -828,6 +828,7 @@ async function runAtsSyncInternal() {
     } catch (error) {
       errors.push({
         company_name: "__system__",
+        ats_name: "__system__",
         message: `pruneExpiredPostings failed: ${String(error?.message || error)}`
       });
     }
@@ -836,6 +837,7 @@ async function runAtsSyncInternal() {
     } catch (error) {
       errors.push({
         company_name: "__system__",
+        ats_name: "__system__",
         message: `prunePostingsOutsideDateWindow failed: ${String(error?.message || error)}`
       });
     }
@@ -901,6 +903,7 @@ async function runAtsSyncInternal() {
         } catch (error) {
           errors.push({
             company_name: company.company_name,
+            ats_name: company.ATS_name || "",
             message: String(error?.message || error)
           });
         } finally {
@@ -910,6 +913,7 @@ async function runAtsSyncInternal() {
             } catch (error) {
               errors.push({
                 company_name: "__system__",
+                ats_name: "__system__",
                 message: `queueFlushPendingPostings failed: ${String(error?.message || error)}`
               });
             }
@@ -934,6 +938,7 @@ async function runAtsSyncInternal() {
     } catch (error) {
       errors.push({
         company_name: "__system__",
+        ats_name: "__system__",
         message: `final queueFlushPendingPostings failed: ${String(error?.message || error)}`
       });
     }
@@ -943,6 +948,7 @@ async function runAtsSyncInternal() {
     } catch (error) {
       errors.push({
         company_name: "__system__",
+        ats_name: "__system__",
         message: `post-sync pruneExpiredPostings failed: ${String(error?.message || error)}`
       });
     }
@@ -951,6 +957,7 @@ async function runAtsSyncInternal() {
     } catch (error) {
       errors.push({
         company_name: "__system__",
+        ats_name: "__system__",
         message: `post-sync prunePostingsOutsideDateWindow failed: ${String(error?.message || error)}`
       });
     }
@@ -964,6 +971,7 @@ async function runAtsSyncInternal() {
     } catch (error) {
       errors.push({
         company_name: "__system__",
+        ats_name: "__system__",
         message: `pruning postingLocationByJobUrl cache failed: ${String(error?.message || error)}`
       });
     }
@@ -978,8 +986,15 @@ async function runAtsSyncInternal() {
     } catch (error) {
       errors.push({
         company_name: "__system__",
+        ats_name: "__system__",
         message: `getSyncScopeStats failed: ${String(error?.message || error)}`
       });
+    }
+
+    const failedCompaniesByAts = {};
+    for (const error of errors) {
+      const atsName = String(error?.ats_name || "unknown");
+      failedCompaniesByAts[atsName] = (failedCompaniesByAts[atsName] || 0) + 1;
     }
 
     syncStatus.last_sync_at = new Date().toISOString();
@@ -990,6 +1005,7 @@ async function runAtsSyncInternal() {
       worker_concurrency: workerCount,
       ats_request_queue_concurrency: getAtsRequestQueueConcurrency(),
       failed_companies: errors.length,
+      failed_companies_by_ats: failedCompaniesByAts,
       expired_pruned: totalPruned,
       posting_date_pruned: postingDatePruned,
       excluded_during_sync_by_posting_date: excludedByPostingDate,
