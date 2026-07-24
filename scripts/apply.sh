@@ -59,7 +59,10 @@ watch_paths_for() {
   case "$target" in
     server) candidates=(server package.json) ;;
     mcp)    candidates=(server/mcp-apply-server.js package.json) ;;
-    web)    candidates=(App.js src app.json babel.config.js metro.config.js package.json) ;;
+    # Metro watches App.js and src/ and rebuilds them on the fly, so only config
+    # and dependency changes actually require restarting the bundler. (Watch mode
+    # depends on CI being unset for this unit — see 20-hot-reload.conf.)
+    web)    candidates=(app.json babel.config.js metro.config.js package.json) ;;
   esac
   local p
   for p in "${candidates[@]}"; do
@@ -237,9 +240,6 @@ if [[ ${#targets[@]} -eq 0 ]]; then
   fi
 fi
 
-# Metro's file watcher does not fire under this deployment (the unit sets CI=1,
-# which disables Expo's watch mode), so frontend edits are only picked up when
-# the bundler is restarted. Do not assume hot reload will apply them.
 
 if (( VERIFY )); then
   info ""
