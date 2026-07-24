@@ -9,7 +9,7 @@
 #   scripts/apply.sh                # verify, then restart whatever is stale
 #   scripts/apply.sh status         # report only; change nothing
 #   scripts/apply.sh server mcp     # restart named targets (implies --force)
-#   scripts/apply.sh --force        # restart even if nothing looks stale
+#   scripts/apply.sh --force        # restart every service, stale or not
 #   scripts/apply.sh --no-verify    # skip syntax checks and tests
 #   scripts/apply.sh --yes          # don't prompt when a sync is in flight
 
@@ -217,11 +217,16 @@ if (( STATUS_ONLY )); then
   exit 0
 fi
 
-# Decide targets: explicit list wins, otherwise everything that looks stale.
+# Decide targets: an explicit list wins, then --force means everything, otherwise
+# just whatever looks stale. --force has to be checked before staleness or it would
+# only add the services that already needed restarting, which is not what
+# "restart everything" means.
 targets=()
 if (( ${#REQUESTED[@]} > 0 )); then
   targets=("${REQUESTED[@]}")
   FORCE=1
+elif (( FORCE )); then
+  targets=("${ALL_TARGETS[@]}")
 else
   for t in "${ALL_TARGETS[@]}"; do
     changed="$(stale_file_for "$t")"
