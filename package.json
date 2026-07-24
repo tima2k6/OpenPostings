@@ -16,6 +16,10 @@
     "test:windows": "jest --config jest.config.windows.js",
     "test:backend": "node --check server/index.js && node --check server/mcp-apply-server.js",
     "test:backend:seeded-source": "node server/tests/seeded-source-parser.test.js",
+    "test:backend:location-filter": "node server/tests/location-state-filter.test.js",
+    "apply": "./scripts/apply.sh",
+    "apply:status": "./scripts/apply.sh status",
+    "logs:server": "journalctl -u openpostings-server -n 50 -f",
     "lite:build-chunks": "node ./scripts/lite/build-lite-chunks.mjs",
     "lite:benchmark": "node ./scripts/lite/benchmark-lite-pipeline.mjs",
     "ios": "expo run:ios"
