@@ -3073,33 +3073,11 @@ export default function App() {
           Configure automatic posting sync timing. Wi-Fi-only gating applies only on Android.
         </Text>
 
-        {codeStatus?.restart_supported ? (
-          <View style={styles.formGroup}>
-            <Text style={styles.fieldLabel}>Server code</Text>
-            <Text style={styles.settingsInlineHint}>
-              {codeStatus.restart_required
-                ? `${codeStatus.changed_files.length} file(s) changed since the server started. Restart to apply them.`
-                : "The server is running the latest code on disk."}
+        {codeStatus?.restart_supported && codeStatus.restart_required ? (
+          <View style={styles.updateFlag}>
+            <Text style={styles.updateFlagText}>
+              {`Update pending — ${codeStatus.changed_files.length} file(s) changed since the server started. Apply it under "Server code" below.`}
             </Text>
-            {codeStatus.restart_required && codeStatus.changed_files.length > 0 ? (
-              <Text style={styles.settingsInlineHint}>{codeStatus.changed_files.join(", ")}</Text>
-            ) : null}
-            <Pressable
-              onPress={handleRestartServer}
-              disabled={restartingServer}
-              style={[styles.settingsSaveButton, restartingServer ? styles.settingsSaveButtonDisabled : null]}
-            >
-              <Text style={styles.settingsSaveButtonText}>
-                {restartingServer
-                  ? "Restarting..."
-                  : restartConfirmArmed
-                    ? "Confirm restart (aborts sync)"
-                    : codeStatus.restart_required
-                      ? "Apply code changes & restart"
-                      : "Restart server"}
-              </Text>
-            </Pressable>
-            {restartNotice ? <Text style={styles.settingsInlineHint}>{restartNotice}</Text> : null}
           </View>
         ) : null}
 
@@ -3320,6 +3298,36 @@ export default function App() {
         >
           <Text style={styles.settingsSaveButtonText}>{syncServiceSettingsSaving ? "Saving..." : "Save Sync Settings"}</Text>
         </Pressable>
+
+        {codeStatus?.restart_supported ? (
+          <View style={styles.formGroup}>
+            <Text style={styles.settingsSubsection}>Server code</Text>
+            <Text style={styles.settingsInlineHint}>
+              {codeStatus.restart_required
+                ? `${codeStatus.changed_files.length} file(s) changed since the server started. Restart to apply them.`
+                : "The server is running the latest code on disk."}
+            </Text>
+            {codeStatus.restart_required && codeStatus.changed_files.length > 0 ? (
+              <Text style={styles.settingsInlineHint}>{codeStatus.changed_files.join(", ")}</Text>
+            ) : null}
+            <Pressable
+              onPress={handleRestartServer}
+              disabled={restartingServer}
+              style={[styles.settingsSaveButton, restartingServer ? styles.settingsSaveButtonDisabled : null]}
+            >
+              <Text style={styles.settingsSaveButtonText}>
+                {restartingServer
+                  ? "Restarting..."
+                  : restartConfirmArmed
+                    ? "Confirm restart (aborts sync)"
+                    : codeStatus.restart_required
+                      ? "Apply code changes & restart"
+                      : "Restart server"}
+              </Text>
+            </Pressable>
+            {restartNotice ? <Text style={styles.settingsInlineHint}>{restartNotice}</Text> : null}
+          </View>
+        ) : null}
       </View>
 
       <Modal
@@ -4398,6 +4406,19 @@ const styles = StyleSheet.create({
     marginTop: 6,
     fontSize: 11,
     color: "#52606d"
+  },
+  updateFlag: {
+    marginTop: 12,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 6,
+    borderLeftWidth: 3,
+    borderLeftColor: "#b45309",
+    backgroundColor: "#fef3c7"
+  },
+  updateFlagText: {
+    fontSize: 12,
+    color: "#92400e"
   },
   settingsSecondaryButton: {
     marginTop: 10,

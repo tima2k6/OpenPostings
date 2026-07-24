@@ -237,15 +237,9 @@ if [[ ${#targets[@]} -eq 0 ]]; then
   fi
 fi
 
-# The web bundler hot-reloads JS, so a restart is usually unnecessary noise.
-if [[ " ${targets[*]} " == *" web "* ]] && (( ${#REQUESTED[@]} == 0 )); then
-  warn "web: Metro hot-reloads JS changes, so a restart is usually unnecessary."
-  warn "     Skipping it. Run 'scripts/apply.sh web' if you changed config or deps."
-  filtered=()
-  for t in "${targets[@]}"; do [[ "$t" != web ]] && filtered+=("$t"); done
-  targets=("${filtered[@]}")
-  [[ ${#targets[@]} -eq 0 ]] && { ok "Nothing else to restart."; exit 0; }
-fi
+# Metro's file watcher does not fire under this deployment (the unit sets CI=1,
+# which disables Expo's watch mode), so frontend edits are only picked up when
+# the bundler is restarted. Do not assume hot reload will apply them.
 
 if (( VERIFY )); then
   info ""
