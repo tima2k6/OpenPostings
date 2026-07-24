@@ -666,16 +666,6 @@ function isWeakPhraseNgram(ngram, phraseNgramIndustryCoverage) {
 
 
 
-function normalizeCompensationPayPeriod(value) {
-  const normalized = String(value || "").trim().toLowerCase();
-  if (normalized === "hour" || normalized === "week" || normalized === "month" || normalized === "year") {
-    return normalized;
-  }
-  return null;
-}
-
-
-
 
 function isLikelyCountryLikePart(value) {
   const candidate = normalizeCountryLikePart(value);
