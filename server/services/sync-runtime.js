@@ -844,7 +844,10 @@ async function runAtsSyncInternal() {
     const postingLocationByJobUrl = getPostingLocationByJobUrl();
     const nextPostingLocationByJobUrl = new Map(postingLocationByJobUrl);
 
-    const dedupedPostings = new Map();
+    // Tracks which job_posting_urls have already been queued this run, without holding onto the
+    // full posting payload (job descriptions can be large and this set stays alive for the whole
+    // multi-hour sync — retaining full objects here previously caused unbounded memory growth).
+    const dedupedPostingUrls = new Set();
     const pendingPostingsForUpsert = [];
     let excludedByPostingDate = 0;
     let nextCompanyIndex = 0;
@@ -888,8 +891,8 @@ async function runAtsSyncInternal() {
               excludedByPostingDate += 1;
               continue;
             }
-            if (dedupedPostings.has(posting.job_posting_url)) continue;
-            dedupedPostings.set(posting.job_posting_url, posting);
+            if (dedupedPostingUrls.has(posting.job_posting_url)) continue;
+            dedupedPostingUrls.add(posting.job_posting_url);
             pendingPostingsForUpsert.push(posting);
             const directLocation = String(posting?.location || "").trim();
             const inferredLocation = String(inferPostingLocationFromJobUrl(posting?.job_posting_url) || "").trim();
@@ -923,7 +926,7 @@ async function runAtsSyncInternal() {
             current: completedCompanies,
             total: syncTargets.length,
             company_name: `${company.company_name} (${company.ATS_name})`,
-            total_collected: dedupedPostings.size
+            total_collected: dedupedPostingUrls.size
           };
         }
       }
@@ -1001,7 +1004,7 @@ async function runAtsSyncInternal() {
     syncStatus.last_sync_summary = {
       total_companies: syncTargets.length,
       ...syncScopeStats,
-      total_postings_stored: dedupedPostings.size,
+      total_postings_stored: dedupedPostingUrls.size,
       worker_concurrency: workerCount,
       ats_request_queue_concurrency: getAtsRequestQueueConcurrency(),
       failed_companies: errors.length,

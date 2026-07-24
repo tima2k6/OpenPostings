@@ -161,7 +161,6 @@ const STATE_CODE_TO_NAME = {
   DC: "district of columbia"
 };
 const US_STATE_NAMES = new Set(Object.values(STATE_CODE_TO_NAME).map((name) => normalizeGeoText(name)));
-const STATE_NAME_SUFFIX_CONFLICTS = buildStateNameSuffixConflicts();
 const LOCATION_REGION_VALUES = new Set(LOCATION_REGION_OPTIONS.map((option) => option.value));
 const LOCATION_NON_COUNTRY_TERMS = new Set([
   "remote",
@@ -614,16 +613,12 @@ function buildWordNgrams(words, minSize = 2, maxSize = 3) {
 }
 
 
-function buildStateNameSuffixConflicts() {
-  const names = Array.from(new Set(Object.values(STATE_CODE_TO_NAME)));
-  const conflicts = new Map();
-  for (const shortName of names) {
-    const longerNames = names.filter(
-      (longName) => longName !== shortName && longName.endsWith(` ${shortName}`)
-    );
-    if (longerNames.length > 0) conflicts.set(shortName, longerNames);
-  }
-  return conflicts;
+// Only treats a state name (e.g. "washington") as a match when it's the entire content of a
+// comma/dash-separated segment, e.g. "Seattle, Washington" — not when it's merely one word inside
+// a longer place name segment like "Fort Washington" or "West Virginia".
+function hasStateNameSegmentMatch(locationText, stateName) {
+  const segments = splitLocationIntoCountryCandidateSegments(locationText);
+  return segments.some((segment) => normalizeGeoText(segment) === stateName);
 }
 
 // Only treats a bare code (e.g. "OR", "IN", "ME") as a state-code match when it stands alone
@@ -662,14 +657,7 @@ function hasStateLikeMatch(locationText, stateCode) {
 
   const stateName = STATE_CODE_TO_NAME[code];
   if (!stateName) return false;
-  if (!containsGeoPhrase(normalizedGeoLocation, stateName)) return false;
-
-  // Exclude matches that are actually a different, longer state name, e.g. "Virginia"
-  // matching inside "West Virginia".
-  const conflictingLongerNames = STATE_NAME_SUFFIX_CONFLICTS.get(stateName) || [];
-  for (const longerName of conflictingLongerNames) {
-    if (containsGeoPhrase(normalizedGeoLocation, longerName)) return false;
-  }
+  if (!hasStateNameSegmentMatch(locationText, stateName)) return false;
 
   if (code === "WA") {
     if (containsGeoPhrase(normalizedGeoLocation, STATE_CODE_TO_NAME.DC)) return false;
