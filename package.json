@@ -20,6 +20,7 @@
     "test:filter-normalize": "node server/tests/filter-normalize.test.js",
     "test:backend:posting-retention": "node server/tests/posting-retention.test.js",
     "test:backend:posting-query-plan": "node server/tests/posting-query-plan.test.js",
+    "test:backend:posting-filter-pushdown": "node server/tests/posting-filter-pushdown.test.js",
     "apply": "./scripts/apply.sh",
     "apply:status": "./scripts/apply.sh status",
     "logs:server": "journalctl -u openpostings-server -n 50 -f",
