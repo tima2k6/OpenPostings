@@ -68,6 +68,11 @@ CREATE TABLE IF NOT EXISTS Postings (
       hidden_at_epoch INTEGER
     );
 
+-- Hidden postings are kept as tombstones for HIDDEN_POSTING_RETENTION_SECONDS, then
+-- deleted by deleteExpiredHiddenPostings; this index serves that sweep.
+CREATE INDEX IF NOT EXISTS idx_postings_hidden_hidden_at_epoch
+  ON Postings(hidden, hidden_at_epoch);
+
 -- SyncServiceSettings
 CREATE TABLE IF NOT EXISTS SyncServiceSettings (
   id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),

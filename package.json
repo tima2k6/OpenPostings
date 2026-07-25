@@ -18,6 +18,7 @@
     "test:backend:seeded-source": "node server/tests/seeded-source-parser.test.js",
     "test:backend:location-filter": "node server/tests/location-state-filter.test.js",
     "test:filter-normalize": "node server/tests/filter-normalize.test.js",
+    "test:backend:posting-retention": "node server/tests/posting-retention.test.js",
     "apply": "./scripts/apply.sh",
     "apply:status": "./scripts/apply.sh status",
     "logs:server": "journalctl -u openpostings-server -n 50 -f",

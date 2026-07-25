@@ -839,6 +839,7 @@ async function runAtsSyncInternal() {
     const errors = [];
     let totalPruned = 0;
     let postingDatePruned = 0;
+    let hiddenDeleted = 0;
     try {
       totalPruned = await pruneExpiredPostings(syncReferenceEpoch);
     } catch (error) {
@@ -993,6 +994,17 @@ async function runAtsSyncInternal() {
         message: `post-sync prunePostingsOutsideDateWindow failed: ${String(error?.message || error)}`
       });
     }
+    // Only after the pass, not before: the delete is the one irreversible step here, and
+    // running it once per pass on rows hidden a month ago is not worth doing twice.
+    try {
+      hiddenDeleted = await deleteExpiredHiddenPostings(syncReferenceEpoch);
+    } catch (error) {
+      errors.push({
+        company_name: "__system__",
+        ats_name: "__system__",
+        message: `deleteExpiredHiddenPostings failed: ${String(error?.message || error)}`
+      });
+    }
     try {
       const activeJobPostingUrls = await getActiveJobPostingUrls();
       for (const jobPostingUrl of nextPostingLocationByJobUrl.keys()) {
@@ -1043,6 +1055,7 @@ async function runAtsSyncInternal() {
       failed_companies_by_ats: failedCompaniesByAts,
       expired_pruned: totalPruned,
       posting_date_pruned: postingDatePruned,
+      hidden_postings_deleted: hiddenDeleted,
       excluded_during_sync_by_posting_date: excludedByPostingDate,
       errors: errors.slice(0, 30)
     };
@@ -1211,6 +1224,15 @@ async function upsertPostings(postings, lastSeenEpoch) {
   }
 }
 
+// Hidden rows are kept as tombstones rather than deleted immediately: job_posting_url is
+// UNIQUE, so the row is what stops a posting that is still listed by its ATS from being
+// re-inserted as new on the next pass and surfacing again for another freshness window.
+const HIDDEN_POSTING_RETENTION_SECONDS = 30 * 24 * 60 * 60;
+
+// Descriptions are dropped at the moment of hiding. They are the bulk of the database
+// (on a 658k-row instance, 435MB of 931MB lived in 96k descriptions) and nothing reads
+// them once a posting is hidden, so keeping them for the whole retention window is pure
+// disk cost. The row itself stays until deleteExpiredHiddenPostings takes it.
 async function pruneExpiredPostings(referenceEpoch = nowEpochSeconds()) {
   const resolvedReferenceEpoch = Number(referenceEpoch || nowEpochSeconds());
   const cutoffEpoch = resolvedReferenceEpoch - getPostingFreshnessWindowSeconds();
@@ -1220,13 +1242,62 @@ async function pruneExpiredPostings(referenceEpoch = nowEpochSeconds()) {
       UPDATE Postings
       SET
         hidden = 1,
-        hidden_at_epoch = COALESCE(hidden_at_epoch, ?)
+        hidden_at_epoch = COALESCE(hidden_at_epoch, ?),
+        job_description = NULL
       WHERE hidden = 0
         AND first_seen_epoch < ?;
     `,
     [resolvedReferenceEpoch, cutoffEpoch]
   );
   return Number(result?.changes || 0);
+}
+
+// Rows are collected and deleted in chunks so a backlog (the first run after this ships
+// clears every posting hidden more than the retention window ago) cannot hold one huge
+// write transaction open for the length of the delete.
+async function deleteExpiredHiddenPostings(referenceEpoch = nowEpochSeconds()) {
+  const resolvedReferenceEpoch = Number(referenceEpoch || nowEpochSeconds());
+  const cutoffEpoch = resolvedReferenceEpoch - HIDDEN_POSTING_RETENTION_SECONDS;
+  const db = getDb();
+
+  const rows = await db.all(
+    `
+      SELECT id
+      FROM Postings
+      WHERE hidden = 1
+        AND hidden_at_epoch IS NOT NULL
+        AND hidden_at_epoch < ?;
+    `,
+    [cutoffEpoch]
+  );
+  if (!Array.isArray(rows) || rows.length === 0) return 0;
+
+  const idsToDelete = rows
+    .map((row) => Number(row?.id || 0))
+    .filter((postingId) => Number.isFinite(postingId) && postingId > 0);
+  if (idsToDelete.length === 0) return 0;
+
+  let totalDeleted = 0;
+  const chunkSize = 800;
+  for (let offset = 0; offset < idsToDelete.length; offset += chunkSize) {
+    const chunk = idsToDelete.slice(offset, offset + chunkSize);
+    if (chunk.length === 0) continue;
+    const placeholders = chunk.map(() => "?").join(", ");
+    await db.exec("BEGIN TRANSACTION;");
+    try {
+      const result = await db.run(
+        `DELETE FROM Postings WHERE id IN (${placeholders});`,
+        chunk
+      );
+      await db.exec("COMMIT;");
+      totalDeleted += Number(result?.changes || 0);
+    } catch (error) {
+      await db.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  return totalDeleted;
 }
 
 async function prunePostingsOutsideDateWindow(referenceEpoch = nowEpochSeconds()) {
@@ -1266,7 +1337,8 @@ async function prunePostingsOutsideDateWindow(referenceEpoch = nowEpochSeconds()
           UPDATE Postings
           SET
             hidden = 1,
-            hidden_at_epoch = COALESCE(hidden_at_epoch, ?)
+            hidden_at_epoch = COALESCE(hidden_at_epoch, ?),
+            job_description = NULL
           WHERE hidden = 0
             AND id IN (${placeholders});
         `,
@@ -1342,6 +1414,9 @@ async function createCanonicalPostingsTable() {
 
     CREATE INDEX IF NOT EXISTS idx_postings_hidden_first_seen_epoch
       ON Postings(hidden, first_seen_epoch);
+
+    CREATE INDEX IF NOT EXISTS idx_postings_hidden_hidden_at_epoch
+      ON Postings(hidden, hidden_at_epoch);
   `);
 }
 
@@ -1423,6 +1498,6 @@ async function getSyncScopeStats() {
   };
 }
 
-module.exports = { runAtsSync, getSyncScopeStats, pruneExpiredPostings, createCanonicalPostingsTable, syncStatus, startSyncStallWatchdog, recoverStalledSync };
+module.exports = { runAtsSync, getSyncScopeStats, pruneExpiredPostings, deleteExpiredHiddenPostings, createCanonicalPostingsTable, syncStatus, startSyncStallWatchdog, recoverStalledSync };
 
 
