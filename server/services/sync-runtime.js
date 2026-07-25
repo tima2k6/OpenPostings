@@ -101,8 +101,22 @@ const syncStatus = {
   last_sync_at: null,
   last_sync_summary: null,
   last_error: null,
-  progress: null
+  progress: null,
+  stall_recoveries: 0,
+  last_stall_recovery_at: null
 };
+
+// runAtsSync hands back the in-flight promise so passes cannot overlap. If a pass
+// never settles — a wedged await that the per-request fetch timeout does not cover —
+// that cached promise is returned forever and syncing is dead until the process is
+// restarted. These track forward progress so a wedged pass can be abandoned.
+const SYNC_STALL_TIMEOUT_MS = Number(process.env.SYNC_STALL_TIMEOUT_MS || 15 * 60 * 1000);
+const SYNC_WATCHDOG_INTERVAL_MS = Number(process.env.SYNC_WATCHDOG_INTERVAL_MS || 60 * 1000);
+// Bumped when a pass is abandoned. Workers compare against the value they started
+// with and exit, so an abandoned pass stops consuming targets and memory instead of
+// racing the replacement pass.
+let syncGeneration = 0;
+let lastSyncProgressAtMs = 0;
 
 const SYNC_WORKER_CONCURRENCY_RAW = Number(process.env.SYNC_WORKER_CONCURRENCY || 4);
 const SYNC_WORKER_CONCURRENCY =
@@ -668,7 +682,9 @@ function shuffleArrayInPlace(values) {
 
 
 async function runAtsSyncInternal() {
+  const passGeneration = syncGeneration;
   const syncReferenceEpoch = nowEpochSeconds();
+  lastSyncProgressAtMs = Date.now();
   syncStatus.running = true;
   syncStatus.started_at = new Date().toISOString();
   syncStatus.progress = { current: 0, total: 0, company_name: "", total_collected: 0 };
@@ -871,6 +887,9 @@ async function runAtsSyncInternal() {
 
     const runSyncWorker = async () => {
       while (true) {
+        // This pass was abandoned as stalled; stop rather than compete with its
+        // replacement for targets, memory and DB writes.
+        if (syncGeneration !== passGeneration) return;
         const currentIndex = nextCompanyIndex;
         if (currentIndex >= syncTargets.length) return;
         nextCompanyIndex += 1;
@@ -927,12 +946,17 @@ async function runAtsSyncInternal() {
             }
           }
           completedCompanies += 1;
-          syncStatus.progress = {
-            current: completedCompanies,
-            total: syncTargets.length,
-            company_name: `${company.company_name} (${company.ATS_name})`,
-            total_collected: dedupedPostingUrls.size
-          };
+          // A worker abandoned mid-company still reaches here, so don't resurrect
+          // progress the watchdog has already cleared.
+          if (syncGeneration === passGeneration) {
+            lastSyncProgressAtMs = Date.now();
+            syncStatus.progress = {
+              current: completedCompanies,
+              total: syncTargets.length,
+              company_name: `${company.company_name} (${company.ATS_name})`,
+              total_collected: dedupedPostingUrls.size
+            };
+          }
         }
       }
     };
@@ -1005,6 +1029,9 @@ async function runAtsSyncInternal() {
       failedCompaniesByAts[atsName] = (failedCompaniesByAts[atsName] || 0) + 1;
     }
 
+    // An abandoned pass must not publish its partial results as the latest sync.
+    if (syncGeneration !== passGeneration) return;
+
     syncStatus.last_sync_at = new Date().toISOString();
     syncStatus.last_sync_summary = {
       total_companies: syncTargets.length,
@@ -1020,11 +1047,56 @@ async function runAtsSyncInternal() {
       errors: errors.slice(0, 30)
     };
   } catch (error) {
-    syncStatus.last_error = String(error?.message || error);
+    if (syncGeneration === passGeneration) {
+      syncStatus.last_error = String(error?.message || error);
+    }
   } finally {
-    syncStatus.running = false;
-    syncStatus.progress = null;
+    // An abandoned pass may settle long after its replacement started; it must not
+    // report that pass as finished or wipe its progress.
+    if (syncGeneration === passGeneration) {
+      syncStatus.running = false;
+      syncStatus.progress = null;
+    }
   }
+}
+
+// Abandons a pass that has stopped making progress, so the next scheduled tick can
+// start a fresh one. The wedged pass is not killable — its pending awaits may never
+// settle — but bumping the generation makes its workers exit at their next iteration
+// and stops it from publishing results.
+function recoverStalledSync() {
+  if (!syncStatus.running) return false;
+  const stalledForMs = Date.now() - lastSyncProgressAtMs;
+  if (!(lastSyncProgressAtMs > 0) || stalledForMs < SYNC_STALL_TIMEOUT_MS) return false;
+
+  const progressLabel = syncStatus.progress
+    ? `${syncStatus.progress.current}/${syncStatus.progress.total}`
+    : "no progress recorded";
+  console.error(
+    `[OpenPostings API] sync made no progress for ${Math.round(stalledForMs / 1000)}s (${progressLabel}); abandoning it`
+  );
+
+  syncGeneration += 1;
+  syncStatus.stall_recoveries = Number(syncStatus.stall_recoveries || 0) + 1;
+  syncStatus.last_stall_recovery_at = new Date().toISOString();
+  syncStatus.last_error = `Sync abandoned after ${Math.round(stalledForMs / 1000)}s without progress (${progressLabel}).`;
+  syncStatus.running = false;
+  syncStatus.progress = null;
+  // Clearing the cached promise is what actually allows a new pass to start.
+  setSyncPromise(null);
+  return true;
+}
+
+function startSyncStallWatchdog() {
+  const timer = setInterval(() => {
+    try {
+      recoverStalledSync();
+    } catch (error) {
+      console.error("[OpenPostings API] sync watchdog failed:", error);
+    }
+  }, SYNC_WATCHDOG_INTERVAL_MS);
+  if (typeof timer.unref === "function") timer.unref();
+  return timer;
 }
 
 function runAtsSync() {
@@ -1351,6 +1423,6 @@ async function getSyncScopeStats() {
   };
 }
 
-module.exports = { runAtsSync, getSyncScopeStats, pruneExpiredPostings, createCanonicalPostingsTable, syncStatus };
+module.exports = { runAtsSync, getSyncScopeStats, pruneExpiredPostings, createCanonicalPostingsTable, syncStatus, startSyncStallWatchdog, recoverStalledSync };
 
 

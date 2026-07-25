@@ -88,7 +88,7 @@ const { ensurePersonalInformationTable, getPersonalInformation, upsertPersonalIn
 const { upsertSeededCompanySource } = require("./services/seeded-source.js");
 const { getMcpSettings, upsertMcpSettings, buildMcpRunbook, buildCoverLetterDraft } = require("./services/mcp.js");
 const { listApplications, createApplication, updateApplicationStatus, deleteApplicationById } = require("./services/applications.js");
-const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable } = require("./services/sync-runtime.js");
+const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable, startSyncStallWatchdog } = require("./services/sync-runtime.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
 const { listPostingsWithFilters, setPostingIgnoredState, getCounts, getPostingLocationGeoFilterOptions, getWideScanStats } = require("./services/postings.js");
 const { getDb, setDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
@@ -1826,6 +1826,10 @@ async function start() {
       `[OpenPostings API] ATS request queue concurrency (runtime): ${getAtsRequestQueueConcurrency()} (saved changes apply after restart)`
     );
   });
+
+  // Watches for a pass that stops making progress and abandons it, so a wedged sync
+  // does not leave the cached promise in place and stop syncing until a restart.
+  startSyncStallWatchdog();
 
   runAtsSync().catch((error) => {
     console.error("[OpenPostings API] initial sync failed:", error);
