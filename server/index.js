@@ -707,6 +707,9 @@ async function ensurePostingsTable() {
     CREATE INDEX IF NOT EXISTS idx_postings_hidden_first_seen_epoch
       ON Postings(hidden, first_seen_epoch);
 
+    CREATE INDEX IF NOT EXISTS idx_postings_hidden_hidden_at_epoch
+      ON Postings(hidden, hidden_at_epoch);
+
     CREATE INDEX IF NOT EXISTS idx_postings_location
       ON Postings(location);
   `);
