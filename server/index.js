@@ -90,7 +90,7 @@ const { getMcpSettings, upsertMcpSettings, buildMcpRunbook, buildCoverLetterDraf
 const { listApplications, createApplication, updateApplicationStatus, deleteApplicationById } = require("./services/applications.js");
 const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable } = require("./services/sync-runtime.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
-const { listPostingsWithFilters, setPostingIgnoredState, getCounts, getPostingLocationGeoFilterOptions } = require("./services/postings.js");
+const { listPostingsWithFilters, setPostingIgnoredState, getCounts, getPostingLocationGeoFilterOptions, getWideScanStats } = require("./services/postings.js");
 const { getDb, setDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
 
 const cors = require("cors");
@@ -1104,6 +1104,7 @@ function createServer() {
       const payload = sanitizeFrontendValue({
         ...syncStatus,
         ...syncScopeStats,
+        filtered_query_queue: getWideScanStats(),
         posting_freshness_hours: syncSettings?.posting_freshness_hours,
         active_posting_freshness_hours: syncSettings?.active_posting_freshness_hours,
         min_posting_freshness_hours: syncSettings?.min_posting_freshness_hours,
