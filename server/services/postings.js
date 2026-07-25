@@ -21,6 +21,8 @@ function getPostingsOrderByClause(sortBy) {
   // Deliberately not COALESCE(last_seen_epoch, 0): wrapping the column made the sort key
   // an opaque expression, which forced a full scan even on the bounded page query. SQLite
   // already sorts NULLs last under DESC, which is where COALESCE-to-zero put them anyway.
+  // Bare, it is served by idx_postings_hidden_last_seen_epoch, which lets the page stream
+  // from the index and stop at LIMIT rather than sorting the visible set in a temp b-tree.
   return "last_seen_epoch DESC, id DESC";
 }
 

@@ -73,6 +73,11 @@ CREATE TABLE IF NOT EXISTS Postings (
 CREATE INDEX IF NOT EXISTS idx_postings_hidden_hidden_at_epoch
   ON Postings(hidden, hidden_at_epoch);
 
+-- Serves the default listing sort (last_seen_epoch DESC) so the page can be streamed
+-- from the index instead of sorting the whole visible set in a temp b-tree.
+CREATE INDEX IF NOT EXISTS idx_postings_hidden_last_seen_epoch
+  ON Postings(hidden, last_seen_epoch);
+
 -- SyncServiceSettings
 CREATE TABLE IF NOT EXISTS SyncServiceSettings (
   id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),

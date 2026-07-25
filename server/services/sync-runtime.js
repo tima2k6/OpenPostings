@@ -1005,6 +1005,18 @@ async function runAtsSyncInternal() {
         message: `deleteExpiredHiddenPostings failed: ${String(error?.message || error)}`
       });
     }
+    // A pass rewrites a large fraction of the table, so the stats the planner relies on to
+    // pick idx_postings_hidden_last_seen_epoch for the listing sort go stale. Refreshing
+    // here keeps the sort on the index instead of silently regressing to a temp b-tree.
+    try {
+      await getDb().exec(`PRAGMA optimize;`);
+    } catch (error) {
+      errors.push({
+        company_name: "__system__",
+        ats_name: "__system__",
+        message: `PRAGMA optimize failed: ${String(error?.message || error)}`
+      });
+    }
     try {
       const activeJobPostingUrls = await getActiveJobPostingUrls();
       for (const jobPostingUrl of nextPostingLocationByJobUrl.keys()) {
@@ -1417,6 +1429,9 @@ async function createCanonicalPostingsTable() {
 
     CREATE INDEX IF NOT EXISTS idx_postings_hidden_hidden_at_epoch
       ON Postings(hidden, hidden_at_epoch);
+
+    CREATE INDEX IF NOT EXISTS idx_postings_hidden_last_seen_epoch
+      ON Postings(hidden, last_seen_epoch);
   `);
 }
 
