@@ -1169,7 +1169,7 @@ async function upsertPostingsBatch(postings, seenEpoch) {
             pay_raw = CASE WHEN excluded.job_description IS NULL THEN Postings.pay_raw ELSE excluded.pay_raw END,
             first_seen_epoch = COALESCE(Postings.first_seen_epoch, Postings.last_seen_epoch, excluded.first_seen_epoch),
             last_seen_epoch = excluded.last_seen_epoch
-          WHERE COALESCE(Postings.hidden, 0) = 0;
+          WHERE Postings.hidden = 0;
         `,
         [
           companyName,
@@ -1221,8 +1221,8 @@ async function pruneExpiredPostings(referenceEpoch = nowEpochSeconds()) {
       SET
         hidden = 1,
         hidden_at_epoch = COALESCE(hidden_at_epoch, ?)
-      WHERE COALESCE(hidden, 0) = 0
-        AND COALESCE(first_seen_epoch, last_seen_epoch, 0) < ?;
+      WHERE hidden = 0
+        AND first_seen_epoch < ?;
     `,
     [resolvedReferenceEpoch, cutoffEpoch]
   );
@@ -1236,7 +1236,7 @@ async function prunePostingsOutsideDateWindow(referenceEpoch = nowEpochSeconds()
     `
       SELECT id, posting_date
       FROM Postings
-      WHERE COALESCE(hidden, 0) = 0
+      WHERE hidden = 0
         AND posting_date IS NOT NULL
         AND TRIM(posting_date) <> '';
     `
@@ -1267,7 +1267,7 @@ async function prunePostingsOutsideDateWindow(referenceEpoch = nowEpochSeconds()
           SET
             hidden = 1,
             hidden_at_epoch = COALESCE(hidden_at_epoch, ?)
-          WHERE COALESCE(hidden, 0) = 0
+          WHERE hidden = 0
             AND id IN (${placeholders});
         `,
         [Number(referenceEpoch || nowEpochSeconds()), ...chunk]
@@ -1287,7 +1287,7 @@ async function prunePostingsOutsideDateWindow(referenceEpoch = nowEpochSeconds()
 async function getActiveJobPostingUrls() {
   const db = getDb();
   const rows = await db.all(
-    `SELECT job_posting_url FROM Postings WHERE COALESCE(hidden, 0) = 0;`
+    `SELECT job_posting_url FROM Postings WHERE hidden = 0;`
   );
   return new Set(rows.map((row) => String(row?.job_posting_url || "")));
 }

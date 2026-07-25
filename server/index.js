@@ -629,6 +629,9 @@ async function ensurePostingsTable() {
   if (!existingColumns.has("first_seen_epoch")) {
     await db.exec(`ALTER TABLE Postings ADD COLUMN first_seen_epoch INTEGER;`);
   }
+  // Runs on every startup, not just when the column is added: the freshness predicates in
+  // pruneExpiredPostings and the listing queries read first_seen_epoch bare so the planner
+  // can use idx_postings_hidden_first_seen_epoch, which relies on it never being NULL.
   await db.run(
     `
       UPDATE Postings
@@ -1107,7 +1110,7 @@ function createServer() {
   app.get("/sync/status", async (_req, res) => {
     try {
       const [counts, syncScopeStats, syncSettings] = await Promise.all([
-        getCounts({ skipPrune: true }),
+        getCounts(),
         getSyncScopeStats(),
         getSyncServiceSettings()
       ]);

@@ -1,9 +1,8 @@
-const { pruneExpiredPostings } = require("./sync-runtime");
 const { normalizePostingSort } = require("../helpers/normalize-strings");
 const { normalizeAtsFilters, normalizeAtsFilterValue, inferAtsFromJobPostingUrl, inferPostingLocationFromJobUrl  } = require("../helpers/normalize-ats");
 const { normalizeStringArray, normalizeLikeText, normalizeAppliedByType, normalizeAppliedByLabel, normalizeIgnoredByLabel, cleanHtmlText } = require("../helpers/normalize-strings");
 const { normalizeCompensationType, normalizeCompensationPayPeriod, normalizeEducationLevels, parseEducationLevels, normalizeCompensationCurrencyCode, parseCountyFilters, parseCountryFilters, parseRegionFilters, normalizeRemoteFilters, buildIndustryMatchersByKey, rowMatchesIndustryLikeParts, rowMatchesEducationFilter, rowMatchesCompensationFilter, rowMatchesCompensationRangeFilter, rowMatchesLocationFilters, rowMatchesRemoteFilter, buildDefaultCountryFilterOptions, inferLocationGeo, LOCATION_REGION_OPTIONS } = require("../helpers/description-filters");
-const { normalizePayFilterNumber, normalizeBoolean, parseNonNegativeInteger, nowEpochSeconds, parsePostingDateToEpochSeconds } = require("../helpers/normalize-numbers");
+const { normalizePayFilterNumber, normalizeBoolean, parseNonNegativeInteger, nowEpochSeconds, parsePostingDateToEpochSeconds, getPostingFreshnessWindowSeconds } = require("../helpers/normalize-numbers");
 const { inferAshbyLocationFromDescription } = require("../ats/ashby/service.js");
 const { getDb, setDb, getPostingLocationByJobUrl } = require("../services/runtime-context")
 
@@ -19,7 +18,18 @@ function getPostingsOrderByClause(sortBy) {
   if (sortBy === "company_asc") {
     return "company_name ASC, position_name ASC";
   }
-  return "COALESCE(last_seen_epoch, 0) DESC, id DESC";
+  // Deliberately not COALESCE(last_seen_epoch, 0): wrapping the column made the sort key
+  // an opaque expression, which forced a full scan even on the bounded page query. SQLite
+  // already sorts NULLs last under DESC, which is where COALESCE-to-zero put them anyway.
+  return "last_seen_epoch DESC, id DESC";
+}
+
+// Postings are hidden by pruneExpiredPostings during sync, but reads must not depend on
+// a sync having happened recently, so the visible set is bounded by the same freshness
+// window here. This replaces a pruneExpiredPostings() call that used to run - as a write
+// transaction - on every listing request.
+function getPostingFreshnessCutoffEpoch() {
+  return nowEpochSeconds() - getPostingFreshnessWindowSeconds();
 }
 
 function formatEpochDateLabel(epochValue) {
@@ -113,10 +123,12 @@ async function readDistinctStoredLocations() {
       `
         SELECT DISTINCT location
         FROM Postings
-        WHERE COALESCE(hidden, 0) = 0
+        WHERE hidden = 0
+          AND first_seen_epoch >= ?
           AND location IS NOT NULL
           AND TRIM(location) <> '';
-      `
+      `,
+      [getPostingFreshnessCutoffEpoch()]
     );
     return rows.map((row) => String(row?.location || "").trim()).filter(Boolean);
   } catch {
@@ -294,7 +306,7 @@ async function hydrateJobDescriptions(db, items) {
 
 async function listPostingsWithFilters(options = {}) {
   const db = getDb()
-  await pruneExpiredPostings();
+  const freshnessCutoffEpoch = getPostingFreshnessCutoffEpoch();
   const search = String(options?.search || "").trim();
   const limit = Math.max(1, Math.min(2000, Number(options?.limit || 500)));
   const offset = Math.max(0, Number(options?.offset || 0));
@@ -343,7 +355,8 @@ async function listPostingsWithFilters(options = {}) {
         `
           SELECT id, company_name, position_name, job_posting_url, posting_date, location, job_description, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
           FROM Postings
-          WHERE COALESCE(hidden, 0) = 0
+          WHERE hidden = 0
+            AND first_seen_epoch >= ?
             AND (? = 0 OR (posting_date IS NOT NULL AND TRIM(posting_date) <> ''))
             AND NOT EXISTS (
               SELECT 1
@@ -353,7 +366,7 @@ async function listPostingsWithFilters(options = {}) {
           ORDER BY ${orderByClause}
           LIMIT ? OFFSET ?;
         `,
-        [hideNoDate ? 1 : 0, limit, offset]
+        [freshnessCutoffEpoch, hideNoDate ? 1 : 0, limit, offset]
       );
     } else {
       rows = await db.all(
@@ -367,7 +380,8 @@ async function listPostingsWithFilters(options = {}) {
               OR
               (${includeIgnored ? 0 : 1} = 1 AND COALESCE(s.ignored, 0) = 1)
             )
-          WHERE COALESCE(p.hidden, 0) = 0
+          WHERE p.hidden = 0
+            AND p.first_seen_epoch >= ?
             AND (? = 0 OR (p.posting_date IS NOT NULL AND TRIM(p.posting_date) <> ''))
             AND NOT EXISTS (
               SELECT 1
@@ -378,7 +392,7 @@ async function listPostingsWithFilters(options = {}) {
           ORDER BY ${orderByClause}
           LIMIT ? OFFSET ?;
         `,
-        [hideNoDate ? 1 : 0, limit, offset]
+        [freshnessCutoffEpoch, hideNoDate ? 1 : 0, limit, offset]
       );
     }
   } else {
@@ -392,14 +406,16 @@ async function listPostingsWithFilters(options = {}) {
       `
         SELECT id, company_name, position_name, job_posting_url, posting_date, location, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
         FROM Postings
-        WHERE COALESCE(hidden, 0) = 0
+        WHERE hidden = 0
+          AND first_seen_epoch >= ?
           AND NOT EXISTS (
           SELECT 1
           FROM blocked_companies b
           WHERE b.normalized_company_name = LOWER(TRIM(Postings.company_name))
         )
         ORDER BY ${orderByClause};
-      `
+      `,
+      [freshnessCutoffEpoch]
     );
   }
 
@@ -760,19 +776,17 @@ async function setPostingIgnoredState(payload) {
 }
 
 
-async function getCounts(options = {}) {
+async function getCounts() {
   const db = getDb()
-  const skipPrune = Boolean(options?.skipPrune);
-  if (!skipPrune) {
-    await pruneExpiredPostings();
-  }
   const companyRow = await db.get(`SELECT COUNT(*) AS count FROM companies;`);
   const postingRow = await db.get(
     `
       SELECT COUNT(*) AS count
       FROM Postings
-      WHERE COALESCE(hidden, 0) = 0;
-    `
+      WHERE hidden = 0
+        AND first_seen_epoch >= ?;
+    `,
+    [getPostingFreshnessCutoffEpoch()]
   );
   const byAtsRows = await db.all(`
     SELECT ATS_name, COUNT(*) AS count
