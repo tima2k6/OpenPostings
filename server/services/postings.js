@@ -34,6 +34,70 @@ function getPostingFreshnessCutoffEpoch() {
   return nowEpochSeconds() - getPostingFreshnessWindowSeconds();
 }
 
+// A search term is user text, so % and _ arrive as literals but mean "anything" to LIKE.
+// Leaving them unescaped cannot return a wrong row -- the JS filter still decides -- but a
+// term containing % would match every posting and hand the whole table back to JS, which
+// is the exact cost this pre-filter exists to avoid.
+function escapeLikeTerm(term) {
+  return String(term).replace(/[\\%_]/g, (match) => `\\${match}`);
+}
+
+// Narrows the candidate set for the filtered branch. Every clause here has to be a
+// superset of the JS predicate it mirrors -- the JS filter still runs afterwards and stays
+// the authority, so a clause that is too broad only costs speed, while one that is too
+// narrow silently loses postings. Only filters that can be proven superset-safe against a
+// stored column are included; ats, industry, location and remote all match on values
+// derived at read time (inferred from the URL, joined from companies) and are left to JS.
+function buildCandidatePrefilter({ searchTerms, payMinFilter, payMaxFilter, payPeriods }) {
+  const clauses = [];
+  const params = [];
+
+  // The JS search matches company_name, position_name and the *enriched* location. The
+  // enriched value is `storedLocation || mappedLocation || inferredLocation || ...`, so
+  // whenever the stored column is non-empty it is exactly what JS compares against, and a
+  // LIKE on the column is faithful. When the column is empty the enriched value can come
+  // from somewhere this query cannot see, so those rows are always kept as candidates.
+  for (const term of searchTerms) {
+    clauses.push(`
+      AND (
+        LOWER(company_name) LIKE ? ESCAPE '\\'
+        OR LOWER(position_name) LIKE ? ESCAPE '\\'
+        OR LOWER(COALESCE(location, '')) LIKE ? ESCAPE '\\'
+        OR location IS NULL
+        OR TRIM(location) = ''
+      )`);
+    const pattern = `%${escapeLikeTerm(term)}%`;
+    params.push(pattern, pattern, pattern);
+  }
+
+  // Mirrors rowMatchesCompensationRangeFilter. A row with no usable pay figure fails that
+  // filter outright once a range is set, and only 4% of stored rows carry one, so this is
+  // where the branch sheds the most work.
+  const hasRangeFilter = Number.isFinite(payMinFilter) || Number.isFinite(payMaxFilter);
+  if (hasRangeFilter) {
+    clauses.push(`AND (COALESCE(pay_min, 0) > 0 OR COALESCE(pay_max, 0) > 0)`);
+    if (Number.isFinite(payMinFilter)) {
+      // rowUpper >= selectedPayMin, where rowUpper falls back to pay_min.
+      clauses.push(`AND (CASE WHEN COALESCE(pay_max, 0) > 0 THEN pay_max ELSE pay_min END) >= ?`);
+      params.push(payMinFilter);
+    }
+    if (Number.isFinite(payMaxFilter)) {
+      // rowLower <= selectedPayMax, where rowLower falls back to pay_max.
+      clauses.push(`AND (CASE WHEN COALESCE(pay_min, 0) > 0 THEN pay_min ELSE pay_max END) <= ?`);
+      params.push(payMaxFilter);
+    }
+  }
+
+  // A row whose pay_period is absent can never be in the selected set, since the JS filter
+  // requires the normalised period to appear in it. The values themselves are not compared
+  // here: normalisation happens in JS and stored spellings vary.
+  if (Array.isArray(payPeriods) && payPeriods.length > 0) {
+    clauses.push(`AND pay_period IS NOT NULL AND TRIM(pay_period) <> ''`);
+  }
+
+  return { sql: clauses.join("\n"), params };
+}
+
 function formatEpochDateLabel(epochValue) {
   const epoch = Number(epochValue);
   if (!Number.isFinite(epoch) || epoch <= 0) return "";
@@ -399,11 +463,23 @@ async function listPostingsWithFilters(options = {}) {
     }
   } else {
     // This branch cannot use LIMIT: the filters below are evaluated in JS, so the
-    // whole visible set has to be scanned before the page can be cut. job_description
+    // whole candidate set has to be scanned before the page can be cut. job_description
     // is therefore deliberately not selected here — no filter predicate reads it, and
     // including it pulled hundreds of MB of text (which V8 then doubles as UTF-16, and
     // doubles again when the rows are enriched) into memory on every filtered request.
     // Descriptions are fetched for the returned page only, once the slice is known.
+    //
+    // The candidate set is narrowed first by buildCandidatePrefilter. Profiling this
+    // branch at 650k rows put almost none of the 12.6s in the filter predicate itself
+    // (~110ms): the cost is fetching the rows, materialising them in the driver, the GC
+    // that follows, and enriching rows that are about to be discarded. Dropping rows in
+    // SQL is the only thing that touches all four at once.
+    const prefilter = buildCandidatePrefilter({
+      searchTerms: search.toLowerCase().split(/\s+/).filter(Boolean),
+      payMinFilter,
+      payMaxFilter,
+      payPeriods
+    });
     rows = await db.all(
       `
         SELECT id, company_name, position_name, job_posting_url, posting_date, location, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
@@ -415,9 +491,10 @@ async function listPostingsWithFilters(options = {}) {
           FROM blocked_companies b
           WHERE b.normalized_company_name = LOWER(TRIM(Postings.company_name))
         )
+        ${prefilter.sql}
         ORDER BY ${orderByClause};
       `,
-      [freshnessCutoffEpoch]
+      [freshnessCutoffEpoch, ...prefilter.params]
     );
   }
 
@@ -450,7 +527,12 @@ async function listPostingsWithFilters(options = {}) {
     }
   }
 
-  const enrichedRows = rows.map((row) => {
+  // Split in two on purpose. Everything the filters read is computed for every candidate;
+  // everything only the response needs -- the posting_date label above all, which parses
+  // and reformats a date per row -- is deferred to buildPostingDisplayFields and runs on
+  // the returned page instead. Profiling the filtered branch at 650k rows attributed
+  // ~1.3s to date-label construction alone, all of it on rows about to be discarded.
+  const enrichRowForFiltering = (row) => {
     const normalizedCompanyName = normalizeLikeText(row?.company_name);
     const companyAts = normalizedCompanyName ? companyAtsByNormalizedName.get(normalizedCompanyName) : "";
     const ats = normalizeAtsFilterValue(companyAts || inferAtsFromJobPostingUrl(row?.job_posting_url));
@@ -467,8 +549,22 @@ async function listPostingsWithFilters(options = {}) {
       (ats === "ashby" ? inferAshbyLocationFromDescription(row?.job_description) : null);
     const payMinValue = Number(row?.pay_min);
     const payMaxValue = Number(row?.pay_max);
+
+    return {
+      ...row,
+      compensation_type: normalizeCompensationType(row?.compensation_type, "unknown"),
+      education_levels: parseEducationLevels(row?.education_levels),
+      pay_min: Number.isFinite(payMinValue) ? payMinValue : null,
+      pay_max: Number.isFinite(payMaxValue) ? payMaxValue : null,
+      pay_period: normalizeCompensationPayPeriod(row?.pay_period),
+      location,
+      ats
+    };
+  };
+
+  const buildPostingDisplayFields = (row) => {
+    const ats = row?.ats;
     const rawPostingDate = String(row?.posting_date || "").trim();
-    const hasRealDate = hasRealSourcePostingDate(rawPostingDate, ats, row?.first_seen_epoch, row?.last_seen_epoch);
     let postingDate = rawPostingDate;
     const isSapHrCloudPosting =
       ats === "saphrcloud" ||
@@ -497,18 +593,27 @@ async function listPostingsWithFilters(options = {}) {
       ...row,
       posting_date: postingDate || null,
       job_description: normalizedJobDescription,
-      _has_real_source_posting_date: hasRealDate,
-      compensation_type: normalizeCompensationType(row?.compensation_type, "unknown"),
-      education_levels: parseEducationLevels(row?.education_levels),
-      pay_min: Number.isFinite(payMinValue) ? payMinValue : null,
-      pay_max: Number.isFinite(payMaxValue) ? payMaxValue : null,
       pay_currency: normalizeCompensationCurrencyCode(row?.pay_currency),
-      pay_period: normalizeCompensationPayPeriod(row?.pay_period),
-      pay_raw: String(row?.pay_raw || "").trim() || null,
-      location,
-      ats
+      pay_raw: String(row?.pay_raw || "").trim() || null
     };
+  };
+
+  // hide_no_date is the one filter that needs a value derived from the posting date, so it
+  // is the only reason to pay for that derivation before the page is cut.
+  const withHasRealSourcePostingDate = (row) => ({
+    ...row,
+    _has_real_source_posting_date: hasRealSourcePostingDate(
+      String(row?.posting_date || "").trim(),
+      row?.ats,
+      row?.first_seen_epoch,
+      row?.last_seen_epoch
+    )
   });
+
+  let enrichedRows = rows.map(enrichRowForFiltering);
+  if (hideNoDate) {
+    enrichedRows = enrichedRows.map(withHasRealSourcePostingDate);
+  }
 
   const searchTerms = search.toLowerCase().split(/\s+/).filter(Boolean);
   const industryMatchersByKey = await buildIndustryMatchersByKey(industryKeys);
@@ -573,7 +678,9 @@ async function listPostingsWithFilters(options = {}) {
     items = items.slice(offset, offset + limit);
   }
 
-  items = items.map(({ _has_real_source_posting_date, ...row }) => row);
+  // Only now, on the page that is actually being returned, is it worth building the
+  // display-only fields.
+  items = items.map(({ _has_real_source_posting_date, ...row }) => buildPostingDisplayFields(row));
   items = await hydrateJobDescriptions(db, items);
   items = await enrichPostingsWithApplicationState(items);
 
@@ -809,4 +916,4 @@ async function getCounts() {
   };
 }
 
-module.exports = { listPostingsWithFilters, setPostingIgnoredState, getCounts, getPostingLocationGeoFilterOptions, markPostingAppliedState, getWideScanStats }
+module.exports = { listPostingsWithFilters, setPostingIgnoredState, getCounts, getPostingLocationGeoFilterOptions, markPostingAppliedState, getWideScanStats, buildCandidatePrefilter }
