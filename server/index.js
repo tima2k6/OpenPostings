@@ -588,6 +588,24 @@ async function initDb() {
   await ensureSyncServiceSettingsTable();
   await loadSyncServiceSettingsIntoRuntime();
   await ensureCompaniesTableSchema();
+  await refreshQueryPlannerStats();
+}
+
+// Without sqlite_stat1 the planner has no way to tell idx_postings_hidden_last_seen_epoch
+// is worth using for the listing sort, and falls back to sorting the whole visible set in
+// a temp b-tree -- measured at 1004ms against 3ms once stats exist. Existing installs have
+// never had stats, since nothing in the app has ever run ANALYZE. PRAGMA optimize only
+// analyses what has drifted, so it costs ~28ms here rather than the ~206ms of a full
+// ANALYZE, and is safe to repeat.
+async function refreshQueryPlannerStats() {
+  const db = getDb();
+  try {
+    await db.exec(`PRAGMA optimize;`);
+  } catch (error) {
+    // Stats are an optimisation, never a correctness requirement: a failure here should
+    // leave the server running on the old plans rather than refusing to start.
+    console.error(`PRAGMA optimize failed: ${String(error?.message || error)}`);
+  }
 }
 
 
@@ -709,6 +727,9 @@ async function ensurePostingsTable() {
 
     CREATE INDEX IF NOT EXISTS idx_postings_hidden_hidden_at_epoch
       ON Postings(hidden, hidden_at_epoch);
+
+    CREATE INDEX IF NOT EXISTS idx_postings_hidden_last_seen_epoch
+      ON Postings(hidden, last_seen_epoch);
 
     CREATE INDEX IF NOT EXISTS idx_postings_location
       ON Postings(location);
