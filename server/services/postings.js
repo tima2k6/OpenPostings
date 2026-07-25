@@ -168,6 +168,45 @@ function getPostingLocationGeoFilterOptions() {
   return postingLocationGeoFilterOptionsCache;
 }
 
+function normalizeJobDescription(rawJobDescription, ats) {
+  if (ats === "workday") return cleanHtmlText(rawJobDescription) || null;
+  return String(rawJobDescription || "").trim() || null;
+}
+
+// Fills in job_description for an already-paginated set of rows. The filtered query
+// omits the column so it can scan the whole visible set cheaply, which means only the
+// handful of rows actually being returned need the text.
+async function hydrateJobDescriptions(db, items) {
+  const pending = items.filter((item) => item?.job_description === undefined && item?.id !== undefined);
+  if (pending.length === 0) {
+    return items.map((item) =>
+      item?.job_description === undefined ? { ...item, job_description: null } : item
+    );
+  }
+
+  const descriptionById = new Map();
+  const CHUNK_SIZE = 400; // Stay well inside SQLite's bound-parameter limit.
+  for (let index = 0; index < pending.length; index += CHUNK_SIZE) {
+    const chunk = pending.slice(index, index + CHUNK_SIZE);
+    const placeholders = chunk.map(() => "?").join(", ");
+    const rows = await db.all(
+      `SELECT id, job_description FROM Postings WHERE id IN (${placeholders});`,
+      chunk.map((item) => item.id)
+    );
+    for (const row of rows) {
+      descriptionById.set(row?.id, row?.job_description);
+    }
+  }
+
+  return items.map((item) => {
+    if (item?.job_description !== undefined) return item;
+    return {
+      ...item,
+      job_description: normalizeJobDescription(descriptionById.get(item?.id), item?.ats)
+    };
+  });
+}
+
 async function listPostingsWithFilters(options = {}) {
   const db = getDb()
   await pruneExpiredPostings();
@@ -255,9 +294,15 @@ async function listPostingsWithFilters(options = {}) {
       );
     }
   } else {
+    // This branch cannot use LIMIT: the filters below are evaluated in JS, so the
+    // whole visible set has to be scanned before the page can be cut. job_description
+    // is therefore deliberately not selected here — no filter predicate reads it, and
+    // including it pulled hundreds of MB of text (which V8 then doubles as UTF-16, and
+    // doubles again when the rows are enriched) into memory on every filtered request.
+    // Descriptions are fetched for the returned page only, once the slice is known.
     rows = await db.all(
       `
-        SELECT id, company_name, position_name, job_posting_url, posting_date, job_description, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
+        SELECT id, company_name, position_name, job_posting_url, posting_date, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
         FROM Postings
         WHERE COALESCE(hidden, 0) = 0
           AND NOT EXISTS (
@@ -332,10 +377,10 @@ async function listPostingsWithFilters(options = {}) {
     if (!postingDate) {
       postingDate = buildSyncedFallbackPostingDate(row?.first_seen_epoch, row?.last_seen_epoch);
     }
+    // undefined means the description was not selected (filtered path) and will be
+    // hydrated for the returned page; null/"" means there genuinely isn't one.
     const normalizedJobDescription =
-      ats === "workday"
-        ? (cleanHtmlText(row?.job_description) || null)
-        : (String(row?.job_description || "").trim() || null);
+      row?.job_description === undefined ? undefined : normalizeJobDescription(row?.job_description, ats);
 
     return {
       ...row,
@@ -418,6 +463,7 @@ async function listPostingsWithFilters(options = {}) {
   }
 
   items = items.map(({ _has_real_source_posting_date, ...row }) => row);
+  items = await hydrateJobDescriptions(db, items);
   items = await enrichPostingsWithApplicationState(items);
 
   if (!includeApplied) {
