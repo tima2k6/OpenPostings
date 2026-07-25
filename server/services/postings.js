@@ -168,6 +168,58 @@ function getPostingLocationGeoFilterOptions() {
   return postingLocationGeoFilterOptionsCache;
 }
 
+// A filtered query has to scan the whole visible set, because the predicates are
+// evaluated in JS and the page cannot be cut until they have run. That scan costs
+// hundreds of MB and currently takes several seconds — longer than the client's
+// debounce — so adjusting a few filters in a row could leave two or three scans
+// resident at once and multiply the cost into an out-of-memory kill. Only one wide
+// scan is allowed to be in flight at a time; the rest queue.
+let wideScanChain = Promise.resolve();
+let wideScanActive = false;
+let wideScanQueued = 0;
+let wideScanPeakQueued = 0;
+
+function runExclusiveWideScan(task) {
+  wideScanQueued += 1;
+  if (wideScanQueued > wideScanPeakQueued) wideScanPeakQueued = wideScanQueued;
+  if (wideScanActive) {
+    console.log(`[OpenPostings API] filtered query waiting; ${wideScanQueued} queued`);
+  }
+
+  const run = wideScanChain.then(
+    async () => {
+      wideScanActive = true;
+      try {
+        return await task();
+      } finally {
+        wideScanActive = false;
+        wideScanQueued -= 1;
+      }
+    },
+    async () => {
+      // The previous scan failed; that must not stop this one from running.
+      wideScanActive = true;
+      try {
+        return await task();
+      } finally {
+        wideScanActive = false;
+        wideScanQueued -= 1;
+      }
+    }
+  );
+
+  // Keep the chain usable no matter how this task settled.
+  wideScanChain = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
+function getWideScanStats() {
+  return { active: wideScanActive, queued: wideScanQueued, peak_queued: wideScanPeakQueued };
+}
+
 function normalizeJobDescription(rawJobDescription, ats) {
   if (ats === "workday") return cleanHtmlText(rawJobDescription) || null;
   return String(rawJobDescription || "").trim() || null;
@@ -248,6 +300,9 @@ async function listPostingsWithFilters(options = {}) {
     regionFilters.length > 0 ||
     !(remoteFilters.length === 1 && remoteFilters[0] === "all");
 
+  const needsWideScan = Boolean(search) || hasStructuredFilters;
+
+  const runPostingsQuery = async () => {
   let rows = [];
   if (!search && !hasStructuredFilters) {
     if (includeApplied && includeIgnored) {
@@ -499,6 +554,12 @@ async function listPostingsWithFilters(options = {}) {
       include_ignored: includeIgnored
     }
   };
+  };
+
+  // Bounded queries read a single page and are cheap, so they are not made to wait
+  // behind a wide scan.
+  if (!needsWideScan) return runPostingsQuery();
+  return runExclusiveWideScan(runPostingsQuery);
 }
 
 async function enrichPostingsWithApplicationState(items) {
@@ -694,4 +755,4 @@ async function getCounts(options = {}) {
   };
 }
 
-module.exports = { listPostingsWithFilters, setPostingIgnoredState, getCounts, getPostingLocationGeoFilterOptions, markPostingAppliedState }
+module.exports = { listPostingsWithFilters, setPostingIgnoredState, getCounts, getPostingLocationGeoFilterOptions, markPostingAppliedState, getWideScanStats }
