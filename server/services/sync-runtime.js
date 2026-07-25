@@ -893,11 +893,16 @@ async function runAtsSyncInternal() {
             }
             if (dedupedPostingUrls.has(posting.job_posting_url)) continue;
             dedupedPostingUrls.add(posting.job_posting_url);
-            pendingPostingsForUpsert.push(posting);
+
             const directLocation = String(posting?.location || "").trim();
             const inferredLocation = String(inferPostingLocationFromJobUrl(posting?.job_posting_url) || "").trim();
             const existingLocation = String(postingLocationByJobUrl.get(posting?.job_posting_url) || "").trim();
             const location = directLocation || inferredLocation || existingLocation;
+            // Resolve before queueing so the persisted row carries the same value the
+            // in-memory map gets, rather than only whatever the source happened to send.
+            posting.location = location || null;
+            pendingPostingsForUpsert.push(posting);
+
             if (location) {
               nextPostingLocationByJobUrl.set(posting.job_posting_url, location);
               postingLocationByJobUrl.set(posting.job_posting_url, location);
@@ -1062,6 +1067,7 @@ async function upsertPostingsBatch(postings, seenEpoch) {
             position_name,
             job_posting_url,
             posting_date,
+            location,
             job_description,
             compensation_type,
             education_levels,
@@ -1075,11 +1081,12 @@ async function upsertPostingsBatch(postings, seenEpoch) {
             hidden_at_epoch,
             last_seen_epoch
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)
           ON CONFLICT(job_posting_url) DO UPDATE SET
             company_name = excluded.company_name,
             position_name = excluded.position_name,
             posting_date = COALESCE(excluded.posting_date, Postings.posting_date),
+            location = COALESCE(excluded.location, Postings.location),
             job_description = COALESCE(excluded.job_description, Postings.job_description),
             compensation_type = COALESCE(excluded.compensation_type, Postings.compensation_type),
             education_levels = COALESCE(excluded.education_levels, Postings.education_levels),
@@ -1097,6 +1104,7 @@ async function upsertPostingsBatch(postings, seenEpoch) {
           positionName,
           jobPostingUrl,
           postingDate,
+          String(posting?.location || "").trim() || null,
           jobDescription,
           compensationType,
           educationLevels,
@@ -1233,6 +1241,7 @@ async function createCanonicalPostingsTable() {
       position_name TEXT NOT NULL,
       job_posting_url TEXT NOT NULL UNIQUE,
       posting_date TEXT,
+      location TEXT,
       job_description TEXT,
       compensation_type TEXT,
       education_levels TEXT,

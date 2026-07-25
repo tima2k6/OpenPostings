@@ -100,14 +100,43 @@ function hasRealSourcePostingDate(rawPostingDate, ats, firstSeenEpoch, lastSeenE
 }
 
 
-function getPostingLocationGeoFilterOptions() {
+// Distinct locations are read from the stored column, not just the in-memory map:
+// the map is empty after a restart, which used to shrink the country list to the
+// static defaults until a full sync pass had run. Cached for a short interval because
+// the underlying DISTINCT scans the visible set.
+const LOCATION_GEO_OPTIONS_TTL_MS = 60000;
+
+async function readDistinctStoredLocations() {
+  const db = getDb();
+  try {
+    const rows = await db.all(
+      `
+        SELECT DISTINCT location
+        FROM Postings
+        WHERE COALESCE(hidden, 0) = 0
+          AND location IS NOT NULL
+          AND TRIM(location) <> '';
+      `
+    );
+    return rows.map((row) => String(row?.location || "").trim()).filter(Boolean);
+  } catch {
+    // Fall back to whatever the in-memory map has rather than failing the request.
+    return [];
+  }
+}
+
+async function getPostingLocationGeoFilterOptions() {
   const postingLocationByJobUrl = getPostingLocationByJobUrl();
+  const now = Date.now();
   if (
     postingLocationGeoFilterOptionsCache.mapRef === postingLocationByJobUrl &&
-    postingLocationGeoFilterOptionsCache.mapSize === postingLocationByJobUrl.size
+    postingLocationGeoFilterOptionsCache.mapSize === postingLocationByJobUrl.size &&
+    now - Number(postingLocationGeoFilterOptionsCache.builtAtMs || 0) < LOCATION_GEO_OPTIONS_TTL_MS
   ) {
     return postingLocationGeoFilterOptionsCache;
   }
+
+  const storedLocations = await readDistinctStoredLocations();
 
   const countriesByValue = new Map(DEFAULT_COUNTRY_FILTER_OPTIONS.map((country) => [country.value, { ...country }]));
   const defaultCountryValues = new Set(DEFAULT_COUNTRY_FILTER_OPTIONS.map((country) => country.value));
@@ -117,7 +146,10 @@ function getPostingLocationGeoFilterOptions() {
     if (region) presentRegions.add(region);
   }
 
-  for (const location of postingLocationByJobUrl.values()) {
+  // The map can be ahead of the stored column for rows the running sync has touched
+  // but not yet flushed, so consider both.
+  const allLocations = new Set([...storedLocations, ...postingLocationByJobUrl.values()]);
+  for (const location of allLocations) {
     const inferred = inferLocationGeo(location);
     if (inferred.countryValue && inferred.countryLabel) {
       const existing = countriesByValue.get(inferred.countryValue);
@@ -162,6 +194,7 @@ function getPostingLocationGeoFilterOptions() {
   postingLocationGeoFilterOptionsCache = {
     mapRef: postingLocationByJobUrl,
     mapSize: postingLocationByJobUrl.size,
+    builtAtMs: now,
     countries,
     regions
   };
@@ -308,7 +341,7 @@ async function listPostingsWithFilters(options = {}) {
     if (includeApplied && includeIgnored) {
       rows = await db.all(
         `
-          SELECT id, company_name, position_name, job_posting_url, posting_date, job_description, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
+          SELECT id, company_name, position_name, job_posting_url, posting_date, location, job_description, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
           FROM Postings
           WHERE COALESCE(hidden, 0) = 0
             AND (? = 0 OR (posting_date IS NOT NULL AND TRIM(posting_date) <> ''))
@@ -325,7 +358,7 @@ async function listPostingsWithFilters(options = {}) {
     } else {
       rows = await db.all(
         `
-          SELECT p.id, p.company_name, p.position_name, p.job_posting_url, p.posting_date, p.job_description, p.compensation_type, p.education_levels, p.pay_min, p.pay_max, p.pay_currency, p.pay_period, p.pay_raw, p.first_seen_epoch, p.last_seen_epoch
+          SELECT p.id, p.company_name, p.position_name, p.job_posting_url, p.posting_date, p.location, p.job_description, p.compensation_type, p.education_levels, p.pay_min, p.pay_max, p.pay_currency, p.pay_period, p.pay_raw, p.first_seen_epoch, p.last_seen_epoch
           FROM Postings p
           LEFT JOIN posting_application_state s
             ON s.job_posting_url = p.job_posting_url
@@ -357,7 +390,7 @@ async function listPostingsWithFilters(options = {}) {
     // Descriptions are fetched for the returned page only, once the slice is known.
     rows = await db.all(
       `
-        SELECT id, company_name, position_name, job_posting_url, posting_date, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
+        SELECT id, company_name, position_name, job_posting_url, posting_date, location, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
         FROM Postings
         WHERE COALESCE(hidden, 0) = 0
           AND NOT EXISTS (
@@ -403,9 +436,14 @@ async function listPostingsWithFilters(options = {}) {
     const normalizedCompanyName = normalizeLikeText(row?.company_name);
     const companyAts = normalizedCompanyName ? companyAtsByNormalizedName.get(normalizedCompanyName) : "";
     const ats = normalizeAtsFilterValue(companyAts || inferAtsFromJobPostingUrl(row?.job_posting_url));
+    // The stored column is preferred because it survives restarts. The in-memory map
+    // stays ahead of it for rows the current sync has touched but not yet flushed, and
+    // covers rows persisted before the column existed.
+    const storedLocation = String(row?.location || "").trim() || null;
     const mappedLocation = String(postingLocationByJobUrl.get(row?.job_posting_url) || "").trim() || null;
     const inferredLocation = inferPostingLocationFromJobUrl(row?.job_posting_url);
     const location =
+      storedLocation ||
       mappedLocation ||
       inferredLocation ||
       (ats === "ashby" ? inferAshbyLocationFromDescription(row?.job_description) : null);

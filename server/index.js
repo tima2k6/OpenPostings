@@ -650,6 +650,13 @@ async function ensurePostingsTable() {
     await db.exec(`ALTER TABLE Postings ADD COLUMN job_description TEXT;`);
   }
 
+  // Location used to live only in an in-memory map, so it was lost on every restart
+  // and location filters silently matched nothing for postings the running sync had
+  // not re-crawled yet. Existing rows backfill from that map as the sync touches them.
+  if (!existingColumns.has("location")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN location TEXT;`);
+  }
+
   if (!existingColumns.has("compensation_type")) {
     await db.exec(`ALTER TABLE Postings ADD COLUMN compensation_type TEXT;`);
   }
@@ -696,6 +703,9 @@ async function ensurePostingsTable() {
 
     CREATE INDEX IF NOT EXISTS idx_postings_hidden_first_seen_epoch
       ON Postings(hidden, first_seen_epoch);
+
+    CREATE INDEX IF NOT EXISTS idx_postings_location
+      ON Postings(location);
   `);
 }
 
@@ -1280,7 +1290,7 @@ function createServer() {
       counties = [];
     }
 
-    const locationGeoOptions = getPostingLocationGeoFilterOptions();
+    const locationGeoOptions = await getPostingLocationGeoFilterOptions();
     let countries = Array.isArray(locationGeoOptions?.countries) ? locationGeoOptions.countries : [];
     if (countries.length === 0 && states.length > 0) {
       countries = [
