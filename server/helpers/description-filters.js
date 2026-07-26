@@ -642,6 +642,69 @@ function hasBareStateCodeSegmentMatch(locationText, code) {
   return false;
 }
 
+// A segment that is exactly a state name usually is that state ("Seattle, Washington"),
+// but most state names are also town names somewhere else: Washington PA and Washington IN,
+// Indiana PA, California MD, Nevada MO, Wyoming MI, Delaware OH. US locations are written
+// city-first, so when the segment right after the name is an explicit *different* state,
+// the name is the city and the token after it is the state.
+//
+// Deliberately adjacency-based rather than "any other state appears anywhere": the segment
+// splitter also breaks on "/", so a multi-location posting like "Seattle, Washington /
+// Portland, OR" flattens into one list, and a whole-string rule would drop its genuine WA
+// match. This also subsumes the Washington/DC case, though the explicit DC guards below
+// stay for the fused spellings ("washingtondc") that never produce a clean segment.
+function isDifferentState(segment, code) {
+  const segmentCode = String(segment || "").trim().toUpperCase();
+  if (STATE_CODE_TO_NAME[segmentCode] && segmentCode !== code) return true;
+
+  const segmentName = normalizeGeoText(segment);
+  for (const [otherCode, otherName] of Object.entries(STATE_CODE_TO_NAME)) {
+    if (otherCode !== code && segmentName === otherName) return true;
+  }
+  return false;
+}
+
+function isNonUsCountry(segment) {
+  const countryCode = COUNTRY_ALIAS_TO_CODE.get(normalizeCountryLikePart(segment));
+  return Boolean(countryCode) && countryCode !== "US";
+}
+
+// A segment that is exactly a state name usually is that state ("Seattle, Washington"), but
+// most state names are also town names somewhere else -- Washington PA and Washington IN,
+// Indiana PA, California MD, Nevada MO, Wyoming MI, Delaware OH -- and abroad, such as
+// Washington in Tyne and Wear. Two signals distinguish the town from the state:
+//
+//   - US locations are written city-first, so an explicit *different* state in the very
+//     next position means the name was the city ("Washington, PA").
+//   - a non-US country anywhere alongside it means it is not a US state at all
+//     ("Washington, Tyne and Wear, United Kingdom").
+//
+// Both are scoped to one location. "/" and friends separate whole locations, and a posting
+// listing many of them flattens into a single string, so the check runs per location group
+// and any one clean group is a match. Otherwise "Seattle, Washington / Portland, OR" would
+// lose its genuine WA match to the other location's state.
+function hasStateNameGroupMatch(locationText, stateName, code) {
+  const groups = String(locationText || "")
+    .split(/[/|;]+/)
+    .map((group) => group.trim())
+    .filter(Boolean);
+
+  return groups.some((group) => {
+    const segments = group
+      .split(/,+|\s+-\s+/)
+      .map((segment) => segment.trim())
+      .filter(Boolean);
+
+    const nameIndex = segments.findIndex((segment) => normalizeGeoText(segment) === stateName);
+    if (nameIndex < 0) return false;
+
+    const next = segments[nameIndex + 1];
+    if (next && isDifferentState(next, code)) return false;
+
+    return !segments.some((segment) => isNonUsCountry(segment));
+  });
+}
+
 function hasStateLikeMatch(locationText, stateCode) {
   const code = String(stateCode || "").trim().toUpperCase();
   if (!code) return false;
@@ -657,7 +720,7 @@ function hasStateLikeMatch(locationText, stateCode) {
 
   const stateName = STATE_CODE_TO_NAME[code];
   if (!stateName) return false;
-  if (!hasStateNameSegmentMatch(locationText, stateName)) return false;
+  if (!hasStateNameGroupMatch(locationText, stateName, code)) return false;
 
   if (code === "WA") {
     if (containsGeoPhrase(normalizedGeoLocation, STATE_CODE_TO_NAME.DC)) return false;

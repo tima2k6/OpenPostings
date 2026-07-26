@@ -8,13 +8,14 @@ const { setDb, getDb } = require("../services/runtime-context.js");
 const {
   createCanonicalPostingsTable,
   pruneExpiredPostings,
-  deleteExpiredHiddenPostings
+  deleteExpiredHiddenPostings,
+  upsertPostingsBatch
 } = require("../services/sync-runtime.js");
 
 const DAY_SECONDS = 24 * 60 * 60;
 const NOW = 1800000000;
 
-async function seedPosting(db, { url, firstSeen, hidden = 0, hiddenAt = null, description = "body" }) {
+async function seedPosting(db, { url, firstSeen, lastSeen, hidden = 0, hiddenAt = null, description = "body" }) {
   await db.run(
     `
       INSERT INTO Postings (
@@ -23,7 +24,7 @@ async function seedPosting(db, { url, firstSeen, hidden = 0, hiddenAt = null, de
       )
       VALUES ('Acme', 'Engineer', ?, ?, ?, ?, ?, ?);
     `,
-    [url, description, firstSeen, firstSeen, hidden, hiddenAt]
+    [url, description, firstSeen, lastSeen === undefined ? firstSeen : lastSeen, hidden, hiddenAt]
   );
 }
 
@@ -76,6 +77,63 @@ async function testPruneKeepsOriginalHiddenAtEpoch() {
       Number(row.hidden_at_epoch),
       originalHiddenAt,
       "re-running the prune must not push the retention clock forward"
+    );
+  });
+}
+
+// Regression: the prune used to key off first_seen_epoch, which gave every posting a hard
+// lifetime from discovery and hid roles the ATS was still listing.
+async function testPruneKeepsPostingsStillListed() {
+  await withDb(async (db) => {
+    await seedPosting(db, {
+      url: "https://x/old-but-still-open",
+      firstSeen: NOW - 30 * DAY_SECONDS,
+      lastSeen: NOW - 60
+    });
+    await seedPosting(db, {
+      url: "https://x/delisted",
+      firstSeen: NOW - 30 * DAY_SECONDS,
+      lastSeen: NOW - 3 * DAY_SECONDS
+    });
+
+    const hiddenCount = await pruneExpiredPostings(NOW);
+    assert.strictEqual(hiddenCount, 1, "only the delisted posting should be hidden");
+
+    const open = await db.get(`SELECT hidden FROM Postings WHERE job_posting_url = 'https://x/old-but-still-open';`);
+    assert.strictEqual(Number(open.hidden), 0, "a posting the ATS still lists must stay visible regardless of its age");
+
+    const delisted = await db.get(`SELECT hidden FROM Postings WHERE job_posting_url = 'https://x/delisted';`);
+    assert.strictEqual(Number(delisted.hidden), 1, "a posting the ATS stopped listing must be hidden");
+  });
+}
+
+// Regression: the upsert's `WHERE hidden = 0` guard discarded the entire update for hidden
+// rows, so a pruned posting could never be revived even while it was still live.
+async function testResightRevivesHiddenPosting() {
+  await withDb(async (db) => {
+    await seedPosting(db, {
+      url: "https://x/relisted",
+      firstSeen: NOW - 30 * DAY_SECONDS,
+      hidden: 1,
+      hiddenAt: NOW - 5 * DAY_SECONDS,
+      description: null
+    });
+
+    await upsertPostingsBatch(
+      [{ company_name: "Acme", position_name: "Engineer", job_posting_url: "https://x/relisted" }],
+      NOW
+    );
+
+    const row = await db.get(
+      `SELECT hidden, hidden_at_epoch, first_seen_epoch, last_seen_epoch FROM Postings WHERE job_posting_url = 'https://x/relisted';`
+    );
+    assert.strictEqual(Number(row.hidden), 0, "seeing a posting again must bring it back into view");
+    assert.strictEqual(row.hidden_at_epoch, null, "reviving a posting must clear its retention clock");
+    assert.strictEqual(Number(row.last_seen_epoch), NOW, "the re-sight must advance last_seen_epoch");
+    assert.strictEqual(
+      Number(row.first_seen_epoch),
+      NOW - 30 * DAY_SECONDS,
+      "reviving must preserve the original discovery time"
     );
   });
 }
@@ -133,6 +191,8 @@ async function testDeleteIsNoOpWhenNothingExpired() {
 async function main() {
   await testPruneHidesAndClearsDescriptions();
   await testPruneKeepsOriginalHiddenAtEpoch();
+  await testPruneKeepsPostingsStillListed();
+  await testResightRevivesHiddenPosting();
   await testDeleteRespectsRetentionWindow();
   await testDeleteChunksBeyondOneBatch();
   await testDeleteIsNoOpWhenNothingExpired();

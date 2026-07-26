@@ -242,6 +242,52 @@ async function testUnfilteredListingIsUnaffected() {
   );
 }
 
+// Regression: the listing queries bounded the visible set with first_seen_epoch while the
+// sync prunes on last_seen_epoch. That re-imposed the age cutoff at query time, so a
+// posting the sync had correctly revived -- discovered long ago, but confirmed still live
+// moments ago -- was filtered out of every listing anyway. Both the unfiltered and the
+// filtered branch build their own SQL, so both are covered here.
+async function testLongLivedPostingStaysListed() {
+  const DAY = 24 * 60 * 60;
+  await withDb([], async (db) => {
+    await db.run(
+      `INSERT INTO Postings
+         (company_name, position_name, job_posting_url, location, posting_date,
+          first_seen_epoch, last_seen_epoch, hidden)
+       VALUES ('Acme', 'Engineer', 'https://x/long-lived', 'Seattle, WA', '1/1/26', ?, ?, 0)`,
+      [NOW - 30 * DAY, NOW - 60]
+    );
+
+    const unfiltered = await listPostingsWithFilters({});
+    assert.strictEqual(
+      unfiltered.count,
+      1,
+      "a posting still listed by its ATS must appear regardless of how long ago it was discovered"
+    );
+
+    const filtered = await listPostingsWithFilters({ states: ["WA"] });
+    assert.strictEqual(filtered.count, 1, "the filtered branch must apply the same freshness column");
+  });
+}
+
+// The other half of the same rule: once the ATS stops listing a posting it must drop out,
+// even though it was discovered recently.
+async function testDelistedPostingIsNotListed() {
+  const DAY = 24 * 60 * 60;
+  await withDb([], async (db) => {
+    await db.run(
+      `INSERT INTO Postings
+         (company_name, position_name, job_posting_url, location, posting_date,
+          first_seen_epoch, last_seen_epoch, hidden)
+       VALUES ('Acme', 'Engineer', 'https://x/delisted', 'Seattle, WA', '1/1/26', ?, ?, 0)`,
+      [NOW - 60, NOW - 3 * DAY]
+    );
+
+    const unfiltered = await listPostingsWithFilters({});
+    assert.strictEqual(unfiltered.count, 0, "a posting the ATS stopped listing must drop out of listings");
+  });
+}
+
 async function testFilteredRowsCarryDisplayFields() {
   await withDb([{ url: "https://x/a", position: "Engineer", location: "Austin, TX" }], async () => {
     const result = await listPostingsWithFilters({ search: "engineer" });
@@ -262,6 +308,8 @@ async function main() {
   await testPayRangeBoundaries();
   await testPayPeriodFilterKeepsOnlyPeriodedRows();
   await testUnfilteredListingIsUnaffected();
+  await testLongLivedPostingStaysListed();
+  await testDelistedPostingIsNotListed();
   await testFilteredRowsCarryDisplayFields();
   console.log("posting-filter-pushdown tests passed");
 }

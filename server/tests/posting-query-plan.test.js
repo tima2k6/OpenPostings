@@ -57,7 +57,7 @@ async function testListingSortStreamsFromIndex() {
       db,
       `SELECT id, company_name, last_seen_epoch
        FROM Postings
-       WHERE hidden = 0 AND first_seen_epoch >= ?
+       WHERE hidden = 0 AND last_seen_epoch >= ?
        ORDER BY last_seen_epoch DESC, id DESC
        LIMIT 500`,
       [NOW - 86400]
@@ -75,9 +75,9 @@ async function testListingSortStreamsFromIndex() {
 
 async function testPrunePredicateUsesIndex() {
   await withSeededDb(async (db) => {
-    const plan = await planFor(db, `SELECT id FROM Postings WHERE hidden = 0 AND first_seen_epoch < ?`, [NOW]);
+    const plan = await planFor(db, `SELECT id FROM Postings WHERE hidden = 0 AND last_seen_epoch < ?`, [NOW]);
     assert.ok(
-      plan.includes("idx_postings_hidden_first_seen_epoch"),
+      plan.includes("idx_postings_hidden_last_seen_epoch"),
       `prune predicate should use the freshness index, got: ${plan}`
     );
     assert.ok(!plan.includes("SCAN Postings"), `prune predicate must not scan the table, got: ${plan}`);
