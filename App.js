@@ -212,7 +212,7 @@ const DEFAULT_ATS_FILTER_OPTIONS = [
   { value: "careerplug", label: "CareerPlug" },
   { value: "careerpuck", label: "CareerPuck" },
   { value: "careerspage", label: "CareersPage" },
-  // { value: "dayforcehcm", label: "Dayforce" },
+  { value: "dayforcehcm", label: "Dayforce" },
   { value: "eightfold", label: "Eightfold" },
   { value: "fountain", label: "Fountain" },
   { value: "freshteam", label: "Freshteam" },
@@ -253,7 +253,7 @@ const DEFAULT_ATS_FILTER_OPTIONS = [
   { value: "webcruiter", label: "Webcruiter" },
   { value: "academicjobsonline", label: "AcademicJobsOnline" },
   { value: "hibob", label: "HiBob" },
-  { value: "isolvisolvedhire", label: "isolvedhire" },
+  { value: "isolved", label: "isolved" },
   { value: "greenhouse", label: "Greenhouse" },
   { value: "hirebridge", label: "Hirebridge" },
   { value: "hcareers", label: "Hcareers" },
@@ -334,6 +334,9 @@ const ATS_LABEL_BY_VALUE = {
   policeapp: "PoliceApp",
   usajobs: "USAJobs",
   k12jobspot: "K12JobSpot",
+  snaphunt: "Snaphunt",
+  dover: "Dover",
+  oorwin: "Oorwin",
   schoolspring: "SchoolSpring",
   calcareers: "CalCareers",
   calopps: "CalOpps",
@@ -342,7 +345,7 @@ const ATS_LABEL_BY_VALUE = {
   webcruiter: "Webcruiter",
   academicjobsonline: "AcademicJobsOnline",
   hibob: "HiBob",
-  isolvisolvedhire: "isolvedhire",
+  isolved: "isolved",
   greenhouse: "Greenhouse",
   hirebridge: "Hirebridge",
   hcareers: "Hcareers",
@@ -648,8 +651,10 @@ function normalizeAtsValue(value) {
   ) {
     return "yello";
   }
-  if (normalized === "isolvisolvedhire" || normalized === "isolvedhire" || normalized === "isolvedhire.com" || normalized === "isolvedhirecom") {
-    return "isolvisolvedhire";
+  // "isolvisolvedhire" is the typo this client used as the canonical value before it
+  // was reconciled with the server; keep accepting it so stored settings survive.
+  if (normalized === "isolvisolvedhire" || normalized === "isolvedhire" || normalized === "isolvedhire.com" || normalized === "isolvedhirecom" || normalized === "isolved") {
+    return "isolved";
   }
   if (normalized === "agilehr.com" || normalized === "agilehrcom" || normalized === "agilehr") return "agilehr";
   if (normalized === "avature" || normalized === "avature.net" || normalized === "avaturenet") return "avature";
@@ -847,7 +852,7 @@ function normalizePostingFreshnessHours(value) {
 
 function normalizeSyncEnabledAts(value, fallback = DEFAULT_ATS_FILTER_OPTIONS.map((option) => option.value)) {
   const allowed = new Set(DEFAULT_ATS_FILTER_OPTIONS.map((option) => option.value));
-  const source = Array.isArray(value) ? value : [];
+  const source = (Array.isArray(value) ? value : []).filter((item) => String(item || "").trim());
   const normalized = [];
   for (const item of source) {
     const atsValue = normalizeAtsValue(item);
@@ -855,6 +860,11 @@ function normalizeSyncEnabledAts(value, fallback = DEFAULT_ATS_FILTER_OPTIONS.ma
     normalized.push(atsValue);
   }
   if (normalized.length > 0) return normalized;
+
+  // Matches the server: a selection that named ATSs but matched none of them stays
+  // narrow instead of expanding to every ATS. Only an absent selection takes the
+  // default, and the toggle list below refuses to clear the last entry.
+  if (source.length > 0) return [];
 
   const fallbackList = Array.isArray(fallback) ? fallback : [];
   const fallbackNormalized = [];

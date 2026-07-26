@@ -116,7 +116,7 @@ Current sync support includes:
 - `governmentjobs`
 - `smartrecruiters`
 - `hibob`
-- `isolvisolvedhire`
+- `isolved`
 - `policeapp`
 - `usajobs`
 - `k12jobspot`

@@ -22,7 +22,7 @@ const ATS_FILTER_OPTIONS = new Set([
   "bamboohr",
   "manatal",
   "careerpuck",
-  // "dayforcehcm",
+  "dayforcehcm",
   "fountain",
   "getro",
   "governmentjobs",
@@ -133,7 +133,7 @@ const ATS_FILTER_OPTION_ITEMS = Object.freeze([
   { value: "eightfold", label: "Eightfold" },
   { value: "manatal", label: "Manatal" },
   { value: "careerspage", label: "CareersPage" },
-  // { value: "dayforcehcm", label: "Dayforce" },
+  { value: "dayforcehcm", label: "Dayforce" },
   { value: "pageup", label: "PageUp" },
   { value: "hirebridge", label: "Hirebridge" },
   { value: "brassring", label: "BrassRing" },
@@ -205,9 +205,24 @@ function normalizeCompanyNameForBlockList(value) {
 }
 
 function normalizeSyncEnabledAts(value, fallbackValue = SYNC_DEFAULT_ENABLED_ATS) {
-  const fallback = normalizeAtsFilters(Array.isArray(fallbackValue) ? fallbackValue : SYNC_DEFAULT_ENABLED_ATS);
-  const normalized = normalizeAtsFilters(Array.isArray(value) ? value : parseJsonArray(value));
+  const requested = parseJsonArray(value);
+  const normalized = normalizeAtsFilters(requested);
   if (normalized.length > 0) return normalized;
+
+  // A request that named ATSs but matched none of them is a selection we failed to
+  // recognize, not an absent one. Widening it to the full default list would enable
+  // every ATS behind the user's back, so keep it as narrow as it was asked for.
+  if (requested.length > 0) {
+    console.warn(
+      `[OpenPostings API] ignoring unrecognized sync_enabled_ats values: ${requested.join(", ")}`
+    );
+    return [];
+  }
+
+  // Nothing was requested at all: an unset settings row stores '[]', and the sync
+  // settings UI refuses to clear the last ATS, so an empty list only ever means
+  // "not configured" and takes the default.
+  const fallback = normalizeAtsFilters(Array.isArray(fallbackValue) ? fallbackValue : SYNC_DEFAULT_ENABLED_ATS);
   if (fallback.length > 0) return fallback;
   return Array.from(SYNC_DEFAULT_ENABLED_ATS);
 }
@@ -324,7 +339,10 @@ function normalizeAtsFilterValue(value) {
     normalized === "isolved" ||
     normalized === "isolvedhire" ||
     normalized === "isolvedhire.com" ||
-    normalized === "isolvedhirecom"
+    normalized === "isolvedhirecom" ||
+    // Builds before the client and server ATS lists were reconciled stored this
+    // typo as the canonical value, so settings saved by them still arrive here.
+    normalized === "isolvisolvedhire"
   ) {
     return "isolved";
   }
