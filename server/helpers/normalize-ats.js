@@ -40,6 +40,7 @@ const ATS_FILTER_OPTIONS = new Set([
   "edjoin",
   "webcruiter",
   "academicjobsonline",
+  "hcareers",
   "hrmdirect",
   "talentlyft",
   "talexio",
@@ -185,6 +186,7 @@ const ATS_FILTER_OPTION_ITEMS = Object.freeze([
   { value: "edjoin", label: "EdJoin" },
   { value: "webcruiter", label: "Webcruiter" },
   { value: "academicjobsonline", label: "AcademicJobsOnline" },
+  { value: "hcareers", label: "Hcareers" },
   { value: "hrmdirect", label: "HRMDirect" },
   { value: "talentlyft", label: "Talentlyft" },
   { value: "talexio", label: "Talexio" },
@@ -489,6 +491,14 @@ function normalizeAtsFilterValue(value) {
   ) {
     return "academicjobsonline";
   }
+  if (
+    normalized === "hcareers.com" ||
+    normalized === "hcareerscom" ||
+    normalized === "www.hcareers.com" ||
+    normalized === "wwwhcareerscom"
+  ) {
+    return "hcareers";
+  }
   if (normalized === "hrmdirect.com" || normalized === "hrmdirectcom") {
     return "hrmdirect";
   }
@@ -712,6 +722,7 @@ function inferAtsFromJobPostingUrl(value) {
   if (url.includes("calcareers.ca.gov/calhrpublic/jobs/jobposting.aspx?jobcontrolid=")) return "calcareers";
   if (url.includes("calopps.org/") && url.includes("/job-")) return "calopps";
   if (url.includes("statejobsny.com/public/vacancydetailsview.cfm?id=")) return "statejobsny";
+  if (url.includes("hcareers.com/jobs/")) return "hcareers";
   if (url.includes(".hrmdirect.com/employment/job-opening.php")) return "hrmdirect";
   if (url.includes(".talentlyft.com/jobs/")) return "talentlyft";
   if (url.includes(".talexio.com/jobs")) return "talexio";
