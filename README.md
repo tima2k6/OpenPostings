@@ -147,6 +147,7 @@ Current sync support includes:
 - `EdJoin`
 - `Webcruiter`
 - `AcademicJobsOnline`
+- `Hcareers`
 - `prismhr`
 - `silkroad`
 - `paycor`

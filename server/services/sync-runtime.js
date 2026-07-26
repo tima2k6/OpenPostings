@@ -94,6 +94,7 @@ const { collectPostingsForAcademicJobsOnlineDynamic, ACADEMICJOBSONLINE_ESTIMATE
 const { collectPostingsForCalcareersDynamic, CALCAREERS_ESTIMATED_COMPANY_COUNT } = require("../ats/calcareers/service.js");
 const { collectPostingsForCaloppsDynamic, CALOPPS_ESTIMATED_COMPANY_COUNT } = require("../ats/calopps/service.js");
 const { collectPostingsForStatejobsnyDynamic, STATEJOBSNY_ESTIMATED_COMPANY_COUNT } = require("../ats/statejobsny/service.js");
+const { collectPostingsForHcareersDynamic, HCAREERS_ESTIMATED_COMPANY_COUNT } = require("../ats/hcareers/service.js");
 
 const syncStatus = {
   running: false,
@@ -604,6 +605,15 @@ async function collectPostingsForCompany(company, options = {}) {
   ) {
     return collectPostingsForStatejobsnyDynamic();
   }
+  if (
+    atsName === "hcareers" ||
+    atsName === "hcareers.com" ||
+    atsName === "hcareerscom" ||
+    atsName === "www.hcareers.com" ||
+    atsName === "wwwhcareerscom"
+  ) {
+    return collectPostingsForHcareersDynamic();
+  }
   if (atsName === "hrmdirect" || atsName === "hrmdirect.com" || atsName === "hrmdirectcom") {
     return collectPostingsForHrmDirectCompany(company);
   }
@@ -807,6 +817,14 @@ async function runAtsSyncInternal() {
         company_name: "StateJobsNY (dynamic)",
         url_string: "https://www.statejobsny.com/public/vacancyTable.cfm",
         ATS_name: "statejobsny"
+      });
+    }
+    if (enabledAts.has("hcareers")) {
+      syncTargets.push({
+        id: null,
+        company_name: "Hcareers (dynamic)",
+        url_string: "https://www.hcareers.com/jobs/recent",
+        ATS_name: "hcareers"
       });
     }
     if (enabledAts.has("edjoin")) {
@@ -1498,6 +1516,9 @@ async function getSyncScopeStats() {
   }
   if (enabledAts.has("edjoin")) {
     syncEnabledCompanyCount += EDJOIN_ESTIMATED_COMPANY_COUNT;
+  }
+  if (enabledAts.has("hcareers")) {
+    syncEnabledCompanyCount += HCAREERS_ESTIMATED_COMPANY_COUNT;
   }
   if (enabledAts.has("webcruiter")) {
     syncEnabledCompanyCount += WEBCRUITER_ESTIMATED_COMPANY_COUNT;
