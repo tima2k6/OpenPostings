@@ -17,6 +17,7 @@
     "test:backend": "node --check server/index.js && node --check server/mcp-apply-server.js",
     "test:backend:seeded-source": "node server/tests/seeded-source-parser.test.js",
     "test:backend:location-filter": "node server/tests/location-state-filter.test.js",
+    "test:backend:mcp-location-filter": "node server/tests/mcp-location-filter.test.js",
     "test:filter-normalize": "node server/tests/filter-normalize.test.js",
     "test:backend:posting-retention": "node server/tests/posting-retention.test.js",
     "test:backend:posting-query-plan": "node server/tests/posting-query-plan.test.js",

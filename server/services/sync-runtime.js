@@ -1211,8 +1211,13 @@ async function upsertPostingsBatch(postings, seenEpoch) {
             pay_period = CASE WHEN excluded.job_description IS NULL THEN Postings.pay_period ELSE excluded.pay_period END,
             pay_raw = CASE WHEN excluded.job_description IS NULL THEN Postings.pay_raw ELSE excluded.pay_raw END,
             first_seen_epoch = COALESCE(Postings.first_seen_epoch, Postings.last_seen_epoch, excluded.first_seen_epoch),
-            last_seen_epoch = excluded.last_seen_epoch
-          WHERE Postings.hidden = 0;
+            last_seen_epoch = excluded.last_seen_epoch,
+            -- Seeing a posting again means the ATS still lists it, so it is open and must
+            -- come back into view. This branch previously carried a "WHERE hidden = 0"
+            -- guard, which silently discarded the whole update for any hidden row: once
+            -- pruned, a posting could never be revived even while it was still live.
+            hidden = 0,
+            hidden_at_epoch = NULL;
         `,
         [
           companyName,
@@ -1255,14 +1260,18 @@ async function upsertPostings(postings, lastSeenEpoch) {
 }
 
 // Hidden rows are kept as tombstones rather than deleted immediately: job_posting_url is
-// UNIQUE, so the row is what stops a posting that is still listed by its ATS from being
-// re-inserted as new on the next pass and surfacing again for another freshness window.
+// UNIQUE, so the row is what lets a delisted posting be recognised (and its original
+// first_seen_epoch preserved) if the ATS lists it again inside the retention window.
 const HIDDEN_POSTING_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 
 // Descriptions are dropped at the moment of hiding. They are the bulk of the database
 // (on a 658k-row instance, 435MB of 931MB lived in 96k descriptions) and nothing reads
 // them once a posting is hidden, so keeping them for the whole retention window is pure
 // disk cost. The row itself stays until deleteExpiredHiddenPostings takes it.
+// Staleness is measured from last_seen_epoch, not first_seen_epoch: the freshness window
+// asks "has the ATS stopped listing this?", not "how long ago did we discover it?". Keying
+// it off first_seen_epoch gave every posting a hard lifetime from discovery and hid roles
+// that were still open, which the upsert's re-sight branch below could then never recover.
 async function pruneExpiredPostings(referenceEpoch = nowEpochSeconds()) {
   const resolvedReferenceEpoch = Number(referenceEpoch || nowEpochSeconds());
   const cutoffEpoch = resolvedReferenceEpoch - getPostingFreshnessWindowSeconds();
@@ -1275,7 +1284,7 @@ async function pruneExpiredPostings(referenceEpoch = nowEpochSeconds()) {
         hidden_at_epoch = COALESCE(hidden_at_epoch, ?),
         job_description = NULL
       WHERE hidden = 0
-        AND first_seen_epoch < ?;
+        AND COALESCE(last_seen_epoch, first_seen_epoch) < ?;
     `,
     [resolvedReferenceEpoch, cutoffEpoch]
   );
@@ -1534,6 +1543,6 @@ async function getSyncScopeStats() {
   };
 }
 
-module.exports = { runAtsSync, getSyncScopeStats, pruneExpiredPostings, deleteExpiredHiddenPostings, createCanonicalPostingsTable, syncStatus, startSyncStallWatchdog, recoverStalledSync };
+module.exports = { runAtsSync, getSyncScopeStats, pruneExpiredPostings, deleteExpiredHiddenPostings, createCanonicalPostingsTable, upsertPostingsBatch, syncStatus, startSyncStallWatchdog, recoverStalledSync };
 
 

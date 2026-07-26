@@ -354,8 +354,16 @@ function hasStateLikeMatch(locationText, stateCode) {
 
   const normalizedLocation = normalizeLikeText(locationText);
   if (code === "WA") {
-    if (normalizedLocation.includes(STATE_CODE_TO_NAME.DC)) return false;
-    if (/\bwashington\s*[- ]?\s*dc/i.test(normalizedLocation)) return false;
+    // normalizeLikeText keeps commas, so the fused-variant regex below never matched the
+    // ordinary "Washington, DC" form -- the separator between "washington" and "dc" is
+    // ", " and the pattern only allowed spaces and dashes. That made this guard dead for
+    // the one spelling that actually occurs in the data, and DC postings passed as WA.
+    // Collapse separators first, mirroring normalizeGeoText in description-filters.js.
+    const collapsedLocation = normalizedLocation.replace(/[.,/-]+/g, " ").replace(/\s+/g, " ").trim();
+    if (collapsedLocation.includes(STATE_CODE_TO_NAME.DC)) return false;
+    // Trailing boundary is deliberately omitted so fused variants ("washington dcmetro
+    // area") stay caught, matching the previous intent.
+    if (/\bwashington\s*d\s*c/.test(collapsedLocation)) return false;
   }
 
   return true;
@@ -998,8 +1006,9 @@ async function findCandidates(options = {}) {
 
   const rows = await db.all(
     `
-      SELECT id, company_name, position_name, job_posting_url, posting_date
+      SELECT id, company_name, position_name, job_posting_url, posting_date, location
       FROM Postings
+      WHERE hidden = 0
       ORDER BY company_name ASC, position_name ASC;
     `
   );
@@ -1012,7 +1021,12 @@ async function findCandidates(options = {}) {
   let items = rows
     .map((row) => ({
       ...row,
-      location: inferLocationFromJobUrl(row?.job_posting_url),
+      // The sync stores a real location on the row. Deriving it from the URL instead only
+      // ever worked for myworkdayjobs.com hosts (~6% of postings) and returned "" for the
+      // rest, which rowMatchesLocationFilters rejects outright -- so any state or county
+      // preference silently discarded most of the database. The URL stays as a fallback
+      // for rows the sync could not populate.
+      location: String(row?.location || "").trim() || inferLocationFromJobUrl(row?.job_posting_url),
       ats: inferAtsFromJobPostingUrl(row?.job_posting_url)
     }))
     .filter((row) => {
