@@ -98,6 +98,70 @@ function run() {
     "PA filter should still match Fort Washington, PA"
   );
 
+  // A bare state name is normally the state, but most state names are also towns in some
+  // other state. US locations are city-first, so the segment after the name settles it.
+  for (const location of [
+    "Washington, PA",
+    "Washington, IN",
+    "Washington, PA, United States",
+    "Washington, IN, United States",
+    "Washington, MO",
+    "Washington, UT",
+    "Washington, Pennsylvania"
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, ["WA"], [], [], []),
+      false,
+      `WA filter should not match the town of ${location}`
+    );
+  }
+
+  for (const [location, code] of [
+    ["Indiana, PA, United States", "IN"],
+    ["California, MD, United States", "CA"],
+    ["Nevada, MO, United States", "NV"],
+    ["Wyoming, MI, United States", "WY"],
+    ["Delaware, OH, United States", "DE"]
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, [code], [], [], []),
+      false,
+      `${code} filter should not match the town of ${location}`
+    );
+  }
+
+  assert.equal(
+    rowMatchesLocationFilters("Washington, PA, United States", ["PA"], [], [], []),
+    true,
+    "PA filter should still match the town of Washington, PA"
+  );
+
+  for (const location of [
+    "Washington, United Kingdom",
+    "Washington, Tyne and Wear, United Kingdom",
+    "Chinnor, United Kingdom / Washington, United Kingdom"
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, ["WA"], [], [], []),
+      false,
+      `WA filter should not match the English town of ${location}`
+    );
+  }
+
+  assert.equal(
+    rowMatchesLocationFilters("Portland, OR / Seattle, Washington, United States", ["WA"], [], [], []),
+    true,
+    "WA filter should match the WA half of a multi-location posting listed after another state"
+  );
+
+  // The segment splitter also breaks on "/", so a multi-location posting flattens into a
+  // single list. Its genuine WA match must survive the other location's state code.
+  assert.equal(
+    rowMatchesLocationFilters("Seattle, Washington / Portland, OR", ["WA"], [], [], []),
+    true,
+    "WA filter should still match a multi-location posting that also lists Portland, OR"
+  );
+
   console.log("location-state-filter tests passed");
 }
 

@@ -43,14 +43,42 @@ const CASES = [
   ["Seattle, WA", true],
   ["Vancouver, WA, USA", true],
   ["Bellevue, Washington, United States", true],
+  ["Washington", true],
+  // The splitter breaks on "/", so a multi-location posting flattens into one segment
+  // list. Its genuine WA match must survive the other location's state.
+  ["Seattle, Washington / Portland, OR", true],
   ["Washington, DC", false],
   ["Washington, DC, USA", false],
   ["Washington, DC, United States", false],
   ["Washington, District of Columbia, United States", false],
   ["Washington DC, USA", false],
+  // Washington in Tyne and Wear, and the long multi-location strings it shows up in.
+  ["Washington, United Kingdom", false],
+  ["Washington, Tyne and Wear, United Kingdom", false],
+  ["Chinnor, United Kingdom / Washington, United Kingdom", false],
+  ["Portland, OR / Seattle, Washington, United States", true],
+  // Towns named Washington in other states: the segment after the name is the real state.
+  ["Washington, PA", false],
+  ["Washington, IN", false],
+  ["Washington, PA, United States", false],
+  ["Washington, IN, United States", false],
+  ["Washington, MO", false],
+  ["Washington, UT", false],
+  ["Washington, Pennsylvania", false],
   ["Fort Washington, PA, United States", false],
   ["New Washington, OH, United States", false],
   ["Austin, TX", false]
+];
+
+// The same rule, for states whose name is also a town elsewhere.
+const OTHER_STATE_CASES = [
+  ["Indianapolis, Indiana, United States", "IN", true],
+  ["Los Angeles, California", "CA", true],
+  ["Indiana, PA, United States", "IN", false],
+  ["California, MD, United States", "CA", false],
+  ["Nevada, MO, United States", "NV", false],
+  ["Wyoming, MI, United States", "WY", false],
+  ["Delaware, OH, United States", "DE", false]
 ];
 
 function run() {
@@ -66,6 +94,19 @@ function run() {
       helperMatches(location, ["WA"], [], [], []),
       expected,
       `shared-helper WA filter on ${JSON.stringify(location)} should be ${expected}`
+    );
+  }
+
+  for (const [location, code, expected] of OTHER_STATE_CASES) {
+    assert.strictEqual(
+      mcpMatches(location, [code], []),
+      expected,
+      `MCP ${code} filter on ${JSON.stringify(location)} should be ${expected}`
+    );
+    assert.strictEqual(
+      helperMatches(location, [code], [], [], []),
+      expected,
+      `shared-helper ${code} filter on ${JSON.stringify(location)} should be ${expected}`
     );
   }
 

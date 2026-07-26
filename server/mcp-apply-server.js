@@ -11,6 +11,7 @@ const {
   normalizeAtsFilters,
   inferAtsFromJobPostingUrl
 } = require("./helpers/normalize-ats.js");
+const { inferLocationGeo } = require("./helpers/description-filters.js");
 
 const ROOT_DIR = path.resolve(__dirname, "..", "..");
 const DB_PATH = process.env.DB_PATH || path.resolve(__dirname, "..", "jobs.db");
@@ -341,6 +342,48 @@ function hasStateNameSegmentMatch(locationText, stateName) {
   return segments.some((segment) => normalizeLikeText(segment) === stateName);
 }
 
+function isDifferentState(segment, code) {
+  const segmentCode = String(segment || "").trim().toUpperCase();
+  if (STATE_CODE_TO_NAME[segmentCode] && segmentCode !== code) return true;
+
+  const segmentName = normalizeLikeText(segment);
+  for (const [otherCode, otherName] of Object.entries(STATE_CODE_TO_NAME)) {
+    if (otherCode !== code && segmentName === otherName) return true;
+  }
+  return false;
+}
+
+// Mirrors hasStateNameGroupMatch in description-filters.js -- see the note there. A state
+// name segment is a town when the next segment names a different state ("Washington, PA")
+// or a non-US country sits alongside it ("Washington, Tyne and Wear, United Kingdom").
+// Scoped per location group so "Seattle, Washington / Portland, OR" keeps its WA match.
+//
+// The country half defers to inferLocationGeo from the shared helper rather than growing
+// another hand-maintained table here -- the same direction commit a9fa375 took the ATS
+// registry, and a step toward retiring this duplicated filter logic entirely.
+function hasStateNameGroupMatch(locationText, stateName, code) {
+  const groups = String(locationText || "")
+    .split(/[/|;]+/)
+    .map((group) => group.trim())
+    .filter(Boolean);
+
+  return groups.some((group) => {
+    const segments = group
+      .split(/,+|\s+-\s+/)
+      .map((segment) => segment.trim())
+      .filter(Boolean);
+
+    const nameIndex = segments.findIndex((segment) => normalizeLikeText(segment) === stateName);
+    if (nameIndex < 0) return false;
+
+    const next = segments[nameIndex + 1];
+    if (next && isDifferentState(next, code)) return false;
+
+    const geo = inferLocationGeo(group);
+    return !(geo?.countryCode && geo.countryCode !== "US");
+  });
+}
+
 function hasStateLikeMatch(locationText, stateCode) {
   const code = String(stateCode || "").trim().toUpperCase();
   if (!code) return false;
@@ -350,7 +393,7 @@ function hasStateLikeMatch(locationText, stateCode) {
   const stateName = STATE_CODE_TO_NAME[code];
   if (!stateName) return false;
 
-  if (!hasStateNameSegmentMatch(locationText, stateName)) return false;
+  if (!hasStateNameGroupMatch(locationText, stateName, code)) return false;
 
   const normalizedLocation = normalizeLikeText(locationText);
   if (code === "WA") {
