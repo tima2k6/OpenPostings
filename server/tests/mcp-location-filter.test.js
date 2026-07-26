@@ -67,7 +67,12 @@ const CASES = [
   ["Washington, Pennsylvania", false],
   ["Fort Washington, PA, United States", false],
   ["New Washington, OH, United States", false],
-  ["Austin, TX", false]
+  ["Austin, TX", false],
+  // Hyphenated ATS slugs: the state has no separate token for the bare-code check.
+  ["US-WA-Redmond", true],
+  ["US-WA-Gig Harbor", true],
+  ["US-GA-Atlanta", false],
+  ["CA-ON-Toronto", false]
 ];
 
 // The same rule, for states whose name is also a town elsewhere.
@@ -78,7 +83,14 @@ const OTHER_STATE_CASES = [
   ["California, MD, United States", "CA", false],
   ["Nevada, MO, United States", "NV", false],
   ["Wyoming, MI, United States", "WY", false],
-  ["Delaware, OH, United States", "DE", false]
+  ["Delaware, OH, United States", "DE", false],
+  ["US-Texas-Fort Worth", "TX", true],
+  ["TX-Katy-77494", "TX", true],
+  ["IN-Mishawaka-46544", "IN", true],
+  ["CA-Lake Forest-92630", "CA", true],
+  // Same leading code, but India rather than Indiana -- no US zip to vouch for it.
+  ["IN-HR-Gurgaon", "IN", false],
+  ["IN-TG-Hyderabad", "IN", false]
 ];
 
 function run() {

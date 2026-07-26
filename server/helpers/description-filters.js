@@ -642,6 +642,38 @@ function hasBareStateCodeSegmentMatch(locationText, code) {
   return false;
 }
 
+// Some ATS exports encode the whole location as one hyphenated slug with no spaces:
+// "US-WA-Redmond", "US-Texas-Fort Worth", "TX-Katy-77494". hasBareStateCodeSegmentMatch
+// cannot see the state there because nothing splits it into its own token -- the segment
+// splitter only breaks on " - " with spaces, so the slug stays a single word.
+//
+// Only two shapes are read, both unambiguous about being American. A leading "US" names
+// the country outright, and a trailing US ZIP does the same by implication. That second
+// signal is what keeps the state and country readings of a shared code apart in this data:
+// "IN-Mishawaka-46544" is Indiana, "IN-HR-Gurgaon" is India, and only the first has a ZIP.
+// A bare "CA-ON-Toronto" is left alone for the same reason.
+function hasStateCodeSlugMatch(locationText, code) {
+  const stateName = STATE_CODE_TO_NAME[code];
+
+  return splitLocationIntoCountryCandidateSegments(locationText).some((segment) => {
+    const parts = String(segment)
+      .split("-")
+      .map((part) => part.trim())
+      .filter(Boolean);
+    if (parts.length < 2) return false;
+
+    if (parts[0].toUpperCase() === "US") {
+      if (parts[1].toUpperCase() === code) return true;
+      if (stateName && normalizeGeoText(parts[1]) === stateName) return true;
+    }
+
+    if (parts[0].toUpperCase() !== code) return false;
+    // The zip can carry a trailing qualifier ("45402 Hybrid"), so read its first token.
+    const lastToken = String(parts[parts.length - 1]).split(/\s+/)[0];
+    return /^\d{5}$/.test(lastToken);
+  });
+}
+
 // A segment that is exactly a state name usually is that state ("Seattle, Washington"),
 // but most state names are also town names somewhere else: Washington PA and Washington IN,
 // Indiana PA, California MD, Nevada MO, Wyoming MI, Delaware OH. US locations are written
@@ -717,6 +749,9 @@ function hasStateLikeMatch(locationText, stateCode) {
     const isActuallyThatCountry = Boolean(inferredGeo?.countryCode) && inferredGeo.countryCode === code;
     if (!isActuallyThatCountry) return true;
   }
+
+  // No country guard needed here: both slug shapes already establish the location is US.
+  if (hasStateCodeSlugMatch(locationText, code)) return true;
 
   const stateName = STATE_CODE_TO_NAME[code];
   if (!stateName) return false;

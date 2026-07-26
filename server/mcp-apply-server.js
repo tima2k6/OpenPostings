@@ -334,6 +334,30 @@ function hasBareStateCodeSegmentMatch(locationText, code) {
   return false;
 }
 
+// Mirrors hasStateCodeSlugMatch in description-filters.js -- see the note there. Reads the
+// hyphenated slug shapes ("US-WA-Redmond", "TX-Katy-77494") that leave no separate token
+// for the bare-code check above to find.
+function hasStateCodeSlugMatch(locationText, code) {
+  const stateName = STATE_CODE_TO_NAME[code];
+
+  return splitLocationIntoSegments(locationText).some((segment) => {
+    const parts = String(segment)
+      .split("-")
+      .map((part) => part.trim())
+      .filter(Boolean);
+    if (parts.length < 2) return false;
+
+    if (parts[0].toUpperCase() === "US") {
+      if (parts[1].toUpperCase() === code) return true;
+      if (stateName && normalizeLikeText(parts[1]) === stateName) return true;
+    }
+
+    if (parts[0].toUpperCase() !== code) return false;
+    const lastToken = String(parts[parts.length - 1]).split(/\s+/)[0];
+    return /^\d{5}$/.test(lastToken);
+  });
+}
+
 // Only treats a state name (e.g. "washington") as a match when it's the entire content of a
 // comma/dash-separated segment, e.g. "Seattle, Washington" — not when it's merely one word inside
 // a longer place name segment like "Fort Washington" or "West Virginia".
@@ -389,6 +413,7 @@ function hasStateLikeMatch(locationText, stateCode) {
   if (!code) return false;
 
   if (hasBareStateCodeSegmentMatch(locationText, code)) return true;
+  if (hasStateCodeSlugMatch(locationText, code)) return true;
 
   const stateName = STATE_CODE_TO_NAME[code];
   if (!stateName) return false;

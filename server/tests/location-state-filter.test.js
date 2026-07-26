@@ -162,6 +162,40 @@ function run() {
     "WA filter should still match a multi-location posting that also lists Portland, OR"
   );
 
+  // Hyphenated ATS slugs leave the state with no separate token, so the bare-code check
+  // cannot see it. A leading "US" or a trailing US zip is what marks the slug American.
+  for (const [location, code] of [
+    ["US-WA-Redmond", "WA"],
+    ["US-WA-Gig Harbor", "WA"],
+    ["US-Texas-Fort Worth", "TX"],
+    ["TX-Katy-77494", "TX"],
+    ["IN-Mishawaka-46544", "IN"],
+    ["CA-Lake Forest-92630", "CA"],
+    ["OH-Dayton-45402 Hybrid - US", "OH"]
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, [code], [], [], []),
+      true,
+      `${code} filter should match the slug ${location}`
+    );
+  }
+
+  for (const [location, code] of [
+    ["US-GA-Atlanta", "WA"],
+    ["US-WA-Redmond", "OR"],
+    ["IN-HR-Gurgaon", "IN"],
+    ["IN-TG-Hyderabad", "IN"],
+    ["CA-ON-Toronto", "CA"],
+    ["GB-ENG-London", "GB"],
+    ["FR-31-Toulouse", "FR"]
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, [code], [], [], []),
+      false,
+      `${code} filter should not match ${location}`
+    );
+  }
+
   console.log("location-state-filter tests passed");
 }
 
