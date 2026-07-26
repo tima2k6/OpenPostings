@@ -51,6 +51,15 @@ import {
   savePersistedFilters
 } from "./src/filter-storage";
 
+// "recent" is last_seen_epoch, i.e. when the sync last touched the row -- rows in a batch
+// share a timestamp and company order is shuffled, so it reads as arbitrary. "first_seen"
+// is discovery time and is what answers "what showed up since I last looked".
+const POSTING_SORT_OPTIONS = [
+  { value: "first_seen_desc", label: "Newest found" },
+  { value: "recent", label: "Recently synced" },
+  { value: "company_asc", label: "Company A-Z" }
+];
+
 const PAGE_KEYS = {
   POSTINGS: "postings",
   APPLICATIONS: "applications",
@@ -2484,7 +2493,8 @@ export default function App() {
       states: [],
       counties: [],
       remote: ["all"],
-      hide_no_date: false
+      hide_no_date: false,
+      sort_by: "recent"
     });
   }, []);
 
@@ -2923,6 +2933,30 @@ export default function App() {
                             remote: next.size > 0 ? Array.from(next) : ["all"]
                           };
                         })
+                      }
+                      style={[styles.remoteFilterChip, selected ? styles.remoteFilterChipActive : null]}
+                    >
+                      <Text style={[styles.remoteFilterChipText, selected ? styles.remoteFilterChipTextActive : null]}>
+                        {option.label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              <View style={styles.remoteNoDateToggleRow}>
+                <Text style={styles.remoteNoDateToggleLabel}>Sort by</Text>
+              </View>
+              <View style={styles.remoteFilterChipsRow}>
+                {POSTING_SORT_OPTIONS.map((option) => {
+                  const selected = String(postingsFilters.sort_by || "recent") === option.value;
+                  return (
+                    <Pressable
+                      key={option.value}
+                      onPress={() =>
+                        setPostingsFilters((prev) => ({
+                          ...prev,
+                          sort_by: option.value
+                        }))
                       }
                       style={[styles.remoteFilterChip, selected ? styles.remoteFilterChipActive : null]}
                     >

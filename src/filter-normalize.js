@@ -9,10 +9,14 @@ export const DEFAULT_POSTINGS_FILTERS = Object.freeze({
   states: [],
   counties: [],
   remote: ["all"],
-  hide_no_date: false
+  hide_no_date: false,
+  sort_by: "recent"
 });
 
 const REMOTE_FILTER_VALUES = ["all", "remote", "hybrid", "non_remote"];
+// Mirrors POSTING_SORT_OPTIONS in server/helpers/normalize-strings.js. An unknown stored
+// value falls back to the default rather than being sent on to the API.
+const POSTING_SORT_VALUES = ["recent", "first_seen_desc", "company_asc"];
 
 function toStringArray(value) {
   if (!Array.isArray(value)) return [];
@@ -43,7 +47,10 @@ export function normalizePersistedFilters(stored) {
     states: toStringArray(source.states),
     counties: toStringArray(source.counties),
     remote: remote.length > 0 ? remote : ["all"],
-    hide_no_date: source.hide_no_date === true
+    hide_no_date: source.hide_no_date === true,
+    sort_by: POSTING_SORT_VALUES.includes(String(source.sort_by ?? ""))
+      ? String(source.sort_by)
+      : DEFAULT_POSTINGS_FILTERS.sort_by
   };
 }
 

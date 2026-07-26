@@ -135,6 +135,9 @@ export function fetchPostings(search = "", limit = 500, offset = 0, filters = {}
   if (filters?.hide_no_date) {
     params.set("hide_no_date", "1");
   }
+  if (filters?.sort_by) {
+    params.set("sort_by", String(filters.sort_by));
+  }
 
   return request(`/postings?${params.toString()}`);
 }

@@ -18,6 +18,14 @@ function getPostingsOrderByClause(sortBy) {
   if (sortBy === "company_asc") {
     return "company_name ASC, position_name ASC";
   }
+  // "Newest to this instance". last_seen_epoch below cannot answer that: it records when
+  // the sync last touched a row, every row in a sync batch shares one timestamp, and the
+  // company order within a pass is shuffled -- so sorting by it is close to sync noise.
+  // first_seen_epoch is the discovery time and does not move once set. Bare column, so
+  // this streams from idx_postings_hidden_first_seen_epoch the same way the default does.
+  if (sortBy === "first_seen_desc") {
+    return "first_seen_epoch DESC, id DESC";
+  }
   // Deliberately not COALESCE(last_seen_epoch, 0): wrapping the column made the sort key
   // an opaque expression, which forced a full scan even on the bounded page query. SQLite
   // already sorts NULLs last under DESC, which is where COALESCE-to-zero put them anyway.
