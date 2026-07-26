@@ -80,6 +80,21 @@ function run() {
     "dayforce has a wired collector, so it belongs in both server registries"
   );
 
+  // The MCP server runs as its own process and once kept a third copy of the registry,
+  // which fell four ATSs behind and made them unusable as search_jobs filters. It must
+  // keep sourcing them from the shared helper rather than redeclaring its own.
+  const mcpSource = fs.readFileSync(path.join(__dirname, "..", "mcp-apply-server.js"), "utf8");
+  for (const name of ["ATS_FILTER_OPTIONS", "normalizeAtsFilters", "inferAtsFromJobPostingUrl"]) {
+    assert.ok(
+      !new RegExp(`^(?:const|let|function)\\s+${name}\\b`, "m").test(mcpSource),
+      `mcp-apply-server.js should import ${name} from helpers/normalize-ats.js, not redeclare it`
+    );
+  }
+  assert.ok(
+    /require\("\.\/helpers\/normalize-ats\.js"\)/.test(mcpSource),
+    "mcp-apply-server.js should require the shared ATS registry"
+  );
+
   // Unrecognized selections must not widen into everything.
   const warnings = [];
   const originalWarn = console.warn;
