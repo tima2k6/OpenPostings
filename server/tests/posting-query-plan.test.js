@@ -73,6 +73,30 @@ async function testListingSortStreamsFromIndex() {
   });
 }
 
+// The "newest discovered" sort has to stream from its own index too. If it ever falls back
+// to sorting the visible set, it stops being usable on a database this size.
+async function testFirstSeenSortStreamsFromIndex() {
+  await withSeededDb(async (db) => {
+    const plan = await planFor(
+      db,
+      `SELECT id, company_name, first_seen_epoch
+       FROM Postings
+       WHERE hidden = 0 AND last_seen_epoch >= ?
+       ORDER BY first_seen_epoch DESC, id DESC
+       LIMIT 500`,
+      [NOW - 86400]
+    );
+    assert.ok(
+      plan.includes("idx_postings_hidden_first_seen_epoch"),
+      `first_seen sort should use the discovery index, got: ${plan}`
+    );
+    assert.ok(
+      !plan.includes("TEMP B-TREE"),
+      `first_seen sort must not fall back to sorting the visible set, got: ${plan}`
+    );
+  });
+}
+
 async function testPrunePredicateUsesIndex() {
   await withSeededDb(async (db) => {
     const plan = await planFor(db, `SELECT id FROM Postings WHERE hidden = 0 AND last_seen_epoch < ?`, [NOW]);
@@ -106,6 +130,7 @@ async function testRetentionSweepUsesIndex() {
 
 async function main() {
   await testListingSortStreamsFromIndex();
+  await testFirstSeenSortStreamsFromIndex();
   await testPrunePredicateUsesIndex();
   await testRetentionSweepUsesIndex();
   console.log("posting-query-plan tests passed");

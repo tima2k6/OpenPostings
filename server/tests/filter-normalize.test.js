@@ -95,6 +95,31 @@ function run() {
   assert.equal(normalizePersistedSearch(undefined), "", "missing search should become an empty string");
   assert.equal(normalizePersistedSearch("nurse"), "nurse", "search text should round-trip");
 
+  // sort_by reaches the API as a query param, so an unknown stored value must collapse to
+  // the default rather than being forwarded.
+  assert.equal(
+    normalizePersistedFilters({ sort_by: "first_seen_desc" }).sort_by,
+    "first_seen_desc",
+    "a supported sort should round-trip"
+  );
+  assert.equal(
+    normalizePersistedFilters({ sort_by: "company_asc" }).sort_by,
+    "company_asc",
+    "company_asc should round-trip"
+  );
+  for (const bogus of ["pay_desc", "", null, 7, {}]) {
+    assert.equal(
+      normalizePersistedFilters({ sort_by: bogus }).sort_by,
+      "recent",
+      `unsupported sort ${JSON.stringify(bogus)} should fall back to the default`
+    );
+  }
+  assert.equal(
+    normalizePersistedFilters({}).sort_by,
+    "recent",
+    "missing sort should default to recent"
+  );
+
   console.log("filter-normalize tests passed");
 }
 
