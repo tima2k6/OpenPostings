@@ -30,6 +30,13 @@ function getPostingsOrderByClause(sortBy) {
 // a sync having happened recently, so the visible set is bounded by the same freshness
 // window here. This replaces a pruneExpiredPostings() call that used to run - as a write
 // transaction - on every listing request.
+//
+// The callers compare this against last_seen_epoch, matching pruneExpiredPostings. They
+// used to compare it against first_seen_epoch, which quietly re-imposed the age-based
+// cutoff at query time: a posting the sync had correctly revived was still filtered out
+// of every listing because it had been *discovered* more than one window ago. Keeping the
+// two sides on the same column is what makes the visible set mean "the ATS still lists
+// this". Bare column, not COALESCE, to preserve the covering index range scan.
 function getPostingFreshnessCutoffEpoch() {
   return nowEpochSeconds() - getPostingFreshnessWindowSeconds();
 }
@@ -190,7 +197,7 @@ async function readDistinctStoredLocations() {
         SELECT DISTINCT location
         FROM Postings
         WHERE hidden = 0
-          AND first_seen_epoch >= ?
+          AND last_seen_epoch >= ?
           AND location IS NOT NULL
           AND TRIM(location) <> '';
       `,
@@ -422,7 +429,7 @@ async function listPostingsWithFilters(options = {}) {
           SELECT id, company_name, position_name, job_posting_url, posting_date, location, job_description, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
           FROM Postings
           WHERE hidden = 0
-            AND first_seen_epoch >= ?
+            AND last_seen_epoch >= ?
             AND (? = 0 OR (posting_date IS NOT NULL AND TRIM(posting_date) <> ''))
             AND NOT EXISTS (
               SELECT 1
@@ -447,7 +454,7 @@ async function listPostingsWithFilters(options = {}) {
               (${includeIgnored ? 0 : 1} = 1 AND COALESCE(s.ignored, 0) = 1)
             )
           WHERE p.hidden = 0
-            AND p.first_seen_epoch >= ?
+            AND p.last_seen_epoch >= ?
             AND (? = 0 OR (p.posting_date IS NOT NULL AND TRIM(p.posting_date) <> ''))
             AND NOT EXISTS (
               SELECT 1
@@ -485,7 +492,7 @@ async function listPostingsWithFilters(options = {}) {
         SELECT id, company_name, position_name, job_posting_url, posting_date, location, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
         FROM Postings
         WHERE hidden = 0
-          AND first_seen_epoch >= ?
+          AND last_seen_epoch >= ?
           AND NOT EXISTS (
           SELECT 1
           FROM blocked_companies b
@@ -893,7 +900,7 @@ async function getCounts() {
       SELECT COUNT(*) AS count
       FROM Postings
       WHERE hidden = 0
-        AND first_seen_epoch >= ?;
+        AND last_seen_epoch >= ?;
     `,
     [getPostingFreshnessCutoffEpoch()]
   );

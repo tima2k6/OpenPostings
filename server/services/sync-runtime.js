@@ -1272,6 +1272,10 @@ const HIDDEN_POSTING_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 // asks "has the ATS stopped listing this?", not "how long ago did we discover it?". Keying
 // it off first_seen_epoch gave every posting a hard lifetime from discovery and hid roles
 // that were still open, which the upsert's re-sight branch below could then never recover.
+// The column is read bare rather than through COALESCE so the predicate keeps a covering
+// range scan on idx_postings_hidden_last_seen_epoch; wrapping it narrows nothing and makes
+// this walk every visible row. The upsert always stamps last_seen_epoch, so it is never
+// NULL in practice -- a NULL would simply never be pruned, and the read path hides it too.
 async function pruneExpiredPostings(referenceEpoch = nowEpochSeconds()) {
   const resolvedReferenceEpoch = Number(referenceEpoch || nowEpochSeconds());
   const cutoffEpoch = resolvedReferenceEpoch - getPostingFreshnessWindowSeconds();
@@ -1284,7 +1288,7 @@ async function pruneExpiredPostings(referenceEpoch = nowEpochSeconds()) {
         hidden_at_epoch = COALESCE(hidden_at_epoch, ?),
         job_description = NULL
       WHERE hidden = 0
-        AND COALESCE(last_seen_epoch, first_seen_epoch) < ?;
+        AND last_seen_epoch < ?;
     `,
     [resolvedReferenceEpoch, cutoffEpoch]
   );
