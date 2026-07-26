@@ -124,6 +124,16 @@ CREATE TABLE IF NOT EXISTS companies (
 	ATS_name TEXT NOT NULL
 );
 
+-- Hilton moved its careers site off Taleo and onto Oracle Recruiting Cloud, so the
+-- hilton.taleo.net career sections still in companies return nothing. The Oracle
+-- collector reads this tenant with no extra code.
+INSERT INTO companies (company_name, url_string, ATS_name)
+SELECT 'Hilton', 'https://efet.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/jobs', 'oraclecloud'
+WHERE NOT EXISTS (
+  SELECT 1 FROM companies
+  WHERE url_string = 'https://efet.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/jobs'
+);
+
 -- job_industry_categories
 CREATE TABLE IF NOT EXISTS job_industry_categories (
       id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
