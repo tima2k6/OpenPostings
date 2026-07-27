@@ -65,7 +65,9 @@ function parseAcademicJobsOnlinePostingsFromHtml(pageHtml, baseUrl) {
 
   const postings = [];
   const seenUrls = new Set();
-  const blockRegex = /<div class="clr">([\s\S]*?)<\/div>\s*(?=<div class="clr">|<hr>|<\/main>)/gi;
+  // The final block on a listing page is not followed by another block; it ends with the
+  // "(N positions listed)" summary and an <hr class="clr">, so both must terminate a block.
+  const blockRegex = /<div class="clr">([\s\S]*?)<\/div>\s*(?=<div class="clr">|<hr\b|<p class="sml">|<\/main>)/gi;
   const liRegex = /<li>([\s\S]*?)<\/li>/gi;
   const hrefRegex = /href="(\/ajo\/jobs\/\d+)"/i;
   const titleRegex = /id="j\d+"[^>]*>([\s\S]*?)<\/span>/i;
@@ -135,4 +137,8 @@ async function collectPostingsForAcademicJobsOnlineDynamic() {
   );
 }
 
-module.exports = { collectPostingsForAcademicJobsOnlineDynamic, ACADEMICJOBSONLINE_ESTIMATED_COMPANY_COUNT };
+module.exports = {
+  collectPostingsForAcademicJobsOnlineDynamic,
+  parseAcademicJobsOnlinePostingsFromHtml,
+  ACADEMICJOBSONLINE_ESTIMATED_COMPANY_COUNT
+};
