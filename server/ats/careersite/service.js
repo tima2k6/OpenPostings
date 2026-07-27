@@ -386,6 +386,7 @@ async function collectCareerSiteSitemapEntries(siteKey, config, referenceEpoch) 
   const visited = new Set();
   const entries = [];
   let fetchedSitemaps = 0;
+  let lastSitemapError = null;
 
   while (pending.length > 0 && fetchedSitemaps < MAX_SITEMAPS_PER_SYNC) {
     const sitemapUrl = pending.shift();
@@ -395,7 +396,8 @@ async function collectCareerSiteSitemapEntries(siteKey, config, referenceEpoch) 
     let xml = "";
     try {
       xml = await fetchCareerSiteText(siteKey, "sitemap", sitemapUrl, "application/xml,text/xml,*/*");
-    } catch {
+    } catch (error) {
+      lastSitemapError = error;
       continue;
     }
     fetchedSitemaps += 1;
@@ -415,6 +417,15 @@ async function collectCareerSiteSitemapEntries(siteKey, config, referenceEpoch) 
     }
   }
 
+  // Reaching no sitemap at all is not "this employer posted nothing today" -- it means the
+  // sweep never started. Returning an empty list would report that as a clean zero and hide
+  // a blocked host, a moved sitemap or a dead site behind a number that looks like a quiet
+  // hiring day, on a collector whose whole job is to notice new postings.
+  if (fetchedSitemaps === 0) {
+    throw lastSitemapError ||
+      new Error(`${siteKey} sitemap sweep found no readable sitemap under ${config.origin}`);
+  }
+
   return entries;
 }
 
@@ -426,13 +437,17 @@ async function collectPostingsForCareerSiteDynamic(siteKey) {
 
   const seenUrls = new Set();
   const postings = [];
+  let failedJobPages = 0;
+  let lastJobPageError = null;
 
   for (const candidateUrl of candidateUrls) {
     let html = "";
     try {
       html = await fetchCareerSiteText(siteKey, "job", candidateUrl, "text/html,application/xhtml+xml");
-    } catch {
+    } catch (error) {
       // One unreachable detail page should not abandon the rest of the sweep.
+      failedJobPages += 1;
+      lastJobPageError = error;
       continue;
     }
 
@@ -445,6 +460,14 @@ async function collectPostingsForCareerSiteDynamic(siteKey) {
 
     seenUrls.add(postingUrl);
     postings.push(posting);
+  }
+
+  // Same reasoning one level down: if the sitemap named fresh jobs and every single one of
+  // them failed to load, the sweep found nothing because it could not read, not because
+  // there was nothing to read.
+  if (candidateUrls.length > 0 && failedJobPages === candidateUrls.length) {
+    throw lastJobPageError ||
+      new Error(`${siteKey} could not read any of its ${candidateUrls.length} candidate job pages`);
   }
 
   return postings;

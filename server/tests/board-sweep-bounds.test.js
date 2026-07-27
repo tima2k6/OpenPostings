@@ -196,11 +196,61 @@ async function testExpediaFallsBackWhenRobotsIsUnavailable() {
   ]);
 }
 
+// A sweep that could not read anything must fail loudly. Reporting an unreachable site as a
+// clean zero makes a blocked host, a moved sitemap or a dead board look exactly like a quiet
+// hiring day -- which is what a live run against a blocked network actually produced before
+// this behaviour existed.
+async function testCareerSiteReportsAnUnreadableSite() {
+  await assert.rejects(
+    withStubbedFetch(
+      () => ({ ok: false, status: 403, text: async () => "Host not in allowlist" }),
+      () => collectPostingsForCareerSiteDynamic("expedia")
+    ),
+    /403/,
+    "a site whose sitemaps cannot be fetched should surface the failure, not an empty list"
+  );
+
+  const nowIso = new Date().toISOString();
+  await assert.rejects(
+    withStubbedFetch(
+      (url) => {
+        if (url.endsWith("/robots.txt")) return textResponse("");
+        if (url.endsWith("/sitemap.xml")) {
+          return textResponse(
+            `<urlset><url><loc>https://careers.expediagroup.com/job/a/x/R-1/</loc><lastmod>${nowIso}</lastmod></url></urlset>`
+          );
+        }
+        return { ok: false, status: 500, text: async () => "boom" };
+      },
+      () => collectPostingsForCareerSiteDynamic("expedia")
+    ),
+    /500/,
+    "fresh candidates that all fail to load should surface the failure too"
+  );
+
+  // The honest zero still has to stay a zero: a readable sitemap with nothing fresh in it
+  // is a quiet day, not a fault.
+  const { result } = await withStubbedFetch(
+    (url) => {
+      if (url.endsWith("/robots.txt")) return textResponse("");
+      if (url.endsWith("/sitemap.xml")) {
+        return textResponse(
+          `<urlset><url><loc>https://careers.expediagroup.com/job/a/x/R-1/</loc><lastmod>2024-01-01T00:00:00Z</lastmod></url></urlset>`
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+    () => collectPostingsForCareerSiteDynamic("expedia")
+  );
+  assert.deepEqual(result, [], "a readable board with nothing fresh is a clean zero");
+}
+
 async function run() {
   await testAmazonStopsAtTheFirstStalePage();
   await testMicrosoftStopsAtTheFirstStalePage();
   await testExpediaFetchesOnlyFreshJobPages();
   await testExpediaFallsBackWhenRobotsIsUnavailable();
+  await testCareerSiteReportsAnUnreadableSite();
   console.log("board-sweep-bounds tests passed");
 }
 
