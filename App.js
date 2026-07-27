@@ -2787,6 +2787,31 @@ export default function App() {
         </Pressable>
       </View>
 
+      {/* Sorting is not a filter: it is changed constantly while scanning results, so it
+          stays visible rather than living behind the collapsed filter panel. */}
+      <View style={styles.postingsSortRow}>
+        <Text style={styles.postingsSortLabel}>Sort</Text>
+        {POSTING_SORT_OPTIONS.map((option) => {
+          const selected = String(postingsFilters.sort_by || "recent") === option.value;
+          return (
+            <Pressable
+              key={option.value}
+              onPress={() =>
+                setPostingsFilters((prev) => ({
+                  ...prev,
+                  sort_by: option.value
+                }))
+              }
+              style={[styles.remoteFilterChip, selected ? styles.remoteFilterChipActive : null]}
+            >
+              <Text style={[styles.remoteFilterChipText, selected ? styles.remoteFilterChipTextActive : null]}>
+                {option.label}
+              </Text>
+            </Pressable>
+          );
+        })}
+      </View>
+
       <View style={styles.postingsFiltersHeaderRow}>
         <View style={styles.postingsFiltersLeftGroup}>
           <Pressable onPress={() => setPostingsFilterPanelOpen((prev) => !prev)} style={styles.postingsFiltersToggleBtn}>
@@ -2933,30 +2958,6 @@ export default function App() {
                             remote: next.size > 0 ? Array.from(next) : ["all"]
                           };
                         })
-                      }
-                      style={[styles.remoteFilterChip, selected ? styles.remoteFilterChipActive : null]}
-                    >
-                      <Text style={[styles.remoteFilterChipText, selected ? styles.remoteFilterChipTextActive : null]}>
-                        {option.label}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-              <View style={styles.remoteNoDateToggleRow}>
-                <Text style={styles.remoteNoDateToggleLabel}>Sort by</Text>
-              </View>
-              <View style={styles.remoteFilterChipsRow}>
-                {POSTING_SORT_OPTIONS.map((option) => {
-                  const selected = String(postingsFilters.sort_by || "recent") === option.value;
-                  return (
-                    <Pressable
-                      key={option.value}
-                      onPress={() =>
-                        setPostingsFilters((prev) => ({
-                          ...prev,
-                          sort_by: option.value
-                        }))
                       }
                       style={[styles.remoteFilterChip, selected ? styles.remoteFilterChipActive : null]}
                     >
@@ -4100,6 +4101,20 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: 8,
     flexWrap: "wrap"
+  },
+  postingsSortRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap",
+    paddingHorizontal: 16,
+    paddingBottom: 8
+  },
+  postingsSortLabel: {
+    color: "#334e68",
+    fontSize: 12,
+    fontWeight: "600",
+    marginRight: 2
   },
   remoteNoDateToggleRow: {
     marginTop: 10,
