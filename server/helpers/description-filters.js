@@ -735,9 +735,15 @@ function hasStateNameGroupMatch(locationText, stateName, code) {
     .filter(Boolean);
 
   return groups.some((group) => {
+    // A ZIP rides along inside the state segment on boards that write the full state name
+    // ("Cambridge, Massachusetts 02139, United States of America" on AcademicJobsOnline).
+    // hasBareStateCodeSegmentMatch already reads the same shape after a state code, and a
+    // US ZIP only reinforces that the spelled-out name is the American state. It comes off
+    // every segment, not just the matched one, or the town-versus-state guard below stops
+    // recognising the following segment and "Washington, Indiana 47501" reads as WA.
     const segments = group
       .split(/,+|\s*-\s+/)
-      .map((segment) => segment.trim())
+      .map((segment) => segment.trim().replace(/\s+\d{5}(-\d{4})?$/, "").trim())
       .filter(Boolean);
 
     const nameIndex = segments.findIndex((segment) => normalizeGeoText(segment) === stateName);

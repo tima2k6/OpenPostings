@@ -98,6 +98,43 @@ function run() {
     "PA filter should still match Fort Washington, PA"
   );
 
+  // AcademicJobsOnline spells the state out and puts the ZIP in the same segment. The
+  // "City, ST ZIP" shape was already understood; the spelled-out one was not, so every
+  // academic posting fell out of state filtering.
+  for (const [location, code] of [
+    ["Cambridge, Massachusetts 02139, United States of America", "MA"],
+    ["Worcester, Massachusetts 01655, United States of America", "MA"],
+    ["Durham, North Carolina 27708, United States of America", "NC"],
+    ["Stanford, California 94305, United States of America", "CA"],
+    ["Seattle, Washington 98101-1234", "WA"]
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, [code], [], [], []),
+      true,
+      `${code} filter should match a spelled-out state carrying a ZIP: ${location}`
+    );
+  }
+
+  assert.equal(
+    rowMatchesLocationFilters("Cambridge, Massachusetts 02139, United States of America", ["CA"], [], [], []),
+    false,
+    "a spelled-out state with a ZIP should still only match its own state"
+  );
+
+  // Trailing digits alone do not make a segment a state: a non-US postal code sits in the
+  // same position, and the state name has to be the whole segment either way.
+  assert.equal(
+    rowMatchesLocationFilters("Sherbrooke, Quebec J1K 2R1, Canada", ["ME"], [], [], []),
+    false,
+    "a Canadian postal code should not be read as a US state segment"
+  );
+
+  assert.equal(
+    rowMatchesLocationFilters("Washington, Indiana 47501, United States", ["WA"], [], [], []),
+    false,
+    "WA filter should not match the town of Washington just because a ZIP follows the state"
+  );
+
   // A bare state name is normally the state, but most state names are also towns in some
   // other state. US locations are city-first, so the segment after the name settles it.
   for (const location of [
