@@ -69,6 +69,24 @@ function testStatePrefilterKeepsRowsWithNoLocation() {
   assert.ok(params.includes("%washington%"), "the spelled-out name is the other");
 }
 
+// Facet drill-down depends on this distinction: title_any widens the set (OR), title_all
+// narrows it (AND). Clicking a facet must never return more rows than before the click.
+function testTitleAllIsAndedWhileTitleAnyIsOred() {
+  const ored = buildQuery({ title_any: "manager, director" });
+  assert.strictEqual((ored.sql.match(/\bOR\b/g) || []).length, 1, "title_any groups terms with OR");
+
+  const anded = buildQuery({ title_all: "operations, senior" });
+  assert.strictEqual((anded.sql.match(/\bOR\b/g) || []).length, 0, "title_all must not OR its terms");
+  assert.strictEqual((anded.sql.match(/AND/g) || []).length, 1, "each title_all term is its own AND-ed clause");
+  assert.deepStrictEqual(anded.params, ["%operations%", "%senior%"]);
+}
+
+function testAtsIsDeferredToTheRefinePass() {
+  const { sql, atsFilters } = buildQuery({ ats: "workday, greenhouse" });
+  assert.deepStrictEqual(atsFilters, ["workday", "greenhouse"]);
+  assert.ok(!/workday/i.test(sql), "ATS is derived from the URL, so it cannot be a SQL clause");
+}
+
 function testEmptyInputProducesNoWhereClause() {
   const { sql, params } = buildQuery({});
   assert.ok(!/WHERE/.test(sql), "no filters means no predicate");
@@ -90,6 +108,8 @@ function main() {
   testSortIsWhitelisted();
   testLimitIsClamped();
   testStatePrefilterKeepsRowsWithNoLocation();
+  testTitleAllIsAndedWhileTitleAnyIsOred();
+  testAtsIsDeferredToTheRefinePass();
   testEmptyInputProducesNoWhereClause();
   testVisibilityAndPayPresence();
   console.log("db-query tests passed");

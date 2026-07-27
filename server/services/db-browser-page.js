@@ -49,6 +49,14 @@ const DB_BROWSER_PAGE = `<!doctype html>
   .err { color: #b3261e; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; margin: 10px 0; }
   footer { padding: 0 18px 30px; }
   .hint { font-size: 12px; color: #66798c; margin: 8px 0; }
+  .facet { margin: 8px 0; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .facet-name { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+                color: #7b8794; min-width: 110px; }
+  button.chip { border: 1px solid #c6ceda; background: #fff; color: inherit; border-radius: 999px;
+                padding: 4px 10px; cursor: pointer; font: inherit; font-size: 12px; }
+  button.chip:hover { border-color: #1f6feb; color: #1f6feb; }
+  button.chip .n { color: #7b8794; font-size: 11px; margin-left: 3px; }
+  @media (prefers-color-scheme: dark) { button.chip { background: #18202a; border-color: #2d3947; } }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; margin-bottom: 10px; }
   .grid label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #52606d; }
   @media (prefers-color-scheme: dark) { .grid label { color: #9fb0c4; } }
@@ -87,6 +95,7 @@ const DB_BROWSER_PAGE = `<!doctype html>
   <section id="panel-postings" hidden>
     <div class="grid">
       <label>Title has <b>any</b> of<input id="f-title-any" placeholder="manager, director, head of"></label>
+      <label>Title has <b>all</b> of<input id="f-title-all" placeholder="operations"></label>
       <label>Title has <b>none</b> of<input id="f-title-none" placeholder="assistant, shift, intern"></label>
       <label>Company <b>any</b><input id="f-company-any" placeholder="hilton, marriott"></label>
       <label>Company <b>none</b><input id="f-company-none" placeholder="staffing, temp"></label>
@@ -112,6 +121,7 @@ const DB_BROWSER_PAGE = `<!doctype html>
         <option value="posted">Posted date</option>
       </select></label>
       <label>Direction<select id="f-dir"><option value="desc">Descending</option><option value="asc">Ascending</option></select></label>
+      <label>ATS<input id="f-ats" placeholder="workday, greenhouse"></label>
       <label>Max rows<input id="f-limit" type="number" value="200"></label>
     </div>
     <p class="hint">Terms are comma-separated. Within a box they are OR-ed; each box is AND-ed with the others &mdash; so <em>any</em>=manager,director with <em>none</em>=assistant gives (manager OR director) AND NOT assistant. Only <b>All rows</b> shows postings the app is currently hiding. <b>State</b> uses real state matching &mdash; "WA" will not match Warwick or Sweetwater the way a location-text search does.</p>
@@ -124,6 +134,7 @@ const DB_BROWSER_PAGE = `<!doctype html>
     </div>
     <div class="row" id="saved-row"></div>
     <pre id="posting-sqlout" hidden></pre>
+    <div id="facet-out"></div>
     <div id="posting-out"></div>
   </section>
 
@@ -215,12 +226,12 @@ ORDER BY n DESC</textarea>
   }
 
   var FIELDS = {
-    "f-title-any": "title_any", "f-title-none": "title_none",
+    "f-title-any": "title_any", "f-title-all": "title_all", "f-title-none": "title_none",
     "f-company-any": "company_any", "f-company-none": "company_none",
     "f-states": "states", "f-loc-any": "location_any", "f-loc-none": "location_none",
     "f-pay-min": "pay_min", "f-pay-max": "pay_max",
     "f-seen": "seen_days", "f-found": "found_days",
-    "f-vis": "visibility", "f-sort": "sort", "f-dir": "dir", "f-limit": "limit"
+    "f-ats": "ats", "f-vis": "visibility", "f-sort": "sort", "f-dir": "dir", "f-limit": "limit"
   };
 
   function readFilters() {
@@ -264,6 +275,54 @@ ORDER BY n DESC</textarea>
     }).catch(function (e) { fail("posting-out", e.message); });
   }
 
+  // Clicking a facet must NARROW the set, which is why title words go to title_all (AND)
+  // rather than title_any (OR): adding a word to an OR group would widen it.
+  function addTerm(id, value, replace) {
+    var el = document.getElementById(id);
+    var existing = el.value.split(",").map(function (t) { return t.trim(); }).filter(Boolean);
+    if (replace) { el.value = value; return; }
+    if (existing.indexOf(value) === -1) existing.push(value);
+    el.value = existing.join(", ");
+  }
+
+  var FACET_TARGET = {
+    states: { id: "f-states", replace: false },
+    title_words: { id: "f-title-all", replace: false },
+    companies: { id: "f-company-any", replace: true },
+    ats: { id: "f-ats", replace: true }
+  };
+  var FACET_LABEL = { states: "State", title_words: "Title contains", companies: "Company", ats: "ATS" };
+
+  function loadFacets() {
+    var params = new URLSearchParams(readFilters()).toString();
+    get("/db/facets?" + params).then(function (data) {
+      var summary = '<p class="hint">' + (data.approximate ? "sampled " : "") + data.scanned +
+        " rows \u00b7 " + data.visible + " visible, " + data.hidden + " hidden \u00b7 " +
+        data.with_pay + " with a pay figure" +
+        (data.approximate ? " \u2014 counts are a sample, narrow further for exact numbers" : "") + "</p>";
+      var groups = Object.keys(FACET_TARGET).map(function (key) {
+        var items = (data.facets[key] || []);
+        if (!items.length) return "";
+        return '<div class="facet"><span class="facet-name">' + FACET_LABEL[key] + "</span>" +
+          items.map(function (it) {
+            return '<button class="chip" data-facet="' + key + '" data-value="' + esc(it.value) + '">' +
+              esc(it.value) + ' <span class="n">' + it.count + "</span></button>";
+          }).join("") + "</div>";
+      }).join("");
+      var out = document.getElementById("facet-out");
+      out.innerHTML = summary + groups;
+      Array.prototype.forEach.call(out.querySelectorAll("button.chip"), function (b) {
+        b.addEventListener("click", function () {
+          var t = FACET_TARGET[b.getAttribute("data-facet")];
+          addTerm(t.id, b.getAttribute("data-value"), t.replace);
+          run();
+        });
+      });
+    }).catch(function (e) { document.getElementById("facet-out").innerHTML = '<p class="err">' + esc(e.message) + "</p>"; });
+  }
+
+  function run() { loadPostings(); loadFacets(); }
+
   // Saved queries live in this browser only; the server holds no per-user state.
   function savedQueries() {
     try { return JSON.parse(localStorage.getItem("openpostings.db.saved") || "[]"); } catch (e) { return []; }
@@ -277,7 +336,7 @@ ORDER BY n DESC</textarea>
              '<button class="saved-x" data-i="' + i + '" title="delete">&times;</button>';
     }).join(" ");
     Array.prototype.forEach.call(row.querySelectorAll("button.saved"), function (b) {
-      b.addEventListener("click", function () { writeFilters(savedQueries()[b.getAttribute("data-i")].state); loadPostings(); });
+      b.addEventListener("click", function () { writeFilters(savedQueries()[b.getAttribute("data-i")].state); run(); });
     });
     Array.prototype.forEach.call(row.querySelectorAll("button.saved-x"), function (b) {
       b.addEventListener("click", function () {
@@ -307,9 +366,9 @@ ORDER BY n DESC</textarea>
 
   document.getElementById("company-go").addEventListener("click", loadCompanies);
   document.getElementById("company-q").addEventListener("keydown", function (e) { if (e.key === "Enter") loadCompanies(); });
-  document.getElementById("posting-go").addEventListener("click", loadPostings);
+  document.getElementById("posting-go").addEventListener("click", run);
   document.getElementById("posting-clear").addEventListener("click", function () {
-    writeFilters({}); document.getElementById("f-limit").value = "200"; loadPostings();
+    writeFilters({}); document.getElementById("f-limit").value = "200"; run();
   });
   document.getElementById("posting-save").addEventListener("click", function () {
     var name = prompt("Name this query:");
@@ -324,7 +383,7 @@ ORDER BY n DESC</textarea>
     el.hidden = !el.hidden;
   });
   Object.keys(FIELDS).forEach(function (id) {
-    document.getElementById(id).addEventListener("keydown", function (e) { if (e.key === "Enter") loadPostings(); });
+    document.getElementById(id).addEventListener("keydown", function (e) { if (e.key === "Enter") run(); });
   });
   renderSaved();
   document.getElementById("sql-go").addEventListener("click", runSql);
