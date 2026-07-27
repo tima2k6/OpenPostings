@@ -103,6 +103,7 @@ const { openDatabase } = require("./db/open-database.js");
 const { findCompanies, findPostings, runReadOnlyQuery, rejectUnsafeQuery, MAX_ROWS } = require("./services/db-browser.js");
 const { DB_BROWSER_PAGE } = require("./services/db-browser-page.js");
 const { runQuery: runPostingQuery } = require("./services/db-query.js");
+const { computeFacets } = require("./services/db-facets.js");
 
 
 const PORT = Number(process.env.PORT || 8787);
@@ -1066,6 +1067,14 @@ function createServer() {
   app.get("/db/search", async (req, res) => {
     try {
       res.json(await runPostingQuery(req.query));
+    } catch (error) {
+      res.status(400).json({ error: String(error?.message || error) });
+    }
+  });
+
+  app.get("/db/facets", async (req, res) => {
+    try {
+      res.json(await computeFacets(req.query));
     } catch (error) {
       res.status(400).json({ error: String(error?.message || error) });
     }

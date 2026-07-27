@@ -11,7 +11,7 @@
 // and those are exactly the constraints worth looking underneath.
 const { getReadOnlyDb } = require("./db-browser.js");
 const { rowMatchesLocationFilters, STATE_CODE_TO_NAME } = require("../helpers/description-filters.js");
-const { inferPostingLocationFromJobUrl } = require("../helpers/normalize-ats.js");
+const { inferPostingLocationFromJobUrl, inferAtsFromJobPostingUrl } = require("../helpers/normalize-ats.js");
 
 const MAX_ROWS = 1000;
 // When a real state filter is active the rows have to be tested in JS, so a bounded
@@ -63,6 +63,9 @@ function buildQuery(input = {}) {
   const params = [];
 
   const titleAny = splitTerms(input.title_any);
+  // Drill-down needs AND, not OR: clicking a facet must narrow the set. title_any widens
+  // it, so the two cannot share a field.
+  const titleAll = splitTerms(input.title_all);
   const titleNone = splitTerms(input.title_none);
   const companyAny = splitTerms(input.company_any);
   const companyNone = splitTerms(input.company_none);
@@ -70,6 +73,7 @@ function buildQuery(input = {}) {
   const locationNone = splitTerms(input.location_none);
 
   if (titleAny.length) clauses.push(anyOf("position_name", titleAny, params));
+  for (const term of titleAll) clauses.push(anyOf("position_name", [term], params));
   if (titleNone.length) clauses.push(noneOf("position_name", titleNone, params));
   if (companyAny.length) clauses.push(anyOf("company_name", companyAny, params));
   if (companyNone.length) clauses.push(noneOf("company_name", companyNone, params));
@@ -107,6 +111,9 @@ function buildQuery(input = {}) {
   // segment-aware matcher, which only runs in JS, so SQL narrows to a superset here and
   // runQuery applies the real predicate afterwards. Rows with no stored location are kept
   // because their value is inferred from the job URL, which this query cannot see.
+  // ATS is derived from the job URL rather than stored, so like states it cannot be a SQL
+  // clause and is applied during the refine pass.
+  const atsFilters = splitTerms(input.ats);
   const stateCodes = splitTerms(input.states).map((code) => code.toUpperCase());
   if (stateCodes.length) {
     const parts = [];
@@ -145,13 +152,13 @@ function buildQuery(input = {}) {
     `ORDER BY ${sortColumn} ${direction}, id DESC\n` +
     `LIMIT ${limit}`;
 
-  return { sql, params, where, clauses, limit, stateCodes };
+  return { sql, params, where, clauses, limit, stateCodes, atsFilters };
 }
 
 async function runQuery(input = {}) {
   const db = await getReadOnlyDb();
   const built = buildQuery(input);
-  const { where, limit, stateCodes } = built;
+  const { where, limit, stateCodes, atsFilters } = built;
   const params = built.params.slice();
 
   const readable = built.sql.replace(/\?/g, () => {
@@ -160,7 +167,7 @@ async function runQuery(input = {}) {
   });
 
   // No state filter: SQL is the whole predicate, so counts come straight from the table.
-  if (stateCodes.length === 0) {
+  if (stateCodes.length === 0 && atsFilters.length === 0) {
     const rows = await db.all(built.sql, params);
     const totals = await db.get(
       `SELECT COUNT(*) AS total, SUM(CASE WHEN hidden = 0 THEN 1 ELSE 0 END) AS visible
@@ -178,7 +185,8 @@ async function runQuery(input = {}) {
     };
   }
 
-  // State filter: take the SQL superset, then apply the real segment-aware matcher.
+  // State or ATS filter: take the SQL superset, then apply the predicates that only exist
+  // in JS -- the segment-aware state matcher, and the ATS inferred from the URL.
   const candidateSql = built.sql
     .replace(/LIMIT \d+$/, `LIMIT ${STATE_CANDIDATE_CAP}`);
   const candidates = await db.all(candidateSql, params);
@@ -187,7 +195,8 @@ async function runQuery(input = {}) {
   for (const row of candidates) {
     const location =
       String(row.location || "").trim() || inferPostingLocationFromJobUrl(row.job_posting_url) || "";
-    if (!rowMatchesLocationFilters(location, stateCodes, [], [], [])) continue;
+    if (stateCodes.length && !rowMatchesLocationFilters(location, stateCodes, [], [], [])) continue;
+    if (atsFilters.length && !atsFilters.includes(String(inferAtsFromJobPostingUrl(row.job_posting_url) || "").toLowerCase())) continue;
     matched.push({ ...row, location: row.location || location });
   }
 
