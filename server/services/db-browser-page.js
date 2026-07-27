@@ -140,6 +140,8 @@ const DB_BROWSER_PAGE = `<!doctype html>
       <label>Company <b>any</b><input id="f-company-any" placeholder="hilton, marriott"></label>
       <label>Company <b>none</b><input id="f-company-none" placeholder="staffing, temp"></label>
       <label>State <b>(exact)</b><input id="f-states" placeholder="WA, OR"></label>
+      <label>Country <b>(exact)</b><input id="f-countries" placeholder="US, Canada"></label>
+      <label>Region <b>(exact)</b><input id="f-regions" placeholder="AMER, EMEA, APAC"></label>
       <label>Location text <b>any</b><input id="f-loc-any" placeholder="Seattle, Bellevue"></label>
       <label>Location <b>none</b><input id="f-loc-none" placeholder="DC, remote"></label>
       <label>Pay at least<input id="f-pay-min" type="number" placeholder="140000"></label>
@@ -165,7 +167,7 @@ const DB_BROWSER_PAGE = `<!doctype html>
       <label>Max rows<input id="f-limit" type="number" value="200"></label>
     </div>
     </details>
-    <p class="hint">Terms are comma-separated. Within a box they are OR-ed; each box is AND-ed with the others &mdash; so <em>any</em>=manager,director with <em>none</em>=assistant gives (manager OR director) AND NOT assistant. Only <b>All rows</b> shows postings the app is currently hiding. <b>State</b> uses real state matching &mdash; "WA" will not match Warwick or Sweetwater the way a location-text search does.</p>
+    <p class="hint">Terms are comma-separated. Within a box they are OR-ed; each box is AND-ed with the others &mdash; so <em>any</em>=manager,director with <em>none</em>=assistant gives (manager OR director) AND NOT assistant. Only <b>All rows</b> shows postings the app is currently hiding. <b>State</b>, <b>Country</b> and <b>Region</b> use the same location matching the app's own filters use &mdash; "WA" will not match Warwick or Sweetwater the way a location-text search does, nor Perth in Western Australia. State accepts a code or a full name; <b>Country</b> takes a code or name ("US", "Canada") and <b>Region</b> one of AMER, EMEA, APAC.</p>
     <div class="row">
       <button class="go" id="posting-go">Run</button>
       <button id="posting-clear">Clear</button>
@@ -278,7 +280,8 @@ ORDER BY n DESC</textarea>
   var FIELDS = {
     "f-title-any": "title_any", "f-title-all": "title_all", "f-title-none": "title_none",
     "f-company-any": "company_any", "f-company-none": "company_none",
-    "f-states": "states", "f-loc-any": "location_any", "f-loc-none": "location_none",
+    "f-states": "states", "f-countries": "countries", "f-regions": "regions",
+    "f-loc-any": "location_any", "f-loc-none": "location_none",
     "f-pay-min": "pay_min", "f-pay-max": "pay_max",
     "f-seen": "seen_days", "f-found": "found_days",
     "f-ats": "ats", "f-vis": "visibility", "f-sort": "sort", "f-dir": "dir", "f-limit": "limit"
@@ -411,7 +414,8 @@ ORDER BY n DESC</textarea>
   var FILTER_LABEL = {
     title_any: "Title any", title_all: "Title has", title_none: "Title not",
     company_any: "Company", company_none: "Company not",
-    states: "State", location_any: "Location", location_none: "Location not",
+    states: "State", countries: "Country", regions: "Region",
+    location_any: "Location", location_none: "Location not",
     ats: "ATS", pay_min: "Pay \u2265", pay_max: "Pay \u2264",
     seen_days: "Seen \u2264 d", found_days: "Found \u2264 d", visibility: "Show"
   };

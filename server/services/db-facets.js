@@ -13,7 +13,7 @@
 // in JS is both simpler and the only option that keeps every facet consistent with the
 // others.
 const { getReadOnlyDb } = require("./db-browser.js");
-const { buildQuery } = require("./db-query.js");
+const { buildQuery, needsRefinePass } = require("./db-query.js");
 const { rowMatchesLocationFilters, STATE_CODE_TO_NAME } = require("../helpers/description-filters.js");
 const { inferPostingLocationFromJobUrl, inferAtsFromJobPostingUrl } = require("../helpers/normalize-ats.js");
 
@@ -92,6 +92,15 @@ async function computeFacets(input = {}) {
   const rows = await db.all(sql, built.params);
 
   const activeStates = built.stateCodes || [];
+  const activeCountries = built.countryFilters || [];
+  const activeRegions = built.regionFilters || [];
+  const activeAts = built.atsFilters || [];
+  const hasLocationFilter = activeStates.length > 0 || activeCountries.length > 0 || activeRegions.length > 0;
+  // The same refine runQuery applies, so the facet totals describe the set the postings list
+  // is showing rather than the SQL superset it was drawn from. The ATS half of it was
+  // previously left out, which made these counts disagree with the result count whenever an
+  // ATS filter was set.
+  const refine = needsRefinePass(built);
   const byState = new Map();
   const byCompany = new Map();
   const byWord = new Map();
@@ -121,10 +130,18 @@ async function computeFacets(input = {}) {
   };
 
   for (const row of rows) {
-    if (activeStates.length > 0) {
+    if (refine) {
       const location =
         String(row.location || "").trim() || inferPostingLocationFromJobUrl(row.job_posting_url) || "";
-      if (!rowMatchesLocationFilters(location, activeStates, [], [], [])) continue;
+      if (hasLocationFilter && !rowMatchesLocationFilters(location, activeStates, [], activeCountries, activeRegions)) {
+        continue;
+      }
+      if (
+        activeAts.length > 0 &&
+        !activeAts.includes(String(inferAtsFromJobPostingUrl(row.job_posting_url) || "").toLowerCase())
+      ) {
+        continue;
+      }
     }
 
     matched += 1;

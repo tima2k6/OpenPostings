@@ -728,9 +728,84 @@ function isDifferentState(segment, code) {
   return Boolean(matchedCode) && matchedCode !== code;
 }
 
-function isNonUsCountry(segment) {
+// Boards abbreviate the country as often as they spell it, so "Perth, WA, AU" has to read
+// the same way as "Perth, WA, Australia". Only codes that are not *also* US state codes are
+// read this way: CA, IN, MD, LA, IL and their kind name a state at least as often as a
+// country in this data, and guessing wrong there would drop genuine US postings.
+function isNonUsCountryCode(segment) {
+  const asCode = String(segment || "").trim().toUpperCase();
+  return COUNTRY_BY_CODE.has(asCode) && asCode !== "US" && !STATE_CODE_TO_NAME[asCode];
+}
+
+function isNonUsCountryName(segment) {
+  const normalized = normalizeGeoText(segment);
+  // "New Mexico" resolves to Mexico through the alias table, and Washington, Georgia and
+  // Indiana all name countries or their neighbours. A US state name is never the country.
+  if (US_STATE_NAMES.has(normalized)) return false;
   const countryCode = COUNTRY_ALIAS_TO_CODE.get(normalizeCountryLikePart(segment));
   return Boolean(countryCode) && countryCode !== "US";
+}
+
+function isNonUsCountry(segment) {
+  return isNonUsCountryName(segment) || isNonUsCountryCode(segment);
+}
+
+// "/" and friends separate whole locations rather than parts of one, so a posting listing
+// several of them flattens into a single string. Every guard that reasons about "the rest of
+// this location" has to be scoped to one group, or the other location's country or state
+// answers for it.
+function splitLocationIntoGroups(locationText) {
+  return String(locationText || "")
+    .split(/[/|;]+/)
+    .map((group) => group.trim())
+    .filter(Boolean);
+}
+
+// Which segment is allowed to name the country matters as much as whether one does. Asking
+// whether *any* segment is country-shaped reads "Lebanon, NH", "Holland, MI", "Jamaica, NY"
+// and "Albuquerque, New Mexico" as foreign -- every one of those is an American town whose
+// name is also a country's, and dropping them costs far more than the foreign rows it saves.
+//
+// Only the positions a country is actually written in are read: the end of the group, and --
+// when the group is a dash-delimited slug like "Australia - WA - Perth" -- the front of it,
+// since those run country-first while comma-separated locations run city-first. A trailing
+// segment that is itself a US state name is never a country, which keeps "New Mexico" from
+// answering as Mexico.
+function hasNonUsCountrySegment(group) {
+  const segments = splitLocationIntoCountryCandidateSegments(group);
+  if (segments.length < 2) return false;
+
+  // A bare foreign code is never an American town, so it counts wherever it sits. That is
+  // what reads the middle of "Gurgaon, HR, IN" -- Haryana beside a code that is also a US
+  // state -- without having to decide what the trailing IN means.
+  if (segments.some((segment) => isNonUsCountryCode(segment))) return true;
+
+  // A spelled-out country name is a different matter, because so many American towns carry
+  // one: Lebanon NH, Holland MI, Jamaica NY, Peru IN, Mexico MO. Reading a name from any
+  // position marks all of those foreign and drops them. So a name only counts where a
+  // country is actually written -- the end of the group, or the front of a dash-delimited
+  // slug like "Australia - WA - Perth", which run country-first where comma-separated
+  // locations run city-first.
+  const countryNamePositions = [segments[segments.length - 1]];
+  // A US ZIP settles the country outright, and it is the one thing that keeps the
+  // country-first reading off "China - China, ME 04358" -- China, Maine, whose ATS happens
+  // to write it dash-delimited with the town name repeated.
+  const hasUsZip = /\b\d{5}(?:-\d{4})?\b/.test(String(group || ""));
+  if (!hasUsZip && /\s-\s/.test(String(group || ""))) countryNamePositions.push(segments[0]);
+  return countryNamePositions.some((segment) => isNonUsCountryName(segment));
+}
+
+// A bare two-letter code is only a US state when the location does not say otherwise. Foreign
+// subdivisions reuse the same abbreviations -- "Perth, WA, Australia" is Western Australia and
+// "Milan, MI, Italy" is the province of Milan -- and hasBareStateCodeSegmentMatch alone reads
+// both as US states, which is how Australian postings survived a WA filter.
+//
+// Scoped per location group for the same reason hasStateNameGroupMatch scopes its guard: any
+// one clean group is a match, so "Seattle, WA / London, United Kingdom" keeps its genuine WA.
+function hasBareStateCodeGroupMatch(locationText, code) {
+  return splitLocationIntoGroups(locationText).some(
+    (group) => hasBareStateCodeSegmentMatch(group, code) && !hasNonUsCountrySegment(group)
+  );
 }
 
 // A segment that is exactly a state name usually is that state ("Seattle, Washington"), but
@@ -748,12 +823,7 @@ function isNonUsCountry(segment) {
 // and any one clean group is a match. Otherwise "Seattle, Washington / Portland, OR" would
 // lose its genuine WA match to the other location's state.
 function hasStateNameGroupMatch(locationText, stateName, code) {
-  const groups = String(locationText || "")
-    .split(/[/|;]+/)
-    .map((group) => group.trim())
-    .filter(Boolean);
-
-  return groups.some((group) => {
+  return splitLocationIntoGroups(locationText).some((group) => {
     // A ZIP rides along inside the state segment on boards that write the full state name
     // ("Cambridge, Massachusetts 02139, United States of America" on AcademicJobsOnline).
     // hasBareStateCodeSegmentMatch already reads the same shape after a state code, and a
@@ -794,44 +864,20 @@ function isWashingtonDcRatherThanWashingtonState(locationText) {
   return !hasBareStateCodeSegmentMatch(locationText, "WA");
 }
 
-// A bare two-letter code is only a US state when the string is not openly saying it is
-// somewhere else. Western Australia is what this catches: "Perth, WA, Australia" is a bare
-// WA segment with no country code of its own to compare against, so the older collision
-// guard -- which only fired for codes that are themselves country codes, like IN/India --
-// never looked at it.
-//
-// Only the trailing segment is read, and only when it is not a US state name. Scanning the
-// whole string for any country-shaped word is what a first attempt did, and it quietly
-// reclassified "Lebanon, NH", "Holland, MI", "Jamaica, NY" and "Albuquerque, New Mexico" as
-// foreign -- every one of those is an American town whose name is also a country's.
-function namesNonUsCountryInTrailingSegment(locationText) {
-  const segments = splitLocationIntoCountryCandidateSegments(locationText);
-  if (segments.length < 2) return false;
-
-  const trailing = segments[segments.length - 1];
-  const normalizedTrailing = normalizeGeoText(trailing);
-  if (!normalizedTrailing) return false;
-  if (US_STATE_NAMES.has(normalizedTrailing)) return false;
-
-  const inferredGeo = inferLocationGeo(trailing);
-  const countryCode = String(inferredGeo?.countryCode || "").trim().toUpperCase();
-  return Boolean(countryCode) && countryCode !== "US";
-}
-
 function hasStateLikeMatch(locationText, stateCode) {
   const code = String(stateCode || "").trim().toUpperCase();
   if (!code) return false;
 
   if (code === "WA" && isWashingtonDcRatherThanWashingtonState(locationText)) return false;
 
-  if (hasBareStateCodeSegmentMatch(locationText, code)) {
+  if (hasBareStateCodeGroupMatch(locationText, code)) {
     // Guard against state-code / country-code collisions (e.g. IN/India, LA/Laos, IL/Israel,
     // MT/Malta, ME/Montenegro) when the full country name is also explicitly present.
     const inferredGeo = COUNTRY_BY_CODE.has(code) ? inferLocationGeo(locationText) : null;
     const isActuallyThatCountry = Boolean(inferredGeo?.countryCode) && inferredGeo.countryCode === code;
-    // A bare code inside a string that ends by naming a foreign country is that country's
-    // own subdivision, not the American state that happens to share the abbreviation.
-    if (!isActuallyThatCountry && !namesNonUsCountryInTrailingSegment(locationText)) return true;
+    // The foreign-subdivision case is already settled by hasBareStateCodeGroupMatch, which
+    // only accepts a bare code from a group that does not name another country.
+    if (!isActuallyThatCountry) return true;
   }
 
   // No country guard needed here: both slug shapes already establish the location is US.
@@ -1170,6 +1216,34 @@ function parseCountyFilters(values) {
   return parsed;
 }
 
+
+// The app sends state codes chosen from a list, but the database page takes them as free
+// text, so "WA", "Washington" and "Washington State" all have to arrive as WA.
+//
+// Anything that is not a US state is dropped rather than passed through as a pseudo-code.
+// An unrecognised token used to reach hasStateLikeMatch as its own "code", where the bare
+// segment test matched it literally and no state name existed to run the guards against --
+// which is how a "Washington" filter kept every Washington, DC row.
+function parseStateFilters(values) {
+  const source = Array.isArray(values) ? values : String(values ?? "").split(",");
+  const seen = new Set();
+  const codes = [];
+
+  for (const rawValue of source) {
+    const value = String(rawValue || "").trim();
+    if (!value) continue;
+
+    const asCode = value.toUpperCase();
+    const code = STATE_CODE_TO_NAME[asCode]
+      ? asCode
+      : STATE_NAME_TO_CODE.get(normalizeGeoText(value.replace(/\bstate\b/gi, " "))) || "";
+    if (!code || seen.has(code)) continue;
+    seen.add(code);
+    codes.push(code);
+  }
+
+  return codes;
+}
 
 function parseCountryFilters(values) {
   const parsed = [];
@@ -1678,6 +1752,7 @@ module.exports = {
   parseCountyFilters,
   parseCountryFilters,
   parseRegionFilters,
+  parseStateFilters,
   normalizeRemoteFilter,
   normalizeRemoteFilters,
   buildIndustryMatchersByKey,
