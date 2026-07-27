@@ -172,8 +172,15 @@ ORDER BY n DESC</textarea>
       document.getElementById("panel-" + t).hidden = t !== name;
     });
   }
+  // Opening the Postings tab used to show an empty form: the facets that make it useful
+  // only appeared after clicking Run, which reads as "the feature is not there". The first
+  // visit runs the current (empty) filter set so the breakdown is on screen immediately.
+  var ranPostings = false;
   TABS.forEach(function (t) {
-    document.getElementById("tab-" + t).addEventListener("click", function () { show(t); });
+    document.getElementById("tab-" + t).addEventListener("click", function () {
+      show(t);
+      if (t === "postings" && !ranPostings) { ranPostings = true; run(); }
+    });
   });
 
   function esc(v) {
