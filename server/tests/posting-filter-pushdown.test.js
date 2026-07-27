@@ -288,6 +288,53 @@ async function testDelistedPostingIsNotListed() {
   });
 }
 
+// The state pre-filter narrows candidates in SQL before the JS location test runs. Too
+// broad only costs speed; too narrow silently loses postings, so both the obvious case and
+// the one that is easy to get wrong are covered.
+async function testStatePrefilterKeepsUrlInferredLocations() {
+  await withDb([], async (db) => {
+    const seedRow = (url, location) =>
+      db.run(
+        `INSERT INTO Postings
+           (company_name, position_name, job_posting_url, location, posting_date,
+            first_seen_epoch, last_seen_epoch, hidden)
+         VALUES ('Acme', 'Engineer', ?, ?, '1/1/26', ?, ?, 0)`,
+        [url, location, NOW - 60, NOW - 60]
+      );
+
+    await seedRow("https://x/stored-wa", "Seattle, WA");
+    // No stored location: the value comes from the URL, which the SQL pre-filter cannot
+    // see. Dropping these would make every Workday posting unreachable by state.
+    await seedRow("https://acme.wd1.myworkdayjobs.com/careers/job/Washington--Seattle-Campus/Engineer_R-1", null);
+    await seedRow("https://x/stored-tx", "Austin, TX");
+
+    const result = await listPostingsWithFilters({ states: ["WA"] });
+    const urls = result.items.map((item) => item.job_posting_url).sort();
+
+    assert.strictEqual(result.count, 2, "both WA postings must survive the pre-filter");
+    assert.ok(
+      urls.some((url) => url.includes("myworkdayjobs")),
+      "a posting whose state is only knowable from its URL must not be filtered out in SQL"
+    );
+    assert.ok(!urls.some((url) => url.includes("stored-tx")), "a posting in another state must not be returned");
+  });
+}
+
+async function testStatePrefilterMatchesOnStateName() {
+  await withDb([], async (db) => {
+    await db.run(
+      `INSERT INTO Postings
+         (company_name, position_name, job_posting_url, location, posting_date,
+          first_seen_epoch, last_seen_epoch, hidden)
+       VALUES ('Acme', 'Engineer', 'https://x/name', 'Bellevue, Washington, United States', '1/1/26', ?, ?, 0)`,
+      [NOW - 60, NOW - 60]
+    );
+
+    const result = await listPostingsWithFilters({ states: ["WA"] });
+    assert.strictEqual(result.count, 1, "the pre-filter must allow the spelled-out state name, not just the code");
+  });
+}
+
 async function testFilteredRowsCarryDisplayFields() {
   await withDb([{ url: "https://x/a", position: "Engineer", location: "Austin, TX" }], async () => {
     const result = await listPostingsWithFilters({ search: "engineer" });
@@ -310,6 +357,8 @@ async function main() {
   await testUnfilteredListingIsUnaffected();
   await testLongLivedPostingStaysListed();
   await testDelistedPostingIsNotListed();
+  await testStatePrefilterKeepsUrlInferredLocations();
+  await testStatePrefilterMatchesOnStateName();
   await testFilteredRowsCarryDisplayFields();
   console.log("posting-filter-pushdown tests passed");
 }

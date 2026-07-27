@@ -370,15 +370,17 @@ function hasStateNameSegmentMatch(locationText, stateName) {
   return segments.some((segment) => normalizeLikeText(segment) === stateName);
 }
 
+// Built once; see the note on STATE_NAME_TO_CODE in description-filters.js.
+const STATE_NAME_TO_CODE = new Map(
+  Object.entries(STATE_CODE_TO_NAME).map(([code, name]) => [name, code])
+);
+
 function isDifferentState(segment, code) {
   const segmentCode = String(segment || "").trim().toUpperCase();
   if (STATE_CODE_TO_NAME[segmentCode] && segmentCode !== code) return true;
 
-  const segmentName = normalizeLikeText(segment);
-  for (const [otherCode, otherName] of Object.entries(STATE_CODE_TO_NAME)) {
-    if (otherCode !== code && segmentName === otherName) return true;
-  }
-  return false;
+  const matchedCode = STATE_NAME_TO_CODE.get(normalizeLikeText(segment));
+  return Boolean(matchedCode) && matchedCode !== code;
 }
 
 // Mirrors hasStateNameGroupMatch in description-filters.js -- see the note there. A state
