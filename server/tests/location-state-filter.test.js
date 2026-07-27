@@ -381,6 +381,46 @@ function run() {
     );
   }
 
+  // Where a country name is allowed to sit is the whole of this rule, and both directions
+  // of it cost real rows. A bare foreign code is never an American town, so it counts from
+  // any position -- that is what reads Haryana in "Gurgaon, HR, IN" without having to decide
+  // what the trailing IN means. A spelled-out name is the opposite: too many American towns
+  // carry one, so it only counts where a country is actually written.
+  for (const [location, code, expected] of [
+    ["Gurgaon, HR, IN", "IN", false],
+    ["Khlong Sam Wa, TH", "WA", false],
+    // Washington, Tyne and Wear -- the English one.
+    ["Washington, GB", "WA", false],
+    ["NL, CA", "CA", false],
+    ["Hi, DZ", "HI", false],
+    ["La Paz, BO", "LA", false],
+    // A US ZIP settles the country outright, which is what keeps the country-first reading
+    // of a dash-delimited slug off China, Maine.
+    ["China - China, ME 04358", "ME", true],
+    ["Indianapolis, IN", "IN", true]
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, [code], [], [], []),
+      expected,
+      `${code} against ${location} should be ${expected}`
+    );
+  }
+
+  // Group scoping earns its keep on the aggregator rows that flatten dozens of locations
+  // into one string: a US group inside one must still be findable, and reading the country
+  // off the whole string instead loses every one of them.
+  for (const [location, code] of [
+    ["Aarhus, Denmark / Myrtle Beach, SC, United States / Alicante, Spain", "SC"],
+    ["Bogota, Colombia / LA, United States / Buenos Aires, Argentina", "LA"],
+    ["SF Bay Area, CA / London, UK", "CA"]
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, [code], [], [], []),
+      true,
+      `a US location inside a multi-country listing must still match ${code}: ${location}`
+    );
+  }
+
   console.log("location-state-filter tests passed");
 }
 

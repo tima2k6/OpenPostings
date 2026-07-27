@@ -787,7 +787,11 @@ function hasNonUsCountrySegment(group) {
   // slug like "Australia - WA - Perth", which run country-first where comma-separated
   // locations run city-first.
   const countryNamePositions = [segments[segments.length - 1]];
-  if (/\s-\s/.test(String(group || ""))) countryNamePositions.push(segments[0]);
+  // A US ZIP settles the country outright, and it is the one thing that keeps the
+  // country-first reading off "China - China, ME 04358" -- China, Maine, whose ATS happens
+  // to write it dash-delimited with the town name repeated.
+  const hasUsZip = /\b\d{5}(?:-\d{4})?\b/.test(String(group || ""));
+  if (!hasUsZip && /\s-\s/.test(String(group || ""))) countryNamePositions.push(segments[0]);
   return countryNamePositions.some((segment) => isNonUsCountryName(segment));
 }
 
