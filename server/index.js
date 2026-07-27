@@ -102,6 +102,7 @@ const { promisify } = require("util");
 const { openDatabase } = require("./db/open-database.js");
 const { findCompanies, findPostings, runReadOnlyQuery, rejectUnsafeQuery, MAX_ROWS } = require("./services/db-browser.js");
 const { DB_BROWSER_PAGE } = require("./services/db-browser-page.js");
+const { runQuery: runPostingQuery } = require("./services/db-query.js");
 
 
 const PORT = Number(process.env.PORT || 8787);
@@ -1058,6 +1059,15 @@ function createServer() {
       res.json({ items });
     } catch (error) {
       res.status(500).json({ error: String(error?.message || error) });
+    }
+  });
+
+  // Composable querying over the raw table; see server/services/db-query.js.
+  app.get("/db/search", async (req, res) => {
+    try {
+      res.json(await runPostingQuery(req.query));
+    } catch (error) {
+      res.status(400).json({ error: String(error?.message || error) });
     }
   });
 

@@ -49,6 +49,17 @@ const DB_BROWSER_PAGE = `<!doctype html>
   .err { color: #b3261e; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; margin: 10px 0; }
   footer { padding: 0 18px 30px; }
   .hint { font-size: 12px; color: #66798c; margin: 8px 0; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; margin-bottom: 10px; }
+  .grid label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #52606d; }
+  @media (prefers-color-scheme: dark) { .grid label { color: #9fb0c4; } }
+  .grid input, .grid select { width: 100%; }
+  pre { overflow-x: auto; background: #eef2f6; padding: 10px; border-radius: 8px; font-size: 12px; }
+  @media (prefers-color-scheme: dark) { pre { background: #1b242e; } }
+  button.saved, button.saved-x, #posting-clear, #posting-save, #posting-sql {
+    border: 1px solid #c6ceda; background: #fff; color: inherit; border-radius: 8px;
+    padding: 7px 12px; cursor: pointer; font: inherit; font-size: 13px; }
+  @media (prefers-color-scheme: dark) { button.saved, button.saved-x, #posting-clear, #posting-save, #posting-sql { background: #18202a; border-color: #2d3947; } }
+  a { color: #1f6feb; }
   .examples button { background: none; border: none; color: #1f6feb; cursor: pointer; font: inherit;
                      padding: 0; text-decoration: underline; font-size: 12px; }
 </style>
@@ -74,15 +85,45 @@ const DB_BROWSER_PAGE = `<!doctype html>
   </section>
 
   <section id="panel-postings" hidden>
-    <div class="row">
-      <input type="search" id="posting-q" placeholder="Company, title or location">
-      <select id="posting-state">
-        <option value="visible">Visible only</option>
-        <option value="hidden">Hidden only</option>
-        <option value="all">All</option>
-      </select>
-      <button class="go" id="posting-go">Search</button>
+    <div class="grid">
+      <label>Title has <b>any</b> of<input id="f-title-any" placeholder="manager, director, head of"></label>
+      <label>Title has <b>none</b> of<input id="f-title-none" placeholder="assistant, shift, intern"></label>
+      <label>Company <b>any</b><input id="f-company-any" placeholder="hilton, marriott"></label>
+      <label>Company <b>none</b><input id="f-company-none" placeholder="staffing, temp"></label>
+      <label>State <b>(exact)</b><input id="f-states" placeholder="WA, OR"></label>
+      <label>Location text <b>any</b><input id="f-loc-any" placeholder="Seattle, Bellevue"></label>
+      <label>Location <b>none</b><input id="f-loc-none" placeholder="DC, remote"></label>
+      <label>Pay at least<input id="f-pay-min" type="number" placeholder="140000"></label>
+      <label>Pay at most<input id="f-pay-max" type="number" placeholder=""></label>
+      <label>Still listed within (days)<input id="f-seen" type="number" placeholder="5"></label>
+      <label>First found within (days)<input id="f-found" type="number" placeholder=""></label>
+      <label>Show<select id="f-vis">
+        <option value="all">All rows</option>
+        <option value="visible">Visible in app</option>
+        <option value="hidden">Hidden from app</option>
+      </select></label>
+      <label>Sort by<select id="f-sort">
+        <option value="last_seen">Last seen</option>
+        <option value="first_seen">First found</option>
+        <option value="pay">Pay</option>
+        <option value="company">Company</option>
+        <option value="position">Position</option>
+        <option value="location">Location</option>
+        <option value="posted">Posted date</option>
+      </select></label>
+      <label>Direction<select id="f-dir"><option value="desc">Descending</option><option value="asc">Ascending</option></select></label>
+      <label>Max rows<input id="f-limit" type="number" value="200"></label>
     </div>
+    <p class="hint">Terms are comma-separated. Within a box they are OR-ed; each box is AND-ed with the others &mdash; so <em>any</em>=manager,director with <em>none</em>=assistant gives (manager OR director) AND NOT assistant. Only <b>All rows</b> shows postings the app is currently hiding. <b>State</b> uses real state matching &mdash; "WA" will not match Warwick or Sweetwater the way a location-text search does.</p>
+    <div class="row">
+      <button class="go" id="posting-go">Run</button>
+      <button id="posting-clear">Clear</button>
+      <button id="posting-save">Save this query</button>
+      <button id="posting-sql">Show SQL</button>
+      <span id="posting-count" class="hint"></span>
+    </div>
+    <div class="row" id="saved-row"></div>
+    <pre id="posting-sqlout" hidden></pre>
     <div id="posting-out"></div>
   </section>
 
@@ -173,21 +214,77 @@ ORDER BY n DESC</textarea>
     }).catch(function (e) { fail("company-out", e.message); });
   }
 
+  var FIELDS = {
+    "f-title-any": "title_any", "f-title-none": "title_none",
+    "f-company-any": "company_any", "f-company-none": "company_none",
+    "f-states": "states", "f-loc-any": "location_any", "f-loc-none": "location_none",
+    "f-pay-min": "pay_min", "f-pay-max": "pay_max",
+    "f-seen": "seen_days", "f-found": "found_days",
+    "f-vis": "visibility", "f-sort": "sort", "f-dir": "dir", "f-limit": "limit"
+  };
+
+  function readFilters() {
+    var out = {};
+    Object.keys(FIELDS).forEach(function (id) {
+      var v = document.getElementById(id).value;
+      if (v !== "" && v !== null) out[FIELDS[id]] = v;
+    });
+    return out;
+  }
+  function writeFilters(state) {
+    Object.keys(FIELDS).forEach(function (id) {
+      document.getElementById(id).value = state[FIELDS[id]] === undefined ? "" : state[FIELDS[id]];
+    });
+  }
+  function money(r) {
+    var lo = r.pay_min, hi = r.pay_max;
+    if (!lo && !hi) return "";
+    var k = function (n) { return n >= 1000 ? Math.round(n / 1000) + "k" : String(n); };
+    return (lo && hi && lo !== hi) ? k(lo) + "-" + k(hi) : k(hi || lo);
+  }
+
   function loadPostings() {
-    var q = document.getElementById("posting-q").value;
-    var state = document.getElementById("posting-state").value;
-    document.getElementById("posting-out").innerHTML = '<p class="hint">Loading&hellip;</p>';
-    get("/db/postings?q=" + encodeURIComponent(q) + "&state=" + encodeURIComponent(state)).then(function (data) {
-      document.getElementById("posting-out").innerHTML = table(data.items, {
-        head: "<th>company</th><th>position</th><th>location</th><th>posted</th><th>state</th><th>first seen</th><th>last seen</th>",
+    var params = new URLSearchParams(readFilters()).toString();
+    document.getElementById("posting-out").innerHTML = '<p class="hint">Running&hellip;</p>';
+    get("/db/search?" + params).then(function (data) {
+      document.getElementById("posting-count").textContent =
+        (data.approximate ? "at least " : "") + data.total + " matched \u00b7 " + data.visible +
+        " visible, " + (data.total - data.visible) + " hidden \u00b7 showing " + data.shown;
+      document.getElementById("posting-sqlout").textContent = data.sql;
+      document.getElementById("posting-out").innerHTML = table(data.rows, {
+        head: "<th>company</th><th>position</th><th>location</th><th>pay</th><th>posted</th><th>state</th><th>first found</th><th>last seen</th><th>link</th>",
         row: function (r) {
           return "<td>" + esc(r.company_name) + '</td><td class="wrap">' + esc(r.position_name) +
-            "</td><td>" + esc(r.location) + "</td><td>" + esc(r.posting_date) + "</td><td>" +
+            "</td><td>" + esc(r.location) + "</td><td>" + esc(money(r)) + "</td><td>" + esc(r.posting_date) + "</td><td>" +
             (r.hidden ? '<span class="pill warn">hidden</span>' : '<span class="pill ok">visible</span>') +
-            "</td><td>" + when(r.first_seen_epoch) + "</td><td>" + when(r.last_seen_epoch) + "</td>";
+            "</td><td>" + when(r.first_seen_epoch) + "</td><td>" + when(r.last_seen_epoch) +
+            '</td><td><a href="' + esc(r.job_posting_url) + '" target="_blank" rel="noopener">open</a></td>';
         }
       });
     }).catch(function (e) { fail("posting-out", e.message); });
+  }
+
+  // Saved queries live in this browser only; the server holds no per-user state.
+  function savedQueries() {
+    try { return JSON.parse(localStorage.getItem("openpostings.db.saved") || "[]"); } catch (e) { return []; }
+  }
+  function renderSaved() {
+    var row = document.getElementById("saved-row");
+    var list = savedQueries();
+    if (!list.length) { row.innerHTML = ''; return; }
+    row.innerHTML = '<span class="hint">saved:</span> ' + list.map(function (q, i) {
+      return '<button class="saved" data-i="' + i + '">' + esc(q.name) + '</button>' +
+             '<button class="saved-x" data-i="' + i + '" title="delete">&times;</button>';
+    }).join(" ");
+    Array.prototype.forEach.call(row.querySelectorAll("button.saved"), function (b) {
+      b.addEventListener("click", function () { writeFilters(savedQueries()[b.getAttribute("data-i")].state); loadPostings(); });
+    });
+    Array.prototype.forEach.call(row.querySelectorAll("button.saved-x"), function (b) {
+      b.addEventListener("click", function () {
+        var list2 = savedQueries(); list2.splice(Number(b.getAttribute("data-i")), 1);
+        localStorage.setItem("openpostings.db.saved", JSON.stringify(list2)); renderSaved();
+      });
+    });
   }
 
   function runSql() {
@@ -211,7 +308,25 @@ ORDER BY n DESC</textarea>
   document.getElementById("company-go").addEventListener("click", loadCompanies);
   document.getElementById("company-q").addEventListener("keydown", function (e) { if (e.key === "Enter") loadCompanies(); });
   document.getElementById("posting-go").addEventListener("click", loadPostings);
-  document.getElementById("posting-q").addEventListener("keydown", function (e) { if (e.key === "Enter") loadPostings(); });
+  document.getElementById("posting-clear").addEventListener("click", function () {
+    writeFilters({}); document.getElementById("f-limit").value = "200"; loadPostings();
+  });
+  document.getElementById("posting-save").addEventListener("click", function () {
+    var name = prompt("Name this query:");
+    if (!name) return;
+    var list = savedQueries();
+    list.push({ name: name, state: readFilters() });
+    localStorage.setItem("openpostings.db.saved", JSON.stringify(list));
+    renderSaved();
+  });
+  document.getElementById("posting-sql").addEventListener("click", function () {
+    var el = document.getElementById("posting-sqlout");
+    el.hidden = !el.hidden;
+  });
+  Object.keys(FIELDS).forEach(function (id) {
+    document.getElementById(id).addEventListener("keydown", function (e) { if (e.key === "Enter") loadPostings(); });
+  });
+  renderSaved();
   document.getElementById("sql-go").addEventListener("click", runSql);
   Array.prototype.forEach.call(document.querySelectorAll(".examples button"), function (b) {
     b.addEventListener("click", function () { document.getElementById("sql").value = b.getAttribute("data-sql"); runSql(); });

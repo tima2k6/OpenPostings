@@ -21,6 +21,7 @@
     "test:filter-normalize": "node server/tests/filter-normalize.test.js",
     "test:backend:api-request-errors": "node server/tests/api-request-errors.test.js",
     "test:backend:db-browser": "node server/tests/db-browser.test.js",
+    "test:backend:db-query": "node server/tests/db-query.test.js",
     "test:backend:posting-retention": "node server/tests/posting-retention.test.js",
     "test:backend:posting-query-plan": "node server/tests/posting-query-plan.test.js",
     "test:backend:posting-filter-pushdown": "node server/tests/posting-filter-pushdown.test.js",

@@ -146,4 +146,4 @@ async function findPostings({ search, hiddenState }) {
   );
 }
 
-module.exports = { findCompanies, findPostings, runReadOnlyQuery, rejectUnsafeQuery, MAX_ROWS };
+module.exports = { findCompanies, findPostings, runReadOnlyQuery, rejectUnsafeQuery, getReadOnlyDb, MAX_ROWS };
