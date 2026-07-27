@@ -184,8 +184,13 @@ const LOCATION_NON_COUNTRY_TERMS = new Set([
   "asia",
   "asia pacific"
 ]);
+// Seeds the country dropdown so it is populated before a sync has run. Every entry has to
+// resolve to a country in COUNTRY_DEFINITIONS -- buildDefaultCountryFilterOptions drops the
+// ones that do not. This list was originally harvested from the distinct trailing segments
+// of real posting locations, which is how "Alberta", "Croydon", "Jalisco", "Nsw" and
+// "Undefined" ended up in it: provinces, a London borough, a Mexican state and a literal
+// null. They are gone now, and anything added here must be a country.
 const DEFAULT_COUNTRY_FILTER_LABELS = Object.freeze([
-  "Alberta",
   "Argentina",
   "Armenia",
   "Austria",
@@ -196,41 +201,43 @@ const DEFAULT_COUNTRY_FILTER_LABELS = Object.freeze([
   "Chile",
   "Colombia",
   "Croatia",
-  "Croydon",
   "Denmark",
   "France",
   "Germany",
-  "Hillview",
   "India",
   "Ireland",
-  "Jalisco",
   "Jordan",
-  "K Vlinge",
   "Kazakhstan",
   "Kenya",
-  "Lund",
   "Mexico",
   "Moldova",
-  "Nederland",
   "Netherlands",
   "North Macedonia",
-  "Nsw",
-  "Ontario",
   "Philippines",
   "Poland",
   "Portugal",
-  "Queensland",
   "Romania",
   "Serbia",
   "South Africa",
-  "Tomelilla",
   "Turkey",
-  "Undefined",
   "United Kingdom",
   "United States",
   "Venezuela"
 ]);
 
+// Aliases are matched against a segment of the posting's location text, so they carry the
+// endonyms and common exonyms ATS feeds actually write: a Dutch board says "Nederland", a
+// German one "Niederlande", a French one "Pays-Bas". Without those the postings were not
+// recognised as Dutch at all -- "Nederland" alone accounted for 2,719 distinct locations.
+//
+// Two rules for adding to this table. The alias must be a country name, never a province or
+// a city: aliases are substring-matched, so "ontario" as a Canada alias would pull in
+// Ontario, California. And it must not be an ordinary English word that occurs in American
+// place names -- "island" would make every Staten Island posting Icelandic, and Georgia is
+// left out entirely because the US state would swallow the country.
+//
+// The two-letter code is deliberately not an alias. Registering it would make every bare
+// state code in a US location read as a country (see hasStateLikeMatch).
 const COUNTRY_DEFINITIONS = Object.freeze([
   {
     code: "US",
@@ -238,12 +245,12 @@ const COUNTRY_DEFINITIONS = Object.freeze([
     region: "AMER",
     aliases: ["us", "usa", "u.s.", "u.s.a.", "united states of america"]
   },
-  { code: "CA", label: "Canada", region: "AMER", aliases: ["can"] },
-  { code: "MX", label: "Mexico", region: "AMER", aliases: ["mex"] },
-  { code: "BR", label: "Brazil", region: "AMER", aliases: ["brasil"] },
-  { code: "AR", label: "Argentina", region: "AMER", aliases: [] },
+  { code: "CA", label: "Canada", region: "AMER", aliases: ["can", "kanada"] },
+  { code: "MX", label: "Mexico", region: "AMER", aliases: ["mex", "mexiko", "mexique"] },
+  { code: "BR", label: "Brazil", region: "AMER", aliases: ["brasil", "bresil", "brasilien"] },
+  { code: "AR", label: "Argentina", region: "AMER", aliases: ["argentine", "argentinien"] },
   { code: "CL", label: "Chile", region: "AMER", aliases: [] },
-  { code: "CO", label: "Colombia", region: "AMER", aliases: [] },
+  { code: "CO", label: "Colombia", region: "AMER", aliases: ["kolumbien"] },
   { code: "PE", label: "Peru", region: "AMER", aliases: [] },
   { code: "UY", label: "Uruguay", region: "AMER", aliases: [] },
   { code: "PY", label: "Paraguay", region: "AMER", aliases: [] },
@@ -256,53 +263,75 @@ const COUNTRY_DEFINITIONS = Object.freeze([
   { code: "SV", label: "El Salvador", region: "AMER", aliases: [] },
   { code: "HN", label: "Honduras", region: "AMER", aliases: [] },
   { code: "NI", label: "Nicaragua", region: "AMER", aliases: [] },
-  { code: "DO", label: "Dominican Republic", region: "AMER", aliases: [] },
+  { code: "DO", label: "Dominican Republic", region: "AMER", aliases: ["dominican", "republica dominicana"] },
   { code: "PR", label: "Puerto Rico", region: "AMER", aliases: [] },
   { code: "JM", label: "Jamaica", region: "AMER", aliases: [] },
   { code: "TT", label: "Trinidad and Tobago", region: "AMER", aliases: ["trinidad"] },
   { code: "BS", label: "Bahamas", region: "AMER", aliases: [] },
   { code: "BB", label: "Barbados", region: "AMER", aliases: [] },
+  { code: "CU", label: "Cuba", region: "AMER", aliases: [] },
+  { code: "BZ", label: "Belize", region: "AMER", aliases: [] },
+  { code: "GY", label: "Guyana", region: "AMER", aliases: [] },
+  { code: "SR", label: "Suriname", region: "AMER", aliases: [] },
+  { code: "HT", label: "Haiti", region: "AMER", aliases: [] },
+  { code: "GD", label: "Grenada", region: "AMER", aliases: [] },
+  { code: "DM", label: "Dominica", region: "AMER", aliases: [] },
+  { code: "AG", label: "Antigua and Barbuda", region: "AMER", aliases: ["antigua"] },
   { code: "GB", label: "United Kingdom", region: "EMEA", aliases: ["uk", "u.k.", "great britain", "britain", "england", "scotland", "wales", "northern ireland"] },
-  { code: "IE", label: "Ireland", region: "EMEA", aliases: ["republic of ireland"] },
-  { code: "FR", label: "France", region: "EMEA", aliases: [] },
-  { code: "DE", label: "Germany", region: "EMEA", aliases: ["deutschland"] },
-  { code: "ES", label: "Spain", region: "EMEA", aliases: [] },
-  { code: "PT", label: "Portugal", region: "EMEA", aliases: [] },
-  { code: "IT", label: "Italy", region: "EMEA", aliases: [] },
-  { code: "NL", label: "Netherlands", region: "EMEA", aliases: ["holland"] },
-  { code: "BE", label: "Belgium", region: "EMEA", aliases: [] },
-  { code: "LU", label: "Luxembourg", region: "EMEA", aliases: [] },
-  { code: "CH", label: "Switzerland", region: "EMEA", aliases: [] },
-  { code: "AT", label: "Austria", region: "EMEA", aliases: [] },
-  { code: "SE", label: "Sweden", region: "EMEA", aliases: [] },
-  { code: "NO", label: "Norway", region: "EMEA", aliases: [] },
-  { code: "DK", label: "Denmark", region: "EMEA", aliases: [] },
-  { code: "FI", label: "Finland", region: "EMEA", aliases: [] },
-  { code: "IS", label: "Iceland", region: "EMEA", aliases: [] },
-  { code: "PL", label: "Poland", region: "EMEA", aliases: [] },
-  { code: "CZ", label: "Czechia", region: "EMEA", aliases: ["czech republic"] },
-  { code: "SK", label: "Slovakia", region: "EMEA", aliases: [] },
-  { code: "HU", label: "Hungary", region: "EMEA", aliases: [] },
-  { code: "RO", label: "Romania", region: "EMEA", aliases: [] },
-  { code: "BG", label: "Bulgaria", region: "EMEA", aliases: [] },
-  { code: "HR", label: "Croatia", region: "EMEA", aliases: [] },
-  { code: "SI", label: "Slovenia", region: "EMEA", aliases: [] },
-  { code: "RS", label: "Serbia", region: "EMEA", aliases: [] },
-  { code: "BA", label: "Bosnia and Herzegovina", region: "EMEA", aliases: ["bosnia"] },
+  { code: "IE", label: "Ireland", region: "EMEA", aliases: ["republic of ireland", "irlanda", "irlande", "irland", "eire"] },
+  { code: "FR", label: "France", region: "EMEA", aliases: ["frankreich", "francia", "frankrijk"] },
+  { code: "DE", label: "Germany", region: "EMEA", aliases: ["deutschland", "allemagne", "germania", "alemania", "duitsland"] },
+  { code: "ES", label: "Spain", region: "EMEA", aliases: ["espana", "espagne", "spagna", "spanien", "spanje"] },
+  { code: "PT", label: "Portugal", region: "EMEA", aliases: ["portogallo"] },
+  { code: "IT", label: "Italy", region: "EMEA", aliases: ["italia", "italie", "italien"] },
+  { code: "NL", label: "Netherlands", region: "EMEA", aliases: ["holland", "nederland", "niederlande", "pays bas", "paesi bajos", "paesi bassi", "the netherlands"] },
+  { code: "BE", label: "Belgium", region: "EMEA", aliases: ["belgie", "belgique", "belgien", "belgio", "belgica"] },
+  { code: "LU", label: "Luxembourg", region: "EMEA", aliases: ["luxemburg"] },
+  { code: "CH", label: "Switzerland", region: "EMEA", aliases: ["schweiz", "suisse", "svizzera", "suiza"] },
+  { code: "AT", label: "Austria", region: "EMEA", aliases: ["osterreich", "oesterreich", "austrija", "ausztria", "autriche"] },
+  { code: "SE", label: "Sweden", region: "EMEA", aliases: ["sverige", "schweden", "suede"] },
+  { code: "NO", label: "Norway", region: "EMEA", aliases: ["norge", "norwegen", "norvege"] },
+  { code: "DK", label: "Denmark", region: "EMEA", aliases: ["danmark", "danemark", "daenemark"] },
+  { code: "FI", label: "Finland", region: "EMEA", aliases: ["suomi", "finnland", "finlande"] },
+  // No "island" alias: it is an ordinary word in American place names, and aliases are
+  // substring-matched, so it would make Staten Island and Rhode Island Icelandic.
+  { code: "IS", label: "Iceland", region: "EMEA", aliases: ["islande"] },
+  { code: "PL", label: "Poland", region: "EMEA", aliases: ["polska", "polen", "pologne"] },
+  { code: "CZ", label: "Czechia", region: "EMEA", aliases: ["czech republic", "czech", "ceska republika", "cesko", "tschechien"] },
+  { code: "SK", label: "Slovakia", region: "EMEA", aliases: ["slovensko", "slowakei"] },
+  { code: "HU", label: "Hungary", region: "EMEA", aliases: ["magyarorszag", "ungarn"] },
+  { code: "RO", label: "Romania", region: "EMEA", aliases: ["rumanien", "roumanie"] },
+  { code: "BG", label: "Bulgaria", region: "EMEA", aliases: ["bulgarien"] },
+  { code: "HR", label: "Croatia", region: "EMEA", aliases: ["hrvatska", "kroatien", "croatie", "croazia"] },
+  { code: "SI", label: "Slovenia", region: "EMEA", aliases: ["slovenija", "slowenien", "slovenie"] },
+  { code: "RS", label: "Serbia", region: "EMEA", aliases: ["srbija", "serbien", "serbie"] },
+  { code: "BA", label: "Bosnia and Herzegovina", region: "EMEA", aliases: ["bosnia", "bosna i hercegovina", "bosna"] },
   { code: "ME", label: "Montenegro", region: "EMEA", aliases: [] },
-  { code: "AL", label: "Albania", region: "EMEA", aliases: [] },
+  { code: "XK", label: "Kosovo", region: "EMEA", aliases: ["kosove"] },
+  { code: "AL", label: "Albania", region: "EMEA", aliases: ["shqiperi"] },
   { code: "MK", label: "North Macedonia", region: "EMEA", aliases: ["macedonia"] },
-  { code: "GR", label: "Greece", region: "EMEA", aliases: [] },
+  { code: "GR", label: "Greece", region: "EMEA", aliases: ["hellas", "griechenland", "grece", "grecia"] },
   { code: "CY", label: "Cyprus", region: "EMEA", aliases: [] },
   { code: "MT", label: "Malta", region: "EMEA", aliases: [] },
-  { code: "EE", label: "Estonia", region: "EMEA", aliases: [] },
-  { code: "LV", label: "Latvia", region: "EMEA", aliases: [] },
-  { code: "LT", label: "Lithuania", region: "EMEA", aliases: [] },
-  { code: "UA", label: "Ukraine", region: "EMEA", aliases: [] },
+  { code: "AD", label: "Andorra", region: "EMEA", aliases: [] },
+  { code: "MC", label: "Monaco", region: "EMEA", aliases: [] },
+  { code: "LI", label: "Liechtenstein", region: "EMEA", aliases: [] },
+  { code: "SM", label: "San Marino", region: "EMEA", aliases: [] },
+  { code: "EE", label: "Estonia", region: "EMEA", aliases: ["eesti", "estland"] },
+  { code: "LV", label: "Latvia", region: "EMEA", aliases: ["latvija", "lettland"] },
+  { code: "LT", label: "Lithuania", region: "EMEA", aliases: ["lietuva", "litauen"] },
+  { code: "UA", label: "Ukraine", region: "EMEA", aliases: ["ukraina"] },
   { code: "BY", label: "Belarus", region: "EMEA", aliases: [] },
-  { code: "MD", label: "Moldova", region: "EMEA", aliases: [] },
+  { code: "MD", label: "Moldova", region: "EMEA", aliases: ["republica moldova"] },
   { code: "RU", label: "Russia", region: "EMEA", aliases: ["russian federation"] },
   { code: "TR", label: "Turkey", region: "EMEA", aliases: ["turkiye"] },
+  { code: "AM", label: "Armenia", region: "EMEA", aliases: ["armenien"] },
+  { code: "AZ", label: "Azerbaijan", region: "EMEA", aliases: ["azerbaidjan", "aserbaidschan"] },
+  { code: "KZ", label: "Kazakhstan", region: "EMEA", aliases: ["kazakstan", "kasachstan"] },
+  { code: "UZ", label: "Uzbekistan", region: "EMEA", aliases: [] },
+  { code: "TM", label: "Turkmenistan", region: "EMEA", aliases: [] },
+  { code: "KG", label: "Kyrgyzstan", region: "EMEA", aliases: [] },
+  { code: "TJ", label: "Tajikistan", region: "EMEA", aliases: [] },
   { code: "AE", label: "United Arab Emirates", region: "EMEA", aliases: ["uae", "u.a.e."] },
   { code: "SA", label: "Saudi Arabia", region: "EMEA", aliases: ["ksa"] },
   { code: "QA", label: "Qatar", region: "EMEA", aliases: [] },
@@ -312,11 +341,18 @@ const COUNTRY_DEFINITIONS = Object.freeze([
   { code: "IL", label: "Israel", region: "EMEA", aliases: [] },
   { code: "JO", label: "Jordan", region: "EMEA", aliases: [] },
   { code: "LB", label: "Lebanon", region: "EMEA", aliases: [] },
-  { code: "EG", label: "Egypt", region: "EMEA", aliases: [] },
-  { code: "MA", label: "Morocco", region: "EMEA", aliases: [] },
-  { code: "DZ", label: "Algeria", region: "EMEA", aliases: [] },
-  { code: "TN", label: "Tunisia", region: "EMEA", aliases: [] },
-  { code: "ZA", label: "South Africa", region: "EMEA", aliases: [] },
+  { code: "IQ", label: "Iraq", region: "EMEA", aliases: [] },
+  { code: "IR", label: "Iran", region: "EMEA", aliases: [] },
+  { code: "SY", label: "Syria", region: "EMEA", aliases: [] },
+  { code: "YE", label: "Yemen", region: "EMEA", aliases: [] },
+  { code: "EG", label: "Egypt", region: "EMEA", aliases: ["egypte", "egypten"] },
+  { code: "MA", label: "Morocco", region: "EMEA", aliases: ["maroc", "marokko", "marruecos"] },
+  { code: "DZ", label: "Algeria", region: "EMEA", aliases: ["algerie", "argelia"] },
+  { code: "TN", label: "Tunisia", region: "EMEA", aliases: ["tunisie", "tunesien"] },
+  { code: "LY", label: "Libya", region: "EMEA", aliases: [] },
+  { code: "SD", label: "Sudan", region: "EMEA", aliases: [] },
+  { code: "SS", label: "South Sudan", region: "EMEA", aliases: [] },
+  { code: "ZA", label: "South Africa", region: "EMEA", aliases: ["sudafrika", "zuid afrika"] },
   { code: "NG", label: "Nigeria", region: "EMEA", aliases: [] },
   { code: "KE", label: "Kenya", region: "EMEA", aliases: [] },
   { code: "GH", label: "Ghana", region: "EMEA", aliases: [] },
@@ -324,21 +360,54 @@ const COUNTRY_DEFINITIONS = Object.freeze([
   { code: "UG", label: "Uganda", region: "EMEA", aliases: [] },
   { code: "TZ", label: "Tanzania", region: "EMEA", aliases: [] },
   { code: "SN", label: "Senegal", region: "EMEA", aliases: [] },
-  { code: "CI", label: "Cote d Ivoire", region: "EMEA", aliases: ["cote d'ivoire", "ivory coast"] },
+  { code: "CI", label: "Cote d Ivoire", region: "EMEA", aliases: ["cote d'ivoire", "cote divoire", "ivory coast"] },
   { code: "CM", label: "Cameroon", region: "EMEA", aliases: [] },
-  { code: "IN", label: "India", region: "APAC", aliases: [] },
-  { code: "CN", label: "China", region: "APAC", aliases: ["prc", "people s republic of china"] },
-  { code: "JP", label: "Japan", region: "APAC", aliases: [] },
+  { code: "MU", label: "Mauritius", region: "EMEA", aliases: ["maurice"] },
+  { code: "MG", label: "Madagascar", region: "EMEA", aliases: [] },
+  { code: "ZM", label: "Zambia", region: "EMEA", aliases: [] },
+  { code: "ZW", label: "Zimbabwe", region: "EMEA", aliases: [] },
+  { code: "MW", label: "Malawi", region: "EMEA", aliases: [] },
+  { code: "MZ", label: "Mozambique", region: "EMEA", aliases: [] },
+  { code: "NA", label: "Namibia", region: "EMEA", aliases: [] },
+  { code: "BW", label: "Botswana", region: "EMEA", aliases: [] },
+  { code: "AO", label: "Angola", region: "EMEA", aliases: [] },
+  { code: "RW", label: "Rwanda", region: "EMEA", aliases: [] },
+  { code: "BI", label: "Burundi", region: "EMEA", aliases: [] },
+  { code: "TG", label: "Togo", region: "EMEA", aliases: [] },
+  { code: "BJ", label: "Benin", region: "EMEA", aliases: [] },
+  { code: "BF", label: "Burkina Faso", region: "EMEA", aliases: [] },
+  { code: "ML", label: "Mali", region: "EMEA", aliases: [] },
+  { code: "NE", label: "Niger", region: "EMEA", aliases: [] },
+  // Bare "Guinea" is Guinea proper. Equatorial Guinea and Papua New Guinea are longer
+  // segments, and collectCountryCandidates tries the longest suffix of a segment first,
+  // so they resolve to their own codes before this one is reached.
+  { code: "GN", label: "Guinea", region: "EMEA", aliases: [] },
+  { code: "GQ", label: "Equatorial Guinea", region: "EMEA", aliases: [] },
+  { code: "SL", label: "Sierra Leone", region: "EMEA", aliases: [] },
+  { code: "LR", label: "Liberia", region: "EMEA", aliases: [] },
+  { code: "GA", label: "Gabon", region: "EMEA", aliases: [] },
+  { code: "GM", label: "Gambia", region: "EMEA", aliases: [] },
+  { code: "MR", label: "Mauritania", region: "EMEA", aliases: [] },
+  { code: "CV", label: "Cabo Verde", region: "EMEA", aliases: ["cape verde"] },
+  { code: "SZ", label: "Eswatini", region: "EMEA", aliases: [] },
+  { code: "SC", label: "Seychelles", region: "EMEA", aliases: [] },
+  { code: "SO", label: "Somalia", region: "EMEA", aliases: [] },
+  { code: "ER", label: "Eritrea", region: "EMEA", aliases: [] },
+  { code: "DJ", label: "Djibouti", region: "EMEA", aliases: [] },
+  { code: "IN", label: "India", region: "APAC", aliases: ["inde", "indien"] },
+  { code: "CN", label: "China", region: "APAC", aliases: ["prc", "people s republic of china", "chine"] },
+  { code: "JP", label: "Japan", region: "APAC", aliases: ["japon", "japao", "nippon"] },
   { code: "KR", label: "South Korea", region: "APAC", aliases: ["korea", "republic of korea", "korea south"] },
-  { code: "SG", label: "Singapore", region: "APAC", aliases: [] },
+  { code: "SG", label: "Singapore", region: "APAC", aliases: ["singapura"] },
   { code: "MY", label: "Malaysia", region: "APAC", aliases: [] },
   { code: "TH", label: "Thailand", region: "APAC", aliases: [] },
   { code: "VN", label: "Vietnam", region: "APAC", aliases: ["viet nam"] },
-  { code: "ID", label: "Indonesia", region: "APAC", aliases: [] },
-  { code: "PH", label: "Philippines", region: "APAC", aliases: [] },
-  { code: "AU", label: "Australia", region: "APAC", aliases: [] },
-  { code: "NZ", label: "New Zealand", region: "APAC", aliases: [] },
+  { code: "ID", label: "Indonesia", region: "APAC", aliases: ["indonesien"] },
+  { code: "PH", label: "Philippines", region: "APAC", aliases: ["filipinas", "filippinerna"] },
+  { code: "AU", label: "Australia", region: "APAC", aliases: ["australien", "australie"] },
+  { code: "NZ", label: "New Zealand", region: "APAC", aliases: ["neuseeland", "nouvelle zelande", "nya zeeland"] },
   { code: "HK", label: "Hong Kong", region: "APAC", aliases: ["hong kong sar"] },
+  { code: "MO", label: "Macau", region: "APAC", aliases: ["macao"] },
   { code: "TW", label: "Taiwan", region: "APAC", aliases: [] },
   { code: "PK", label: "Pakistan", region: "APAC", aliases: [] },
   { code: "BD", label: "Bangladesh", region: "APAC", aliases: [] },
@@ -348,7 +417,15 @@ const COUNTRY_DEFINITIONS = Object.freeze([
   { code: "KH", label: "Cambodia", region: "APAC", aliases: [] },
   { code: "LA", label: "Laos", region: "APAC", aliases: ["lao pdr"] },
   { code: "BN", label: "Brunei", region: "APAC", aliases: ["brunei darussalam"] },
-  { code: "MN", label: "Mongolia", region: "APAC", aliases: [] }
+  { code: "MN", label: "Mongolia", region: "APAC", aliases: [] },
+  { code: "AF", label: "Afghanistan", region: "APAC", aliases: [] },
+  { code: "MV", label: "Maldives", region: "APAC", aliases: [] },
+  { code: "BT", label: "Bhutan", region: "APAC", aliases: [] },
+  { code: "FJ", label: "Fiji", region: "APAC", aliases: [] },
+  { code: "PG", label: "Papua New Guinea", region: "APAC", aliases: [] },
+  { code: "WS", label: "Samoa", region: "APAC", aliases: [] },
+  { code: "TO", label: "Tonga", region: "APAC", aliases: [] },
+  { code: "KI", label: "Kiribati", region: "APAC", aliases: [] }
 ]);
 const {
   byCode: COUNTRY_BY_CODE,
@@ -493,17 +570,6 @@ function inferLocationGeoUncached(locationText) {
     };
   }
 
-function toTitleCaseWords(value) {
-  const source = normalizeGeoText(value);
-  if (!source) return "";
-  return source
-    .split(" ")
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(" ");
-}
-
-
-
 function collectCountryCandidates(locationText) {
   const segments = splitLocationIntoCountryCandidateSegments(locationText);
   if (segments.length === 0) return [];
@@ -543,23 +609,23 @@ function collectCountryCandidates(locationText) {
     };
   }
 
-  const segments = splitLocationIntoCountryCandidateSegments(location);
-  let fallbackCountryLikePart = "";
-  if (segments.length >= 2) {
-    for (let index = segments.length - 1; index >= 1; index -= 1) {
-      const candidate = normalizeCountryLikePart(segments[index]);
-      if (!isLikelyCountryLikePart(candidate)) continue;
-      fallbackCountryLikePart = candidate;
-      break;
-    }
-  }
-
+  // No country recognised. This used to fall back to the trailing segment of the location
+  // and return it as `RAW:<text>`, which existed only to seed the country dropdown -- no
+  // other caller reads countryValue. The trailing segment of a location is a province or a
+  // city far more often than a country, so the dropdown filled up with "RAW:alberta",
+  // "RAW:croydon" and "RAW:jalisco": 8,804 such values against 111 real countries, and only
+  // 104 of them were country names at all. The rest of that list was cities, subdivisions
+  // and junk ("RAW:and nbsp", "RAW:click website to apply"). The country names among them
+  // are aliases in COUNTRY_DEFINITIONS now, so they resolve above instead of landing here.
+  //
+  // The region is still worth inferring: an explicit "EMEA" or "Europe" in the text names a
+  // region without naming a country.
   const region = inferRegionFromNormalizedGeoText(normalizedGeoLocation);
   return {
     countryCode: "",
-    countryValue: fallbackCountryLikePart ? `RAW:${fallbackCountryLikePart}` : "",
-    countryLabel: fallbackCountryLikePart ? toTitleCaseWords(fallbackCountryLikePart) : "",
-    countryLikePart: fallbackCountryLikePart,
+    countryValue: "",
+    countryLabel: "",
+    countryLikePart: "",
     region
   };
 }
@@ -938,10 +1004,6 @@ function containsGeoPhrase(normalizedGeoTextValue, phrase) {
   return ` ${haystack} `.includes(` ${needle} `);
 }
 
-function inferRegionFromLocationText(locationText, countryCode = "") {
-  return inferRegionFromNormalizedGeoText(normalizeGeoText(locationText), countryCode);
-}
-
 function inferRegionFromNormalizedGeoText(normalizedGeoTextValue, countryCode = "") {
   for (const region of ["AMER", "EMEA", "APAC"]) {
     const hints = REGION_HINTS_BY_VALUE[region] || [];
@@ -972,22 +1034,18 @@ function buildDefaultCountryFilterOptions() {
       : COUNTRY_ALIAS_TO_CODE.get(normalizedLabel);
     const matchedCountry = matchedCode ? COUNTRY_BY_CODE.get(matchedCode) : null;
 
-    let value = label;
-    let region = "";
-    if (matchedCountry) {
-      value = matchedCountry.code;
-      region = String(matchedCountry.region || "").trim().toUpperCase();
-    } else if (isLikelyCountryLikePart(normalizedLabel)) {
-      value = `RAW:${normalizedLabel}`;
-      region = inferRegionFromLocationText(label);
-    }
+    // A label with no country behind it is dropped rather than emitted as `RAW:<label>`.
+    // The dropdown offers these as countries, so a value it cannot resolve to one does not
+    // belong in it -- that fallback is how "Alberta" and "Croydon" became country options.
+    if (!matchedCountry) continue;
 
+    const value = matchedCountry.code;
     if (seenValues.has(value)) continue;
     seenValues.add(value);
     options.push({
       value,
-      label,
-      region
+      label: matchedCountry.label,
+      region: String(matchedCountry.region || "").trim().toUpperCase()
     });
   }
 
@@ -1245,6 +1303,11 @@ function parseStateFilters(values) {
   return codes;
 }
 
+// The filter options no longer offer `RAW:<text>` values, but this still accepts them:
+// saved queries and MCP preferences stored before that change hold them, and dropping them
+// silently would widen those searches rather than fail them. A RAW value naming something
+// COUNTRY_DEFINITIONS now knows is upgraded to its ISO code, so a saved "RAW:nederland"
+// becomes a proper NL filter instead of a substring match.
 function parseCountryFilters(values) {
   const parsed = [];
   const seen = new Set();
@@ -1255,7 +1318,14 @@ function parseCountryFilters(values) {
     let nextFilter = null;
     if (/^raw:/i.test(value)) {
       const rawLikePart = normalizeCountryLikePart(value.slice(4));
-      if (isLikelyCountryLikePart(rawLikePart)) {
+      const upgradedCountryCode = COUNTRY_ALIAS_TO_CODE.get(rawLikePart);
+      if (upgradedCountryCode) {
+        nextFilter = {
+          type: "code",
+          code: upgradedCountryCode,
+          value: upgradedCountryCode
+        };
+      } else if (isLikelyCountryLikePart(rawLikePart)) {
         nextFilter = {
           type: "raw",
           rawLikePart,

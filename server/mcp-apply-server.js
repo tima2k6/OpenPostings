@@ -532,22 +532,10 @@ async function main() {
       const states = normalizeStringArray(args?.states);
       const options = await getPostingFilterOptions({ states });
 
-      // Country options are inferred from posting location text, and the trailing segment of
-      // a location is often a province or a city rather than a country. Those land in the
-      // list as RAW: entries -- 6,700 of them against 111 real countries on a full database.
-      // The app shows them; an agent choosing a filter value should only see the ISO codes.
-      const isoCountries = options.countries.filter(
-        (country) => !String(country?.value || "").startsWith("RAW:")
-      );
-      const rawCountryCount = options.countries.length - isoCountries.length;
-
+      // No RAW: filtering here any more: getPostingFilterOptions only returns ISO countries,
+      // so the app and the agent see the same list.
       return asToolResult({
         ...options,
-        countries: isoCountries,
-        countries_note:
-          rawCountryCount > 0
-            ? `${rawCountryCount} unrecognized location labels were omitted; only ISO country codes are listed.`
-            : "",
         counties: states.length > 0 ? options.counties : [],
         counties_note:
           states.length > 0
