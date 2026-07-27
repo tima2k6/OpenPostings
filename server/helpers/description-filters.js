@@ -440,9 +440,18 @@ let phraseNgramIndustryCoverageCache = null;
 
 
 
+// The dash rule is "dash followed by whitespace", not "dash surrounded by whitespace".
+// Workday stores no location column, so its value is inferred from the job URL and comes
+// out as "Washington- Seattle Campus" or "USA- California- West Hollywood" -- no space
+// before the dash. Requiring one left those as a single segment, so no state name ever
+// stood alone and every Workday posting was unreachable by state and county filters.
+//
+// Whitespace *after* the dash is what keeps this safe: hyphenated place names have none,
+// so "Winston-Salem" and "Stratford-upon-Avon" stay intact, as do the hyphenated ATS
+// slugs ("US-WA-Redmond", "TX-Katy-77494") that hasStateCodeSlugMatch reads whole.
 function splitLocationIntoCountryCandidateSegments(locationText) {
   return String(locationText || "")
-    .split(/[,/|;]+|\s+-\s+/)
+    .split(/[,/|;]+|\s*-\s+/)
     .map((segment) => String(segment || "").trim())
     .filter(Boolean);
 }
@@ -723,7 +732,7 @@ function hasStateNameGroupMatch(locationText, stateName, code) {
 
   return groups.some((group) => {
     const segments = group
-      .split(/,+|\s+-\s+/)
+      .split(/,+|\s*-\s+/)
       .map((segment) => segment.trim())
       .filter(Boolean);
 

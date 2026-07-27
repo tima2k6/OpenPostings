@@ -196,6 +196,46 @@ function run() {
     );
   }
 
+  // Workday stores no location column; the value is inferred from the job URL and has no
+  // space before the dash. Requiring one made every Workday posting unreachable by state.
+  for (const [location, code] of [
+    ["Washington- Seattle Campus", "WA"],
+    ["Washington - Seattle Campus", "WA"],
+    ["USA- California- West Hollywood", "CA"],
+    ["USA- New York- New York", "NY"]
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, [code], [], [], []),
+      true,
+      `${code} filter should match the Workday-inferred location ${location}`
+    );
+  }
+
+  for (const [location, code] of [
+    ["Switzerland- Geneva", "WA"],
+    ["USA- California- West Hollywood", "WA"],
+    ["Washington- Seattle Campus", "CA"]
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, [code], [], [], []),
+      false,
+      `${code} filter should not match ${location}`
+    );
+  }
+
+  // Splitting on a bare dash would break these; whitespace after the dash is what makes
+  // the rule safe. Hyphenated place names and ATS slugs must survive intact.
+  assert.equal(
+    rowMatchesLocationFilters("Winston-Salem, NC, United States", ["NC"], [], [], []),
+    true,
+    "hyphenated city names must not be split apart"
+  );
+  assert.equal(
+    rowMatchesLocationFilters("US-WA-Redmond", ["WA"], [], [], []),
+    true,
+    "hyphenated ATS slugs must still be read whole"
+  );
+
   console.log("location-state-filter tests passed");
 }
 

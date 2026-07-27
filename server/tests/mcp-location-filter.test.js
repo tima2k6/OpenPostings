@@ -72,7 +72,11 @@ const CASES = [
   ["US-WA-Redmond", true],
   ["US-WA-Gig Harbor", true],
   ["US-GA-Atlanta", false],
-  ["CA-ON-Toronto", false]
+  ["CA-ON-Toronto", false],
+  // Workday's URL-inferred format: no space before the dash.
+  ["Washington- Seattle Campus", true],
+  ["Washington - Seattle Campus", true],
+  ["Switzerland- Geneva", false]
 ];
 
 // The same rule, for states whose name is also a town elsewhere.
@@ -90,7 +94,9 @@ const OTHER_STATE_CASES = [
   ["CA-Lake Forest-92630", "CA", true],
   // Same leading code, but India rather than Indiana -- no US zip to vouch for it.
   ["IN-HR-Gurgaon", "IN", false],
-  ["IN-TG-Hyderabad", "IN", false]
+  ["IN-TG-Hyderabad", "IN", false],
+  ["USA- California- West Hollywood", "CA", true],
+  ["Winston-Salem, NC, United States", "NC", true]
 ];
 
 function run() {
