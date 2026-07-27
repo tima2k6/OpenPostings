@@ -100,6 +100,8 @@ const path = require("path");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const { openDatabase } = require("./db/open-database.js");
+const { findCompanies, findPostings, runReadOnlyQuery, rejectUnsafeQuery, MAX_ROWS } = require("./services/db-browser.js");
+const { DB_BROWSER_PAGE } = require("./services/db-browser-page.js");
 
 
 const PORT = Number(process.env.PORT || 8787);
@@ -1032,6 +1034,46 @@ function createServer() {
       running: true
     });
   };
+
+  // Read-only database browser. See server/services/db-browser.js for why it exists and
+  // how it is constrained.
+  app.get("/db", (_req, res) => {
+    res.type("html").send(DB_BROWSER_PAGE.replace(">500<", `>${MAX_ROWS}<`));
+  });
+
+  app.get("/db/companies", async (req, res) => {
+    try {
+      res.json({ items: await findCompanies(req.query.q) });
+    } catch (error) {
+      res.status(500).json({ error: String(error?.message || error) });
+    }
+  });
+
+  app.get("/db/postings", async (req, res) => {
+    try {
+      const items = await findPostings({
+        search: req.query.q,
+        hiddenState: String(req.query.state || "visible")
+      });
+      res.json({ items });
+    } catch (error) {
+      res.status(500).json({ error: String(error?.message || error) });
+    }
+  });
+
+  app.post("/db/query", async (req, res) => {
+    const sql = String(req.body?.sql || "");
+    const rejection = rejectUnsafeQuery(sql);
+    if (rejection) {
+      res.status(400).json({ error: rejection });
+      return;
+    }
+    try {
+      res.json(await runReadOnlyQuery(sql));
+    } catch (error) {
+      res.status(400).json({ error: String(error?.message || error) });
+    }
+  });
 
   app.get("/health", async (_req, res) => {
     const counts = await getCounts();
