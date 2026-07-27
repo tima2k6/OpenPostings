@@ -95,6 +95,14 @@ const { collectPostingsForCalcareersDynamic, CALCAREERS_ESTIMATED_COMPANY_COUNT 
 const { collectPostingsForCaloppsDynamic, CALOPPS_ESTIMATED_COMPANY_COUNT } = require("../ats/calopps/service.js");
 const { collectPostingsForStatejobsnyDynamic, STATEJOBSNY_ESTIMATED_COMPANY_COUNT } = require("../ats/statejobsny/service.js");
 const { collectPostingsForHcareersDynamic, HCAREERS_ESTIMATED_COMPANY_COUNT } = require("../ats/hcareers/service.js");
+const { collectPostingsForAmazonDynamic, AMAZON_ESTIMATED_COMPANY_COUNT } = require("../ats/amazon/service.js");
+const {
+  CAREER_SITE_CONFIGS,
+  CAREER_SITE_KEYS,
+  collectPostingsForCareerSiteDynamic,
+  getCareerSiteEstimatedCompanyCount
+} = require("../ats/careersite/service.js");
+const { collectPostingsForMicrosoftDynamic, MICROSOFT_ESTIMATED_COMPANY_COUNT } = require("../ats/microsoft/service.js");
 
 const syncStatus = {
   running: false,
@@ -614,6 +622,33 @@ async function collectPostingsForCompany(company, options = {}) {
   ) {
     return collectPostingsForHcareersDynamic();
   }
+  if (
+    atsName === "amazon" ||
+    atsName === "amazon.jobs" ||
+    atsName === "amazonjobs" ||
+    atsName === "www.amazon.jobs" ||
+    atsName === "wwwamazonjobs"
+  ) {
+    return collectPostingsForAmazonDynamic();
+  }
+  // Every employer read through the shared sitemap/JSON-LD engine dispatches by its own
+  // key, so adding one there needs no branch here. Host spellings ("careers.walmart.com")
+  // are folded onto the key first, the way the hand-written branches above accept theirs.
+  const careerSiteKey = normalizeAtsFilterValue(atsName);
+  if (CAREER_SITE_KEYS.includes(careerSiteKey)) {
+    return collectPostingsForCareerSiteDynamic(careerSiteKey);
+  }
+  if (
+    atsName === "microsoft" ||
+    atsName === "microsoft.com" ||
+    atsName === "microsoftcom" ||
+    atsName === "careers.microsoft.com" ||
+    atsName === "careersmicrosoftcom" ||
+    atsName === "jobs.careers.microsoft.com" ||
+    atsName === "jobscareersmicrosoftcom"
+  ) {
+    return collectPostingsForMicrosoftDynamic();
+  }
   if (atsName === "hrmdirect" || atsName === "hrmdirect.com" || atsName === "hrmdirectcom") {
     return collectPostingsForHrmDirectCompany(company);
   }
@@ -763,7 +798,27 @@ const BOARD_WIDE_SYNC_TARGETS = [
     company_name: "AcademicJobsOnline (dynamic)",
     url_string: "https://academicjobsonline.org/ajo?joblst---0----0-p--",
     ATS_name: "academicjobsonline"
-  }
+  },
+  // Amazon, Expedia Group and Microsoft each run their own careers platform rather than
+  // renting an ATS, so there is no seeded company row that could reach them. They belong
+  // here for the same reason the boards above do: one target sweeps the whole employer.
+  {
+    company_name: "Amazon Jobs (dynamic)",
+    url_string: "https://www.amazon.jobs/en/search.json?sort=recent",
+    ATS_name: "amazon"
+  },
+  {
+    company_name: "Microsoft Careers (dynamic)",
+    url_string: "https://gcsservices.careers.microsoft.com/search/api/v1/search?o=Recent",
+    ATS_name: "microsoft"
+  },
+  // Employers read through the shared sitemap/JSON-LD engine. Listing them from the config
+  // keeps this table and the collector from drifting apart as employers are added.
+  ...CAREER_SITE_KEYS.map((siteKey) => ({
+    company_name: `${CAREER_SITE_CONFIGS[siteKey].label} (dynamic)`,
+    url_string: `${CAREER_SITE_CONFIGS[siteKey].origin}/sitemap.xml`,
+    ATS_name: siteKey
+  }))
 ];
 
 async function runAtsSyncInternal() {
@@ -1510,6 +1565,17 @@ async function getSyncScopeStats() {
   }
   if (enabledAts.has("academicjobsonline")) {
     syncEnabledCompanyCount += ACADEMICJOBSONLINE_ESTIMATED_COMPANY_COUNT;
+  }
+  if (enabledAts.has("amazon")) {
+    syncEnabledCompanyCount += AMAZON_ESTIMATED_COMPANY_COUNT;
+  }
+  if (enabledAts.has("microsoft")) {
+    syncEnabledCompanyCount += MICROSOFT_ESTIMATED_COMPANY_COUNT;
+  }
+  for (const siteKey of CAREER_SITE_KEYS) {
+    if (enabledAts.has(siteKey)) {
+      syncEnabledCompanyCount += getCareerSiteEstimatedCompanyCount(siteKey);
+    }
   }
 
   return {

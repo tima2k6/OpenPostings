@@ -148,6 +148,14 @@ Current sync support includes:
 - `Webcruiter`
 - `AcademicJobsOnline`
 - `Hcareers`
+- `Amazon Jobs`
+- `Expedia Group`
+- `Microsoft Careers`
+- `Apple`
+- `Meta`
+- `Walmart`
+- `Disney`
+- `Boeing`
 - `prismhr`
 - `silkroad`
 - `paycor`
