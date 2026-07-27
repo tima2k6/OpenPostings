@@ -200,9 +200,13 @@ const STATE_CODE_TO_NAME = {
   DC: "district of columbia"
 };
 
+// Dash-followed-by-whitespace, mirroring splitLocationIntoCountryCandidateSegments in
+// description-filters.js -- see the note there. Workday's URL-inferred locations
+// ("Washington- Seattle Campus") have no space before the dash, and requiring one made
+// every Workday posting unreachable by state filters.
 function splitLocationIntoSegments(locationText) {
   return String(locationText || "")
-    .split(/[,/|;]+|\s+-\s+/)
+    .split(/[,/|;]+|\s*-\s+/)
     .map((segment) => segment.trim())
     .filter(Boolean);
 }
@@ -393,7 +397,7 @@ function hasStateNameGroupMatch(locationText, stateName, code) {
 
   return groups.some((group) => {
     const segments = group
-      .split(/,+|\s+-\s+/)
+      .split(/,+|\s*-\s+/)
       .map((segment) => segment.trim())
       .filter(Boolean);
 
