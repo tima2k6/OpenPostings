@@ -41,6 +41,8 @@ const ATS_FILTER_OPTIONS = new Set([
   "webcruiter",
   "academicjobsonline",
   "hcareers",
+  "amazon",
+  "expedia",
   "hrmdirect",
   "talentlyft",
   "talexio",
@@ -187,6 +189,8 @@ const ATS_FILTER_OPTION_ITEMS = Object.freeze([
   { value: "webcruiter", label: "Webcruiter" },
   { value: "academicjobsonline", label: "AcademicJobsOnline" },
   { value: "hcareers", label: "Hcareers" },
+  { value: "amazon", label: "Amazon Jobs" },
+  { value: "expedia", label: "Expedia Group" },
   { value: "hrmdirect", label: "HRMDirect" },
   { value: "talentlyft", label: "Talentlyft" },
   { value: "talexio", label: "Talexio" },
@@ -517,6 +521,27 @@ function normalizeAtsFilterValue(value) {
   ) {
     return "hcareers";
   }
+  if (
+    normalized === "amazon.jobs" ||
+    normalized === "amazonjobs" ||
+    normalized === "www.amazon.jobs" ||
+    normalized === "wwwamazonjobs" ||
+    normalized === "amazon.com" ||
+    normalized === "amazoncom"
+  ) {
+    return "amazon";
+  }
+  if (
+    normalized === "expediagroup" ||
+    normalized === "expedia.com" ||
+    normalized === "expediacom" ||
+    normalized === "expediagroup.com" ||
+    normalized === "expediagroupcom" ||
+    normalized === "careers.expediagroup.com" ||
+    normalized === "careersexpediagroupcom"
+  ) {
+    return "expedia";
+  }
   if (normalized === "hrmdirect.com" || normalized === "hrmdirectcom") {
     return "hrmdirect";
   }
@@ -741,6 +766,8 @@ function inferAtsFromJobPostingUrl(value) {
   if (url.includes("calopps.org/") && url.includes("/job-")) return "calopps";
   if (url.includes("statejobsny.com/public/vacancydetailsview.cfm?id=")) return "statejobsny";
   if (url.includes("hcareers.com/jobs/")) return "hcareers";
+  if (url.includes("amazon.jobs/") && url.includes("/jobs/")) return "amazon";
+  if (url.includes("careers.expediagroup.com/job")) return "expedia";
   if (url.includes(".hrmdirect.com/employment/job-opening.php")) return "hrmdirect";
   if (url.includes(".talentlyft.com/jobs/")) return "talentlyft";
   if (url.includes(".talexio.com/jobs")) return "talexio";

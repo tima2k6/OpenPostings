@@ -95,6 +95,8 @@ const { collectPostingsForCalcareersDynamic, CALCAREERS_ESTIMATED_COMPANY_COUNT 
 const { collectPostingsForCaloppsDynamic, CALOPPS_ESTIMATED_COMPANY_COUNT } = require("../ats/calopps/service.js");
 const { collectPostingsForStatejobsnyDynamic, STATEJOBSNY_ESTIMATED_COMPANY_COUNT } = require("../ats/statejobsny/service.js");
 const { collectPostingsForHcareersDynamic, HCAREERS_ESTIMATED_COMPANY_COUNT } = require("../ats/hcareers/service.js");
+const { collectPostingsForAmazonDynamic, AMAZON_ESTIMATED_COMPANY_COUNT } = require("../ats/amazon/service.js");
+const { collectPostingsForExpediaDynamic, EXPEDIA_ESTIMATED_COMPANY_COUNT } = require("../ats/expedia/service.js");
 
 const syncStatus = {
   running: false,
@@ -614,6 +616,25 @@ async function collectPostingsForCompany(company, options = {}) {
   ) {
     return collectPostingsForHcareersDynamic();
   }
+  if (
+    atsName === "amazon" ||
+    atsName === "amazon.jobs" ||
+    atsName === "amazonjobs" ||
+    atsName === "www.amazon.jobs" ||
+    atsName === "wwwamazonjobs"
+  ) {
+    return collectPostingsForAmazonDynamic();
+  }
+  if (
+    atsName === "expedia" ||
+    atsName === "expediagroup" ||
+    atsName === "expediagroup.com" ||
+    atsName === "expediagroupcom" ||
+    atsName === "careers.expediagroup.com" ||
+    atsName === "careersexpediagroupcom"
+  ) {
+    return collectPostingsForExpediaDynamic();
+  }
   if (atsName === "hrmdirect" || atsName === "hrmdirect.com" || atsName === "hrmdirectcom") {
     return collectPostingsForHrmDirectCompany(company);
   }
@@ -763,6 +784,19 @@ const BOARD_WIDE_SYNC_TARGETS = [
     company_name: "AcademicJobsOnline (dynamic)",
     url_string: "https://academicjobsonline.org/ajo?joblst---0----0-p--",
     ATS_name: "academicjobsonline"
+  },
+  // Amazon and Expedia Group each run their own careers platform rather than renting an
+  // ATS, so there is no seeded company row that could reach them. They belong here for
+  // the same reason the boards above do: one target sweeps the whole employer.
+  {
+    company_name: "Amazon Jobs (dynamic)",
+    url_string: "https://www.amazon.jobs/en/search.json?sort=recent",
+    ATS_name: "amazon"
+  },
+  {
+    company_name: "Expedia Group (dynamic)",
+    url_string: "https://careers.expediagroup.com/sitemap.xml",
+    ATS_name: "expedia"
   }
 ];
 
@@ -1510,6 +1544,12 @@ async function getSyncScopeStats() {
   }
   if (enabledAts.has("academicjobsonline")) {
     syncEnabledCompanyCount += ACADEMICJOBSONLINE_ESTIMATED_COMPANY_COUNT;
+  }
+  if (enabledAts.has("amazon")) {
+    syncEnabledCompanyCount += AMAZON_ESTIMATED_COMPANY_COUNT;
+  }
+  if (enabledAts.has("expedia")) {
+    syncEnabledCompanyCount += EXPEDIA_ESTIMATED_COMPANY_COUNT;
   }
 
   return {

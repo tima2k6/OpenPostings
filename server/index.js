@@ -133,7 +133,11 @@ const DYNAMIC_ATS_OPTIONS = new Set([
   "statejobsny",
   "edjoin",
   "webcruiter",
-  "academicjobsonline"
+  "academicjobsonline",
+  // Both sweep their whole board from a single target, so seeding one as a company row
+  // would only queue the same full sweep again under a second name.
+  "amazon",
+  "expedia"
 ]);
 const SEEDED_ATS_OPTIONS = new Set(
   Array.from(ATS_FILTER_OPTIONS).filter((ats) => !DYNAMIC_ATS_OPTIONS.has(String(ats || "").trim().toLowerCase()))
