@@ -1828,7 +1828,8 @@ function createServer() {
       remote: req.query.remote,
       hide_no_date: normalizeBoolean(req.query.hide_no_date, false),
       include_applied: normalizeBoolean(req.query.include_applied, true),
-      include_ignored: normalizeBoolean(req.query.include_ignored, false)
+      include_ignored: normalizeBoolean(req.query.include_ignored, false),
+      include_descriptions: normalizeBoolean(req.query.include_descriptions, true)
     });
 
     res.json({

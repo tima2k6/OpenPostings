@@ -138,6 +138,11 @@ export function fetchPostings(search = "", limit = 500, offset = 0, filters = {}
   if (filters?.sort_by) {
     params.set("sort_by", String(filters.sort_by));
   }
+  // Descriptions dominate the response size, and the listing has a toggle that hides them.
+  // When it is off there is no reason to ship them.
+  if (filters?.include_descriptions === false) {
+    params.set("include_descriptions", "0");
+  }
 
   return request(`/postings?${params.toString()}`);
 }
