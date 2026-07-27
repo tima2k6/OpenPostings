@@ -177,6 +177,17 @@ async function fetchSnaphuntPayload(nextToken = "", pageSize = SNAPHUNT_DEFAULT_
   return res.json();
 }
 
+// api.snaphunt.com no longer resolves and snaphunt.com carries no job board, so a bare
+// "fetch failed" here reads as a transient network blip when it is really a dead source.
+function describeSnaphuntFetchFailure(error) {
+  const code = String(error?.cause?.code || "");
+  if (code !== "ENOTFOUND" && code !== "EAI_AGAIN") return error;
+  return new Error(
+    `Snaphunt host ${new URL(SNAPHUNT_API_URL).hostname} does not resolve (${code}); ` +
+      "the public Snaphunt job feed appears to have been retired."
+  );
+}
+
 async function collectPostingsForSnaphuntDynamic(pageSize = SNAPHUNT_DEFAULT_PAGE_SIZE) {
   const postings = [];
   const seenUrls = new Set();
@@ -184,7 +195,12 @@ async function collectPostingsForSnaphuntDynamic(pageSize = SNAPHUNT_DEFAULT_PAG
   let nextToken = "";
 
   while (true) {
-    const payload = await fetchSnaphuntPayload(nextToken, pageSize);
+    let payload;
+    try {
+      payload = await fetchSnaphuntPayload(nextToken, pageSize);
+    } catch (error) {
+      throw describeSnaphuntFetchFailure(error);
+    }
     const batch = parseSnaphuntPostingsFromPayload(payload);
     if (batch.length === 0) break;
 
@@ -209,4 +225,9 @@ async function collectPostingsForSnaphuntDynamic(pageSize = SNAPHUNT_DEFAULT_PAG
   return postings;
 }
 
-module.exports = { collectPostingsForSnaphuntDynamic, SNAPHUNT_ESTIMATED_COMPANY_COUNT };
+module.exports = {
+  collectPostingsForSnaphuntDynamic,
+  parseSnaphuntPostingsFromPayload,
+  describeSnaphuntFetchFailure,
+  SNAPHUNT_ESTIMATED_COMPANY_COUNT
+};

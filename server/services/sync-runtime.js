@@ -718,12 +718,10 @@ const BOARD_WIDE_SYNC_TARGETS = [
     url_string: "https://api.k12jobspot.com/api/Jobs/Search",
     ATS_name: "k12jobspot"
   },
-  {
-    company_name: "Snaphunt (dynamic)",
-    url_string:
-      "https://api.snaphunt.com/v2/jobs?jobLocationType=onsite%2Chybrid%2Cremote&pageSize=300&isFeatured=false",
-    ATS_name: "snaphunt"
-  },
+  // Snaphunt is deliberately absent: api.snaphunt.com stopped resolving (authoritative NXDOMAIN)
+  // and snaphunt.com is now a marketing site whose own "job listing" link 404s, so the target only
+  // ever produced a DNS error. The ATS stays in the registry so postings already stored under it
+  // remain filterable; re-add a target here if a public feed reappears.
   {
     company_name: "SchoolSpring (dynamic)",
     url_string:
@@ -763,7 +761,7 @@ const BOARD_WIDE_SYNC_TARGETS = [
   },
   {
     company_name: "AcademicJobsOnline (dynamic)",
-    url_string: "https://academicjobsonline.org/ajo?joblst-44-0-0-0---0-p--",
+    url_string: "https://academicjobsonline.org/ajo?joblst---0----0-p--",
     ATS_name: "academicjobsonline"
   }
 ];

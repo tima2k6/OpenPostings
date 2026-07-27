@@ -1,4 +1,9 @@
-const { urljoin, decodeHtmlEntities, toTitleCase } = require("../../helpers/normalize-strings");
+const {
+  urljoin,
+  decodeHtmlEntities,
+  toTitleCase,
+  DEFAULT_BROWSER_USER_AGENT
+} = require("../../helpers/normalize-strings");
 const { fetchWithAtsRateLimit } = require("../../services/queue");
 const CALOPPS_RATE_LIMIT_WAIT_MS = 60 * 1000;
 const CALOPPS_ESTIMATED_COMPANY_COUNT = 254;
@@ -108,7 +113,10 @@ async function collectPostingsForCaloppsDynamic(maxPages = 25) {
       method: "GET",
       headers: {
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9"
+        "Accept-Language": "en-US,en;q=0.9",
+        // CalOpps sits behind an edge filter that answers 403 to requests with no
+        // User-Agent, so the whole board collected nothing until this was sent.
+        "User-Agent": DEFAULT_BROWSER_USER_AGENT
       }
     });
     if (!res.ok) {
@@ -131,4 +139,9 @@ async function collectPostingsForCaloppsDynamic(maxPages = 25) {
   return postings;
 }
 
-module.exports = { collectPostingsForCaloppsDynamic, CALOPPS_ESTIMATED_COMPANY_COUNT };
+module.exports = {
+  collectPostingsForCaloppsDynamic,
+  parseCaloppsPostingsFromHtml,
+  extractCaloppsNextPageUrl,
+  CALOPPS_ESTIMATED_COMPANY_COUNT
+};
