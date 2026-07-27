@@ -2873,6 +2873,15 @@ export default function App() {
               {postingsFilterPanelOpen ? "Hide Filters" : "Show Filters"}
             </Text>
           </Pressable>
+          {/* The database browser answers what this listing structurally cannot: whether an
+              employer is tracked at all, and what exists behind the freshness window. It is
+              served by the API rather than by Metro, hence the absolute URL. */}
+          <Pressable
+            onPress={() => Linking.openURL(`${API_BASE_URL}/db`)}
+            style={styles.postingsFiltersToggleBtn}
+          >
+            <Text style={styles.postingsFiltersToggleText}>Browse DB</Text>
+          </Pressable>
           <View style={styles.postingDescriptionToggleRow}>
             <Text style={styles.postingDescriptionToggleLabel}>Descriptions</Text>
             <Switch value={showPostingDescriptions} onValueChange={setShowPostingDescriptions} />

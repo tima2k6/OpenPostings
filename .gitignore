@@ -96,3 +96,5 @@ android/app/build/outputs/
 *.apk
 *.aab
 jobs.db
+saved-queries.json
+saved-queries.json.tmp

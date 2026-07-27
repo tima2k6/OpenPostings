@@ -23,6 +23,7 @@
     "test:backend:db-browser": "node server/tests/db-browser.test.js",
     "test:backend:db-query": "node server/tests/db-query.test.js",
     "test:backend:db-facets": "node server/tests/db-facets.test.js",
+    "test:backend:saved-queries": "node server/tests/saved-queries.test.js",
     "test:backend:posting-retention": "node server/tests/posting-retention.test.js",
     "test:backend:posting-query-plan": "node server/tests/posting-query-plan.test.js",
     "test:backend:posting-filter-pushdown": "node server/tests/posting-filter-pushdown.test.js",

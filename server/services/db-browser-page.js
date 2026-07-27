@@ -359,27 +359,34 @@ ORDER BY n DESC</textarea>
 
   function run() { loadPostings(); loadFacets(); }
 
-  // Saved queries live in this browser only; the server holds no per-user state.
-  function savedQueries() {
-    try { return JSON.parse(localStorage.getItem("openpostings.db.saved") || "[]"); } catch (e) { return []; }
-  }
+  // Saved queries come from the server, so they survive a browser eviction, a different
+  // device, and the overnight sync they are usually waiting on.
+  var savedCache = [];
   function renderSaved() {
     var row = document.getElementById("saved-row");
-    var list = savedQueries();
-    if (!list.length) { row.innerHTML = ''; return; }
-    row.innerHTML = '<span class="hint">saved:</span> ' + list.map(function (q, i) {
-      return '<button class="saved" data-i="' + i + '">' + esc(q.name) + '</button>' +
-             '<button class="saved-x" data-i="' + i + '" title="delete">&times;</button>';
+    if (!savedCache.length) { row.innerHTML = '<span class="hint">no saved queries yet</span>'; return; }
+    row.innerHTML = '<span class="hint">saved:</span> ' + savedCache.map(function (q) {
+      return '<button class="saved" data-id="' + esc(q.id) + '">' + esc(q.name) + "</button>" +
+             '<button class="saved-x" data-id="' + esc(q.id) + '" title="delete">&times;</button>';
     }).join(" ");
     Array.prototype.forEach.call(row.querySelectorAll("button.saved"), function (b) {
-      b.addEventListener("click", function () { writeFilters(savedQueries()[b.getAttribute("data-i")].state); run(); });
+      b.addEventListener("click", function () {
+        var q = savedCache.filter(function (x) { return x.id === b.getAttribute("data-id"); })[0];
+        if (q) { writeFilters(q.state); run(); }
+      });
     });
     Array.prototype.forEach.call(row.querySelectorAll("button.saved-x"), function (b) {
       b.addEventListener("click", function () {
-        var list2 = savedQueries(); list2.splice(Number(b.getAttribute("data-i")), 1);
-        localStorage.setItem("openpostings.db.saved", JSON.stringify(list2)); renderSaved();
+        fetch("/db/saved/" + encodeURIComponent(b.getAttribute("data-id")), { method: "DELETE" })
+          .then(loadSaved);
       });
     });
+  }
+  function loadSaved() {
+    return get("/db/saved").then(function (data) {
+      savedCache = data.items || [];
+      renderSaved();
+    }).catch(function () { renderSaved(); });
   }
 
   function runSql() {
@@ -409,10 +416,14 @@ ORDER BY n DESC</textarea>
   document.getElementById("posting-save").addEventListener("click", function () {
     var name = prompt("Name this query:");
     if (!name) return;
-    var list = savedQueries();
-    list.push({ name: name, state: readFilters() });
-    localStorage.setItem("openpostings.db.saved", JSON.stringify(list));
-    renderSaved();
+    fetch("/db/saved", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name, state: readFilters() })
+    }).then(function (r) {
+      if (!r.ok) return r.json().then(function (b) { throw new Error(b.error || "Save failed"); });
+      return loadSaved();
+    }).catch(function (e) { alert(e.message); });
   });
   document.getElementById("posting-sql").addEventListener("click", function () {
     var el = document.getElementById("posting-sqlout");
@@ -421,13 +432,13 @@ ORDER BY n DESC</textarea>
   Object.keys(FIELDS).forEach(function (id) {
     document.getElementById(id).addEventListener("keydown", function (e) { if (e.key === "Enter") run(); });
   });
-  renderSaved();
   document.getElementById("sql-go").addEventListener("click", runSql);
   Array.prototype.forEach.call(document.querySelectorAll(".examples button"), function (b) {
     b.addEventListener("click", function () { document.getElementById("sql").value = b.getAttribute("data-sql"); runSql(); });
   });
 
   loadCompanies();
+  loadSaved();
 })();
 </script>
 </body>
