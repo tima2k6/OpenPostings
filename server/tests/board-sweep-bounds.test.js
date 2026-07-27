@@ -245,12 +245,45 @@ async function testCareerSiteReportsAnUnreadableSite() {
   assert.deepEqual(result, [], "a readable board with nothing fresh is a clean zero");
 }
 
+// A sweep must stay on the one host it was configured for. An operator allowlisting an
+// employer's careers host should not find the collector reaching a CDN or a partner domain
+// named by that site's own sitemap index.
+async function testCareerSiteStaysOnItsOwnHost() {
+  const nowIso = new Date().toISOString();
+  const { requested } = await withStubbedFetch(
+    (url) => {
+      if (url.endsWith("/robots.txt")) {
+        return textResponse("Sitemap: https://careers.expediagroup.com/sitemap-index.xml\n");
+      }
+      if (url.includes("sitemap-index.xml")) {
+        return textResponse(
+          `<sitemapindex>
+            <sitemap><loc>https://cdn.othervendor.net/sitemap-jobs.xml</loc><lastmod>${nowIso}</lastmod></sitemap>
+            <sitemap><loc>https://careers.expediagroup.com/sitemap-jobs.xml</loc><lastmod>${nowIso}</lastmod></sitemap>
+          </sitemapindex>`
+        );
+      }
+      if (url.includes("careers.expediagroup.com/sitemap-jobs.xml")) {
+        return textResponse("<urlset></urlset>");
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+    () => collectPostingsForCareerSiteDynamic("expedia")
+  );
+
+  assert.ok(
+    requested.every((url) => new URL(url).host === "careers.expediagroup.com"),
+    `every request must stay on the configured host, got ${requested.join(", ")}`
+  );
+}
+
 async function run() {
   await testAmazonStopsAtTheFirstStalePage();
   await testMicrosoftStopsAtTheFirstStalePage();
   await testExpediaFetchesOnlyFreshJobPages();
   await testExpediaFallsBackWhenRobotsIsUnavailable();
   await testCareerSiteReportsAnUnreadableSite();
+  await testCareerSiteStaysOnItsOwnHost();
   console.log("board-sweep-bounds tests passed");
 }
 

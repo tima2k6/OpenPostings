@@ -408,9 +408,17 @@ async function collectCareerSiteSitemapEntries(siteKey, config, referenceEpoch) 
       continue;
     }
 
-    const children = parsed.entries.filter(
-      (entry) => !entry.lastmod || shouldStorePostingByDate(entry.lastmod, referenceEpoch)
-    );
+    // robots.txt entries are host-checked on the way in; child sitemaps have to be too, or
+    // an index naming a CDN or a partner host would walk the sweep off the employer's site
+    // and past the one host an operator allowlisted for it.
+    const children = parsed.entries.filter((entry) => {
+      if (entry.lastmod && !shouldStorePostingByDate(entry.lastmod, referenceEpoch)) return false;
+      try {
+        return new URL(entry.loc).host.toLowerCase() === careerSiteHost(config);
+      } catch {
+        return false;
+      }
+    });
     const jobChildren = children.filter((entry) => /job/i.test(String(entry.loc || "")));
     for (const child of jobChildren.length > 0 ? jobChildren : children) {
       if (!visited.has(child.loc)) pending.push(child.loc);
