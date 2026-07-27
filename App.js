@@ -24,6 +24,7 @@ import {
   blockCompany,
   createApplication,
   deleteApplication,
+  fetchApplicantDocuments,
   fetchApplications,
   fetchBlockedCompanies,
   fetchMcpCandidates,
@@ -44,7 +45,8 @@ import {
   saveSyncServiceSettings,
   triggerWorkdaySync,
   unblockCompany,
-  updateApplicationStatus
+  updateApplicationStatus,
+  uploadApplicantDocument
 } from "./src/api";
 import {
   DEFAULT_POSTINGS_FILTERS,
@@ -1416,6 +1418,9 @@ export default function App() {
   const [error, setError] = useState("");
   const [status, setStatus] = useState(null);
   const [personalInformation, setPersonalInformation] = useState(createEmptyPersonalInformation);
+  const [applicantDocuments, setApplicantDocuments] = useState([]);
+  const [documentUploading, setDocumentUploading] = useState("");
+  const [documentNotice, setDocumentNotice] = useState("");
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsNotice, setSettingsNotice] = useState("");
@@ -1829,6 +1834,60 @@ export default function App() {
         setSettingsLoading(false);
       }
     }
+
+    // Absence of stored documents (or a pre-upload server) is not an error on this page;
+    // the upload rows just show "Not uploaded yet".
+    try {
+      const documentsResponse = await fetchApplicantDocuments();
+      setApplicantDocuments(Array.isArray(documentsResponse?.items) ? documentsResponse.items : []);
+    } catch {
+      setApplicantDocuments([]);
+    }
+  }, []);
+
+  // Web only: the browser's file picker is the one that exists on every install serving the
+  // web UI, and the base64 body matches what POST /settings/applicant-documents expects.
+  // Native shells point the user at the web UI instead of growing a picker dependency.
+  const handleUploadApplicantDocument = useCallback((kind) => {
+    if (Platform.OS !== "web" || typeof document === "undefined") {
+      setDocumentNotice("Uploading is supported from the web UI. Open the app in a browser to upload this document.");
+      return;
+    }
+
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".pdf,.docx,.txt,.md";
+    input.onchange = () => {
+      const file = input.files && input.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onerror = () => setDocumentNotice("Could not read the selected file.");
+      reader.onload = async () => {
+        setDocumentUploading(kind);
+        setDocumentNotice("");
+        try {
+          // readAsDataURL yields "data:<mime>;base64,<payload>"; the server wants the payload.
+          const contentBase64 = String(reader.result || "").split(",").pop();
+          const saved = await uploadApplicantDocument({
+            kind,
+            file_name: file.name,
+            content_base64: contentBase64
+          });
+          setDocumentNotice(
+            `Uploaded ${saved.file_name} (${saved.format}, ${Number(saved.chars || 0).toLocaleString()} characters extracted).`
+          );
+          const documentsResponse = await fetchApplicantDocuments();
+          setApplicantDocuments(Array.isArray(documentsResponse?.items) ? documentsResponse.items : []);
+        } catch (e) {
+          setDocumentNotice(`Upload failed: ${String(e.message || e)}`);
+        } finally {
+          setDocumentUploading("");
+        }
+      };
+      reader.readAsDataURL(file);
+    };
+    input.click();
   }, []);
 
   const loadMcpSettings = useCallback(async (options = {}) => {
@@ -3202,6 +3261,45 @@ export default function App() {
                 />
               </View>
             ))}
+
+            <View style={styles.formGroup}>
+              <Text style={styles.settingsSubsection}>Documents on server</Text>
+              <Text style={styles.settingsDescription}>
+                Upload your resume once and the apply agent can read it no matter where the server runs.
+                The file paths above stay as a fallback for installs where the server runs on this same machine.
+              </Text>
+
+              {[
+                { kind: "resume", label: "Resume" },
+                { kind: "projects_portfolio", label: "Projects Portfolio" }
+              ].map(({ kind, label }) => {
+                const stored = applicantDocuments.find((item) => item?.kind === kind);
+                const isUploadingThis = documentUploading === kind;
+                return (
+                  <View key={kind} style={styles.documentRow}>
+                    <View style={styles.documentRowInfo}>
+                      <Text style={styles.fieldLabel}>{label}</Text>
+                      <Text style={styles.documentRowMeta}>
+                        {stored
+                          ? `${stored.file_name} — ${stored.format}, ${Number(stored.chars || 0).toLocaleString()} characters, uploaded ${stored.uploaded_at}`
+                          : "Not uploaded yet"}
+                      </Text>
+                    </View>
+                    <Pressable
+                      onPress={() => handleUploadApplicantDocument(kind)}
+                      disabled={Boolean(documentUploading)}
+                      style={[styles.documentUploadBtn, documentUploading ? styles.settingsSaveButtonDisabled : null]}
+                    >
+                      <Text style={styles.settingsSaveButtonText}>
+                        {isUploadingThis ? "Uploading..." : stored ? "Replace" : "Upload"}
+                      </Text>
+                    </Pressable>
+                  </View>
+                );
+              })}
+
+              {documentNotice ? <Text style={styles.settingsNotice}>{documentNotice}</Text> : null}
+            </View>
 
             {settingsNotice ? <Text style={styles.settingsNotice}>{settingsNotice}</Text> : null}
 
@@ -4739,6 +4837,29 @@ const styles = StyleSheet.create({
     backgroundColor: "#0b6e4f",
     borderRadius: 10,
     paddingVertical: 12,
+    alignItems: "center"
+  },
+  documentRow: {
+    marginTop: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10
+  },
+  documentRowInfo: {
+    flex: 1,
+    minWidth: 0
+  },
+  documentRowMeta: {
+    marginTop: 2,
+    fontSize: 12,
+    color: "#627d98"
+  },
+  documentUploadBtn: {
+    backgroundColor: "#0b6e4f",
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
     alignItems: "center"
   },
   settingsSaveButtonDisabled: {

@@ -22,7 +22,7 @@ const QUERY_TIMEOUT_MS = 15000;
 // These hold credentials and personal details. The API binds to every interface with
 // permissive CORS, so anything readable here is readable by anything on the network --
 // see the note in the page footer.
-const DENIED_TABLES = ["mcpsettings", "personalinformation"];
+const DENIED_TABLES = ["mcpsettings", "personalinformation", "applicant_documents"];
 
 let readOnlyDb = null;
 

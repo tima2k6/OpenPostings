@@ -77,11 +77,23 @@ than reporting an error, so an agent should read this before filtering.
 
 ## The screening workflow
 
-`get_resume` extracts the text of the file in `resume_file_path` (PDF, docx, txt or md; PDF
-via pdf.js) so the agent screens against the actual resume rather than the profile summary.
-The path must exist on the machine running the MCP server; when it cannot be read there, the
-tool returns the path so clients with their own file tools can read it directly.
-`document=projects_portfolio` reads the portfolio document instead.
+`get_resume` serves the applicant's actual resume text (PDF, docx, txt or md; PDF via
+pdf.js) so the agent screens against the real background rather than the profile summary.
+The document of record is the copy uploaded into the database:
+
+```
+POST /settings/applicant-documents
+{ "kind": "resume", "file_name": "resume.pdf", "content_base64": "..." }
+```
+
+Upload once from whichever machine holds the file; extraction runs at upload time, and from
+then on the server answers from its own database no matter where it runs relative to your
+files. `GET /settings/applicant-documents` lists what is stored, and
+`GET /settings/applicant-documents/resume/file` returns the original bytes, so the machine
+driving a browser can attach the real file to an application form. If nothing is uploaded,
+`get_resume` falls back to reading `resume_file_path` from the local disk (same-machine
+installs), and failing that returns the path so clients with their own file tools can read
+it directly. `document=projects_portfolio` reads the portfolio document instead.
 
 Four more tools carry the loop between shortlisting and applying:
 

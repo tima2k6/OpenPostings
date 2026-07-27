@@ -9,7 +9,7 @@ const os = require("os");
 const path = require("path");
 const zlib = require("zlib");
 
-const { extractDocumentText, readZipEntry } = require("../services/applicant-documents.js");
+const { extractDocumentText, readZipEntry, saveApplicantDocument, getApplicantDocument } = require("../services/applicant-documents.js");
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openpostings-doc-"));
 
@@ -165,6 +165,46 @@ function testZipReaderRejectsGarbage() {
   assert.strictEqual(readZipEntry(Buffer.from("this is not a zip"), "word/document.xml"), null);
 }
 
+// The stored copy is what makes the resume survive the server living on a different machine
+// from the file: upload once, read forever. Round-trips through a real (in-memory) SQLite.
+async function testDatabaseRoundTrip() {
+  const { open } = require("sqlite");
+  const sqlite3 = require("sqlite3");
+  const { setDb, getDb } = require("../services/runtime-context.js");
+  const previousDb = getDb();
+  setDb(await open({ filename: ":memory:", driver: sqlite3.Database }));
+
+  try {
+    const pdfBytes = buildPdf(["Timothy Annan", "Hotel General Manager", "Seattle WA"]);
+    const saved = await saveApplicantDocument({ kind: "resume", file_name: "resume.pdf", content: pdfBytes });
+    assert.strictEqual(saved.format, "pdf");
+    assert.ok(saved.chars > 0, "extraction happens at upload time");
+
+    const stored = await getApplicantDocument("resume");
+    assert.ok(stored.text.includes("Hotel General Manager"), "text is served from the database");
+    assert.ok(!("content" in stored), "bytes stay out of the payload unless asked for");
+
+    const withContent = await getApplicantDocument("resume", { includeContent: true });
+    assert.ok(Buffer.isBuffer(withContent.content), "original bytes are kept");
+    assert.strictEqual(withContent.content.length, pdfBytes.length, "byte-for-byte");
+
+    // Re-upload replaces, not duplicates.
+    await saveApplicantDocument({ kind: "resume", file_name: "resume-v2.txt", content: Buffer.from("Updated resume") });
+    const replaced = await getApplicantDocument("resume");
+    assert.strictEqual(replaced.file_name, "resume-v2.txt");
+    assert.strictEqual(replaced.text, "Updated resume");
+
+    assert.strictEqual(await getApplicantDocument("projects_portfolio"), null, "absent kinds are null, not errors");
+    await assert.rejects(
+      () => saveApplicantDocument({ kind: "resume", file_name: "resume.xyz", content: Buffer.from("x") }),
+      /Unsupported format/,
+      "a bad upload fails in the caller's face, not at the next get_resume"
+    );
+  } finally {
+    setDb(previousDb);
+  }
+}
+
 async function run() {
   try {
     await testPlainText();
@@ -173,6 +213,7 @@ async function run() {
     await testMissingFileHandsBackThePath();
     await testUnsupportedFormat();
     testZipReaderRejectsGarbage();
+    await testDatabaseRoundTrip();
     console.log("applicant-documents tests passed");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });

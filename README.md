@@ -352,7 +352,7 @@ MCP helper endpoints:
 
 You can have Codex/Claude/Gemini/Qwen/LLMs do the following for you:
 - Get your applicantee information `get_applicant_context`
-- Read your actual resume (PDF, docx, txt or md) so screening happens against your real background `get_resume`
+- Read your actual resume (PDF, docx, txt or md) so screening happens against your real background `get_resume` — upload it once with `POST /settings/applicant-documents` and it is stored in the database, so it stays readable even when the server runs on a different machine than your files
 - List every filter value it can search on `get_filter_options`
 - Find the latest relevant jobs for you. `find_posting_candidates`
 - Run precision queries like "(manager OR director) AND NOT assistant, in WA, over 140k, seen in the last 3 days" `query_postings`

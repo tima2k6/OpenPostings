@@ -92,7 +92,7 @@ const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable,
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
 const { listPostingsWithFilters, setPostingIgnoredState, getCounts, getWideScanStats } = require("./services/postings.js");
 const { getPostingFilterOptions } = require("./services/filter-options.js");
-const { extractDocumentText } = require("./services/applicant-documents.js");
+const { extractDocumentText, getApplicantDocument, saveApplicantDocument, normalizeDocumentKind, APPLICANT_DOCUMENT_KINDS } = require("./services/applicant-documents.js");
 const { getDb, setDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
 
 const cors = require("cors");
@@ -1001,7 +1001,9 @@ function createServer() {
   const app = express();
   const db = getDb();
   app.use(cors());
-  app.use(express.json());
+  // 25mb: document uploads (/settings/applicant-documents) arrive as base64 JSON, and the
+  // default 100kb cap cannot fit a resume PDF. Local/self-hosted API, per the security notes.
+  app.use(express.json({ limit: "25mb" }));
 
   app.post("/frontend/log", async (req, res) => {
     try {
@@ -1568,15 +1570,87 @@ function createServer() {
         error: String(error?.message || error)
       });
     }
-    const personalInformation = await getPersonalInformation();
     const which = String(req.query.document || "") === "projects_portfolio" ? "projects_portfolio" : "resume";
+
+    const stored = await getApplicantDocument(which);
+    if (stored) {
+      return res.json({ document: which, source: "database", ok: true, ...stored });
+    }
+
+    const personalInformation = await getPersonalInformation();
     const filePath =
       which === "projects_portfolio"
         ? personalInformation?.projects_portfolio_file_path
         : personalInformation?.resume_file_path;
 
     const result = await extractDocumentText(filePath);
-    res.json({ document: which, ...result });
+    if (!result.ok) {
+      result.error += " To make the document permanently available to this server, upload it once via POST /settings/applicant-documents.";
+    }
+    res.json({ document: which, source: "file", ...result });
+  });
+
+  // The upload that makes the resume the server's own. The client machine (where the file
+  // lives) POSTs it once; from then on get_resume and /mcp/resume serve the stored copy no
+  // matter which machine either side runs on. Unlike the /mcp/* routes this is not gated on
+  // the agent being enabled -- the document belongs to profile setup, like the rest of
+  // /settings, and uploading it before enabling the agent is the natural order.
+  app.post("/settings/applicant-documents", async (req, res) => {
+    const kind = normalizeDocumentKind(req.body?.kind || "resume");
+    if (!kind) {
+      return res.status(400).json({ ok: false, error: `kind must be one of: ${APPLICANT_DOCUMENT_KINDS.join(", ")}` });
+    }
+
+    const contentBase64 = String(req.body?.content_base64 || "").trim();
+    if (!contentBase64) {
+      return res.status(400).json({ ok: false, error: "content_base64 is required." });
+    }
+
+    let content;
+    try {
+      content = Buffer.from(contentBase64, "base64");
+    } catch {
+      content = Buffer.alloc(0);
+    }
+    if (content.length === 0) {
+      return res.status(400).json({ ok: false, error: "content_base64 did not decode to any bytes." });
+    }
+
+    try {
+      const saved = await saveApplicantDocument({
+        kind,
+        file_name: req.body?.file_name,
+        content
+      });
+      res.json({ ok: true, ...saved });
+    } catch (error) {
+      res.status(400).json({ ok: false, error: String(error?.message || error) });
+    }
+  });
+
+  app.get("/settings/applicant-documents", async (_req, res) => {
+    const items = [];
+    for (const kind of APPLICANT_DOCUMENT_KINDS) {
+      const stored = await getApplicantDocument(kind);
+      if (stored) {
+        const { text, ...meta } = stored;
+        items.push(meta);
+      }
+    }
+    res.json({ ok: true, items });
+  });
+
+  // Serves the original bytes back, so the machine driving a browser can attach the real
+  // file to an application form even when the upload happened from somewhere else.
+  app.get("/settings/applicant-documents/:kind/file", async (req, res) => {
+    const kind = normalizeDocumentKind(req.params.kind);
+    const stored = kind ? await getApplicantDocument(kind, { includeContent: true }) : null;
+    if (!stored) {
+      return res.status(404).json({ ok: false, error: "No such document uploaded." });
+    }
+    res.setHeader("Content-Disposition", `attachment; filename="${stored.file_name.replace(/"/g, "")}"`);
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.send(stored.content);
   });
 
   app.post("/mcp/cover-letter-draft", async (req, res) => {
