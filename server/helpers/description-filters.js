@@ -634,19 +634,38 @@ function hasStateNameSegmentMatch(locationText, stateName) {
 // as a leading/trailing token of a comma/dash-separated segment (optionally with a trailing zip),
 // e.g. "Portland, OR" or "OR 97201" — not when it's just an English word inside a longer phrase
 // like "Chicago, IL or Remote" or "based in USA".
+function segmentIsBareStateCode(segment, code) {
+  const words = String(segment || "").toUpperCase().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return false;
+  if (words[0] === code) return true;
+  const lastWord = words[words.length - 1];
+  if (lastWord === code) return true;
+  return words.length >= 2 && words[words.length - 2] === code && /^\d{5}(-\d{4})?$/.test(lastWord);
+}
+
+// A location string is a list of "city, state" pairs, so the segment in front of a bare
+// state code is what that code is qualifying. That neighbour is the only thing that tells
+// "Seattle, WA" apart from "DC, WA" -- both are a bare WA segment, and the second is a
+// Washington DC posting whose ATS put a junk value in the state field. Reading the code
+// without its city is what let those through.
+function isDcDenotingSegment(segment) {
+  const normalized = normalizeGeoText(segment);
+  if (!normalized) return false;
+  if (normalized === "district of columbia") return true;
+  // Leading rather than exact, so "dc capital hill" and "dc washington" are read the same
+  // way as a bare "dc".
+  if (/^d\s?c(\s|$)/.test(normalized)) return true;
+  return /^washington\s+d\s?c(\s|$)/.test(normalized);
+}
+
 function hasBareStateCodeSegmentMatch(locationText, code) {
-  const segments = splitLocationIntoCountryCandidateSegments(locationText).map((segment) =>
-    segment.toUpperCase()
-  );
-  for (const segment of segments) {
-    const words = segment.split(/\s+/).filter(Boolean);
-    if (words.length === 0) continue;
-    if (words[0] === code) return true;
-    const lastWord = words[words.length - 1];
-    if (lastWord === code) return true;
-    if (words.length >= 2 && words[words.length - 2] === code && /^\d{5}(-\d{4})?$/.test(lastWord)) {
-      return true;
-    }
+  const segments = splitLocationIntoCountryCandidateSegments(locationText);
+  for (let index = 0; index < segments.length; index += 1) {
+    if (!segmentIsBareStateCode(segments[index], code)) continue;
+    // Washington is the one state whose name is also a city in another jurisdiction, so a
+    // bare WA is only believable when the place it qualifies is not itself the District.
+    if (code === "WA" && index > 0 && isDcDenotingSegment(segments[index - 1])) continue;
+    return true;
   }
   return false;
 }
@@ -756,17 +775,63 @@ function hasStateNameGroupMatch(locationText, stateName, code) {
   });
 }
 
+// The District's own name is "Washington", so every route into a WA match has to be able to
+// tell the two apart -- not just the one that reads the spelled-out state name. The guard
+// used to live only on that last route, which left the other two open: "US-Washington, DC"
+// matched as a US-prefixed slug and "DC, WA" matched as a bare code, both returning before
+// the check ever ran.
+function isWashingtonDcRatherThanWashingtonState(locationText) {
+  const normalizedGeoLocation = normalizeGeoText(locationText);
+  if (!normalizedGeoLocation) return false;
+  if (!/\b(?:dc|d c|district of columbia)\b/.test(normalizedGeoLocation)) return false;
+
+  // A posting can legitimately list both -- "Seattle, WA ... Washington DC" is a real
+  // multi-site listing and belongs in a WA search -- so a mention of the District is not on
+  // its own disqualifying. What settles it is whether a bare WA code survives, since
+  // hasBareStateCodeSegmentMatch has already discarded the codes sitting next to the
+  // District's own name. The spelled-out "Washington" is deliberately not accepted as
+  // evidence here: it is the District's city name too, which is the whole ambiguity.
+  return !hasBareStateCodeSegmentMatch(locationText, "WA");
+}
+
+// A bare two-letter code is only a US state when the string is not openly saying it is
+// somewhere else. Western Australia is what this catches: "Perth, WA, Australia" is a bare
+// WA segment with no country code of its own to compare against, so the older collision
+// guard -- which only fired for codes that are themselves country codes, like IN/India --
+// never looked at it.
+//
+// Only the trailing segment is read, and only when it is not a US state name. Scanning the
+// whole string for any country-shaped word is what a first attempt did, and it quietly
+// reclassified "Lebanon, NH", "Holland, MI", "Jamaica, NY" and "Albuquerque, New Mexico" as
+// foreign -- every one of those is an American town whose name is also a country's.
+function namesNonUsCountryInTrailingSegment(locationText) {
+  const segments = splitLocationIntoCountryCandidateSegments(locationText);
+  if (segments.length < 2) return false;
+
+  const trailing = segments[segments.length - 1];
+  const normalizedTrailing = normalizeGeoText(trailing);
+  if (!normalizedTrailing) return false;
+  if (US_STATE_NAMES.has(normalizedTrailing)) return false;
+
+  const inferredGeo = inferLocationGeo(trailing);
+  const countryCode = String(inferredGeo?.countryCode || "").trim().toUpperCase();
+  return Boolean(countryCode) && countryCode !== "US";
+}
+
 function hasStateLikeMatch(locationText, stateCode) {
   const code = String(stateCode || "").trim().toUpperCase();
   if (!code) return false;
-  const normalizedGeoLocation = normalizeGeoText(locationText);
+
+  if (code === "WA" && isWashingtonDcRatherThanWashingtonState(locationText)) return false;
 
   if (hasBareStateCodeSegmentMatch(locationText, code)) {
     // Guard against state-code / country-code collisions (e.g. IN/India, LA/Laos, IL/Israel,
     // MT/Malta, ME/Montenegro) when the full country name is also explicitly present.
     const inferredGeo = COUNTRY_BY_CODE.has(code) ? inferLocationGeo(locationText) : null;
     const isActuallyThatCountry = Boolean(inferredGeo?.countryCode) && inferredGeo.countryCode === code;
-    if (!isActuallyThatCountry) return true;
+    // A bare code inside a string that ends by naming a foreign country is that country's
+    // own subdivision, not the American state that happens to share the abbreviation.
+    if (!isActuallyThatCountry && !namesNonUsCountryInTrailingSegment(locationText)) return true;
   }
 
   // No country guard needed here: both slug shapes already establish the location is US.
@@ -774,16 +839,7 @@ function hasStateLikeMatch(locationText, stateCode) {
 
   const stateName = STATE_CODE_TO_NAME[code];
   if (!stateName) return false;
-  if (!hasStateNameGroupMatch(locationText, stateName, code)) return false;
-
-  if (code === "WA") {
-    if (containsGeoPhrase(normalizedGeoLocation, STATE_CODE_TO_NAME.DC)) return false;
-    if (containsGeoPhrase(normalizedGeoLocation, "washington dc")) return false;
-    if (containsGeoPhrase(normalizedGeoLocation, "washington d c")) return false;
-    // Catches fused/slug variants: "washington dcmetro area", "washington-dc", "washingtondc"
-    if (/\bwashington\s*[- ]?\s*dc/i.test(normalizedGeoLocation)) return false;
-  }
-  return true;
+  return hasStateNameGroupMatch(locationText, stateName, code);
 }
 
 function classifyLocationWorkMode(locationText) {
