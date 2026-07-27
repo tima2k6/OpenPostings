@@ -265,6 +265,17 @@ export function savePersonalInformation(payload) {
   });
 }
 
+export function fetchApplicantDocuments() {
+  return request("/settings/applicant-documents");
+}
+
+export function uploadApplicantDocument(payload) {
+  return request("/settings/applicant-documents", {
+    method: "POST",
+    body: JSON.stringify(payload || {})
+  });
+}
+
 export function fetchMcpSettings() {
   return request("/settings/mcp");
 }
