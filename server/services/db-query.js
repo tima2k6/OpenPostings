@@ -10,7 +10,13 @@
 // listPostingsWithFilters. That function applies the freshness window and the hidden flag,
 // and those are exactly the constraints worth looking underneath.
 const { getReadOnlyDb } = require("./db-browser.js");
-const { rowMatchesLocationFilters, STATE_CODE_TO_NAME } = require("../helpers/description-filters.js");
+const {
+  rowMatchesLocationFilters,
+  parseStateFilters,
+  parseCountryFilters,
+  parseRegionFilters,
+  STATE_CODE_TO_NAME
+} = require("../helpers/description-filters.js");
 const { inferPostingLocationFromJobUrl, inferAtsFromJobPostingUrl } = require("../helpers/normalize-ats.js");
 
 const MAX_ROWS = 1000;
@@ -114,8 +120,15 @@ function buildQuery(input = {}) {
   // because their value is inferred from the job URL, which this query cannot see.
   // ATS is derived from the job URL rather than stored, so like states it cannot be a SQL
   // clause and is applied during the refine pass.
+  //
+  // Country and region are the same predicate the app's own location filter applies, and
+  // they are what stops a state code standing in for a foreign subdivision. Neither narrows
+  // in SQL: both are inferred from the location text rather than stored, and a country is
+  // named by any of its aliases, so the refine pass is the only place they can be decided.
   const atsFilters = splitTerms(input.ats);
-  const stateCodes = splitTerms(input.states).map((code) => code.toUpperCase());
+  const stateCodes = parseStateFilters(input.states);
+  const countryFilters = parseCountryFilters(splitTerms(input.countries));
+  const regionFilters = parseRegionFilters(splitTerms(input.regions));
   if (stateCodes.length) {
     const parts = [];
     for (const code of stateCodes) {
@@ -153,13 +166,24 @@ function buildQuery(input = {}) {
     `ORDER BY ${sortColumn} ${direction}, id DESC\n` +
     `LIMIT ${limit}`;
 
-  return { sql, params, where, clauses, limit, stateCodes, atsFilters };
+  return { sql, params, where, clauses, limit, stateCodes, countryFilters, regionFilters, atsFilters };
+}
+
+// True when the SQL predicate is only a superset of what the caller asked for, so the counts
+// have to come from the refined set rather than a COUNT(*) over the same WHERE.
+function needsRefinePass(built) {
+  return (
+    built.stateCodes.length > 0 ||
+    built.countryFilters.length > 0 ||
+    built.regionFilters.length > 0 ||
+    built.atsFilters.length > 0
+  );
 }
 
 async function runQuery(input = {}) {
   const db = await getReadOnlyDb();
   const built = buildQuery(input);
-  const { where, limit, stateCodes, atsFilters } = built;
+  const { where, limit, stateCodes, countryFilters, regionFilters, atsFilters } = built;
   const params = built.params.slice();
 
   const readable = built.sql.replace(/\?/g, () => {
@@ -167,8 +191,9 @@ async function runQuery(input = {}) {
     return typeof next === "number" ? String(next) : `'${String(next).replace(/'/g, "''")}'`;
   });
 
-  // No state filter: SQL is the whole predicate, so counts come straight from the table.
-  if (stateCodes.length === 0 && atsFilters.length === 0) {
+  // No location or ATS filter: SQL is the whole predicate, so counts come straight from the
+  // table.
+  if (!needsRefinePass(built)) {
     const rows = await db.all(built.sql, params);
     const totals = await db.get(
       `SELECT COUNT(*) AS total, SUM(CASE WHEN hidden = 0 THEN 1 ELSE 0 END) AS visible
@@ -186,8 +211,8 @@ async function runQuery(input = {}) {
     };
   }
 
-  // State or ATS filter: take the SQL superset, then apply the predicates that only exist
-  // in JS -- the segment-aware state matcher, and the ATS inferred from the URL.
+  // Location or ATS filter: take the SQL superset, then apply the predicates that only exist
+  // in JS -- the segment-aware location matcher, and the ATS inferred from the URL.
   const candidateSql = built.sql
     .replace(/LIMIT \d+$/, `LIMIT ${STATE_CANDIDATE_CAP}`);
   const candidates = await db.all(candidateSql, params);
@@ -196,7 +221,7 @@ async function runQuery(input = {}) {
   for (const row of candidates) {
     const location =
       String(row.location || "").trim() || inferPostingLocationFromJobUrl(row.job_posting_url) || "";
-    if (stateCodes.length && !rowMatchesLocationFilters(location, stateCodes, [], [], [])) continue;
+    if (!rowMatchesLocationFilters(location, stateCodes, [], countryFilters, regionFilters)) continue;
     if (atsFilters.length && !atsFilters.includes(String(inferAtsFromJobPostingUrl(row.job_posting_url) || "").toLowerCase())) continue;
     matched.push({ ...row, location: row.location || location });
   }
@@ -214,4 +239,4 @@ async function runQuery(input = {}) {
   };
 }
 
-module.exports = { buildQuery, runQuery, SORTABLE, MAX_ROWS };
+module.exports = { buildQuery, runQuery, needsRefinePass, SORTABLE, MAX_ROWS };

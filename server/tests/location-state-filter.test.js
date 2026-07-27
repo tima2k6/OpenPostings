@@ -345,6 +345,42 @@ function run() {
     );
   }
 
+  // Foreign subdivisions reuse US state abbreviations, and the bare-code test read them as
+  // states: a WA filter kept every Perth posting. The country named alongside the code is
+  // what settles it, spelled out or abbreviated.
+  for (const [location, code] of [
+    ["Perth, WA, Australia", "WA"],
+    ["Perth, WA, AU", "WA"],
+    ["WA, Australia", "WA"],
+    ["Australia - WA - Perth", "WA"],
+    ["Milan, MI, Italy", "MI"],
+    ["Bengaluru, KA, India", "CA"],
+    ["Gurgaon, HR, IN", "IN"]
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, [code], [], [], []),
+      false,
+      `${code} filter should not match the foreign subdivision in ${location}`
+    );
+  }
+
+  // The country guard is scoped to one location group, so a genuine US match survives a
+  // foreign location listed beside it -- and an explicit US country never blocks anything.
+  for (const [location, code] of [
+    ["Seattle, WA / Perth, WA, Australia", "WA"],
+    ["Seattle, WA, United States", "WA"],
+    ["Seattle, WA, USA", "WA"],
+    ["Redmond, WA 98052, United States", "WA"],
+    ["Indianapolis, IN", "IN"],
+    ["Detroit, MI", "MI"]
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, [code], [], [], []),
+      true,
+      `${code} filter should still match ${location}`
+    );
+  }
+
   console.log("location-state-filter tests passed");
 }
 

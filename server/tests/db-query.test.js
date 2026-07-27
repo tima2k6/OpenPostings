@@ -4,7 +4,7 @@
 // value, or a state pre-filter that discards postings whose location comes from the URL).
 const assert = require("assert");
 
-const { buildQuery, SORTABLE, MAX_ROWS } = require("../services/db-query.js");
+const { buildQuery, needsRefinePass, SORTABLE, MAX_ROWS } = require("../services/db-query.js");
 
 function testTermsAreOredWithinAGroup() {
   const { sql, params } = buildQuery({ title_any: "manager, director , head of" });
@@ -87,6 +87,41 @@ function testAtsIsDeferredToTheRefinePass() {
   assert.ok(!/workday/i.test(sql), "ATS is derived from the URL, so it cannot be a SQL clause");
 }
 
+// The state box is free text, so a full name has to mean the state it names. Passing an
+// unrecognised token through as its own "code" let the bare-segment matcher match it
+// literally, with no state name to run the Washington/DC guards against -- so a "Washington"
+// filter kept every Washington, DC row.
+function testStateNamesAreResolvedToCodes() {
+  assert.deepStrictEqual(buildQuery({ states: "Washington" }).stateCodes, ["WA"]);
+  assert.deepStrictEqual(buildQuery({ states: "washington state" }).stateCodes, ["WA"]);
+  assert.deepStrictEqual(buildQuery({ states: "District of Columbia" }).stateCodes, ["DC"]);
+  assert.deepStrictEqual(buildQuery({ states: "wa, Washington, WA" }).stateCodes, ["WA"], "duplicates collapse");
+  assert.deepStrictEqual(
+    buildQuery({ states: "Australia, Ontario" }).stateCodes,
+    [],
+    "a token that is not a US state must be dropped, not treated as a code"
+  );
+}
+
+// Country and region are the app's own location filters. Neither can narrow in SQL -- both
+// are read out of the location text rather than stored -- so they belong to the refine pass.
+function testCountryAndRegionAreDeferredToTheRefinePass() {
+  const { sql, countryFilters, regionFilters } = buildQuery({ countries: "us, canada", regions: "AMER, nowhere" });
+  assert.deepStrictEqual(countryFilters.map((filter) => filter.value), ["US", "CA"]);
+  assert.deepStrictEqual(regionFilters, ["AMER"], "an unknown region is dropped");
+  assert.ok(!/WHERE/.test(sql), "neither filter may reach the statement");
+
+  assert.strictEqual(needsRefinePass(buildQuery({ countries: "us" })), true);
+  assert.strictEqual(needsRefinePass(buildQuery({ regions: "EMEA" })), true);
+  assert.strictEqual(needsRefinePass(buildQuery({ states: "WA" })), true);
+  assert.strictEqual(needsRefinePass(buildQuery({ ats: "workday" })), true);
+  assert.strictEqual(
+    needsRefinePass(buildQuery({ title_any: "manager" })),
+    false,
+    "without a JS-only predicate the SQL is the whole query, and the counts are exact"
+  );
+}
+
 function testEmptyInputProducesNoWhereClause() {
   const { sql, params } = buildQuery({});
   assert.ok(!/WHERE/.test(sql), "no filters means no predicate");
@@ -110,6 +145,8 @@ function main() {
   testStatePrefilterKeepsRowsWithNoLocation();
   testTitleAllIsAndedWhileTitleAnyIsOred();
   testAtsIsDeferredToTheRefinePass();
+  testStateNamesAreResolvedToCodes();
+  testCountryAndRegionAreDeferredToTheRefinePass();
   testEmptyInputProducesNoWhereClause();
   testVisibilityAndPayPresence();
   console.log("db-query tests passed");
