@@ -147,16 +147,18 @@ function buildMcpRunbook(settings, personalInformation, candidates) {
   return {
     preferred_agent_name: preferredAgent,
     summary:
-      "Use your existing browser/web automation tools to open each job URL, complete the application form, and submit only when allowed by settings and credentials.",
+      "Shortlist, screen, then apply: filter postings down, read each survivor's stored description before opening a browser, and submit only when allowed by settings and credentials.",
     steps: [
       "Read applicantee information and MCP settings from this payload.",
-      "For each candidate posting, open job_posting_url and validate role relevance before applying.",
-      "Fill application fields using applicantee information. Keep applicant email separate from agent login email.",
+      "Shortlist with find_posting_candidates (saved preferences) or query_postings (include/exclude terms, pay floor, recency).",
+      "Screen each shortlisted posting with get_posting_details and weigh its description against the applicant's background before opening anything in a browser.",
+      "Call ignore_posting for postings that are not a fit, so no later run resurfaces them.",
+      "For each posting worth applying to, open job_posting_url and fill the application from applicantee information. Keep applicant email separate from agent login email.",
       "If an account or MFA is required, use agent_login_email + agent_login_password for account creation and sign-in flows.",
       "Use the same agent_login_email for MFA/approval flows when required.",
       "Draft a job-specific cover letter aligned to the posting requirements and applicant background.",
       "If dry_run_only is true, stop before final submit and return a dry-run result.",
-      "When application is submitted, call record_application_result with commit=true to write outcomes."
+      "When application is submitted, call record_application_result with commit=true; consult list_applications when unsure whether a posting was already handled."
     ],
     guardrails: {
       dry_run_only: Boolean(settings?.dry_run_only),

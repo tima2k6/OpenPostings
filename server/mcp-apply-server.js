@@ -32,7 +32,14 @@ const { MCP_SETTINGS_DEFAULTS } = require("./helpers/normalize-mcp-settings.js")
 const { setDb } = require("./services/runtime-context.js");
 const { getMcpSettings, buildMcpRunbook, buildCoverLetterDraft } = require("./services/mcp.js");
 const { getPersonalInformation } = require("./services/personal-info.js");
-const { listPostingsWithFilters } = require("./services/postings.js");
+const {
+  listPostingsWithFilters,
+  getPostingsByUrls,
+  setPostingIgnoredState,
+  enrichPostingsWithApplicationState
+} = require("./services/postings.js");
+const { listApplications } = require("./services/applications.js");
+const { runQuery, SORTABLE, MAX_ROWS } = require("./services/db-query.js");
 const { getPostingFilterOptions } = require("./services/filter-options.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime } = require("./services/sync-settings.js");
 
@@ -42,6 +49,7 @@ const MCP_ATS_FILTER_VALUES = Object.freeze(Array.from(ATS_FILTER_OPTIONS));
 const MCP_REGION_FILTER_VALUES = Object.freeze(LOCATION_REGION_OPTIONS.map((option) => option.value));
 const MCP_REMOTE_FILTER_VALUES = Object.freeze(["all", "remote", "hybrid", "non_remote"]);
 const MCP_SORT_VALUES = Object.freeze(["recent", "company_asc"]);
+const MCP_QUERY_SORT_VALUES = Object.freeze(Array.from(SORTABLE.keys()));
 const MAX_CANDIDATE_LIMIT = 2000;
 
 let db;
@@ -222,6 +230,42 @@ function normalizeAtsArgument(value) {
   if (Array.isArray(value)) return normalizeStringArray(value);
   const single = String(value || "").trim();
   return single ? [single] : [];
+}
+
+// runQuery's contract is comma-separated term strings, shared with the /db/query route.
+// Arrays are the honest MCP shape, so they are joined here -- which also means a term
+// cannot itself contain a comma.
+function buildQueryPostingsInput(args) {
+  const joinTerms = (values) => normalizeStringArray(values).join(",");
+  return {
+    title_any: joinTerms(args?.title_any),
+    title_all: joinTerms(args?.title_all),
+    title_none: joinTerms(args?.title_none),
+    company_any: joinTerms(args?.company_any),
+    company_none: joinTerms(args?.company_none),
+    location_any: joinTerms(args?.location_any),
+    location_none: joinTerms(args?.location_none),
+    ats: joinTerms(args?.ats),
+    states: joinTerms(args?.states),
+    countries: joinTerms(args?.countries),
+    regions: joinTerms(args?.regions),
+    pay_min: args?.pay_min,
+    pay_max: args?.pay_max,
+    has_pay: normalizeBoolean(args?.has_pay, false) ? "1" : "",
+    seen_days: args?.seen_days,
+    found_days: args?.found_days,
+    visibility: args?.visibility || "all",
+    sort: args?.sort,
+    dir: args?.dir,
+    limit: args?.limit
+  };
+}
+
+// The label is what the app shows next to an ignored row, so it should say who decided
+// and why, not just that an agent was here.
+function buildIgnoredByLabel(agentName, reason) {
+  const trimmedReason = String(reason || "").trim();
+  return trimmedReason ? `${agentName}: ${trimmedReason}` : `${agentName} marked not a fit`;
 }
 
 async function findCandidates(options = {}) {
@@ -593,6 +637,133 @@ async function main() {
   );
 
   mcpServer.registerTool(
+    "query_postings",
+    {
+      description:
+        "Precision query over the raw Postings table, for questions find_posting_candidates cannot phrase: each *_any group ORs its terms, groups AND together, and *_none excludes -- so '(manager OR director) AND NOT (assistant OR shift), in WA, over 140k, still listed within 3 days' is one call. Terms are substring matches. Unlike find_posting_candidates this ignores saved preferences and the app's freshness window, and can see hidden postings via visibility. Rows carry applied/ignored flags but no descriptions; screen the shortlist with get_posting_details. When approximate=true the counts are a floor, not a total.",
+      inputSchema: {
+        title_any: z.array(z.string()).optional(),
+        title_all: z.array(z.string()).optional(),
+        title_none: z.array(z.string()).optional(),
+        company_any: z.array(z.string()).optional(),
+        company_none: z.array(z.string()).optional(),
+        location_any: z.array(z.string()).optional(),
+        location_none: z.array(z.string()).optional(),
+        ats: z.array(z.enum(MCP_ATS_FILTER_VALUES)).optional(),
+        states: z.array(z.string()).optional(),
+        countries: z.array(z.string()).optional(),
+        regions: z.array(z.enum(MCP_REGION_FILTER_VALUES)).optional(),
+        pay_min: z.number().positive().optional(),
+        pay_max: z.number().positive().optional(),
+        has_pay: z.boolean().optional(),
+        seen_days: z.number().positive().optional(),
+        found_days: z.number().positive().optional(),
+        visibility: z.enum(["visible", "hidden", "all"]).optional(),
+        sort: z.enum(MCP_QUERY_SORT_VALUES).optional(),
+        dir: z.enum(["asc", "desc"]).optional(),
+        limit: z.number().int().positive().max(MAX_ROWS).optional()
+      }
+    },
+    async (args) => {
+      const mcpSettings = await getMcpSettings();
+      ensureMcpAgentEnabled(mcpSettings);
+      const result = await runQuery(buildQueryPostingsInput(args));
+      const rows = await enrichPostingsWithApplicationState(result.rows);
+      return asToolResult({
+        total: result.total,
+        visible: result.visible,
+        shown: result.shown,
+        limit: result.limit,
+        approximate: result.approximate,
+        sql: result.sql,
+        rows
+      });
+    }
+  );
+
+  mcpServer.registerTool(
+    "get_posting_details",
+    {
+      description:
+        "Everything stored about the named postings: full job description, pay fields, education levels, ATS, hidden flag, sync timestamps, and applied/ignored state. This is the screening step between shortlisting and opening a browser -- read the description against the applicant's background and decide fit before spending a browser session. URLs not in the database are returned in missing.",
+      inputSchema: {
+        job_posting_urls: z.array(z.string()).min(1).max(20)
+      }
+    },
+    async (args) => {
+      const mcpSettings = await getMcpSettings();
+      ensureMcpAgentEnabled(mcpSettings);
+      const requested = normalizeStringArray(args?.job_posting_urls);
+      const items = await getPostingsByUrls(requested);
+      const foundUrls = new Set(items.map((item) => String(item?.job_posting_url || "").trim()));
+
+      return asToolResult({
+        count: items.length,
+        items,
+        missing: requested.filter((url) => !foundUrls.has(url))
+      });
+    }
+  );
+
+  mcpServer.registerTool(
+    "ignore_posting",
+    {
+      description:
+        "Mark postings as not a fit so neither find_posting_candidates nor a future run surfaces them again -- the durable form of 'screened and rejected'. Pass ignored=false to un-ignore. This writes tracking state only; it never touches the posting or any application record.",
+      inputSchema: {
+        job_posting_urls: z.array(z.string()).min(1).max(50),
+        ignored: z.boolean().optional(),
+        reason: z.string().optional()
+      }
+    },
+    async (args) => {
+      const mcpSettings = await getMcpSettings();
+      ensureMcpAgentEnabled(mcpSettings);
+      const ignored = normalizeBoolean(args?.ignored, true);
+      const agentName =
+        String(mcpSettings.preferred_agent_name || MCP_SETTINGS_DEFAULTS.preferred_agent_name).trim() ||
+        MCP_SETTINGS_DEFAULTS.preferred_agent_name;
+      const ignoredByLabel = buildIgnoredByLabel(agentName, args?.reason);
+
+      const results = [];
+      for (const jobPostingUrl of normalizeStringArray(args?.job_posting_urls)) {
+        results.push(
+          await setPostingIgnoredState({
+            job_posting_url: jobPostingUrl,
+            ignored,
+            ignored_by_label: ignoredByLabel
+          })
+        );
+      }
+
+      return asToolResult({ count: results.length, ignored, items: results });
+    }
+  );
+
+  mcpServer.registerTool(
+    "list_applications",
+    {
+      description:
+        "Application history with attribution -- who applied (user or agent) and when. Use it to avoid double-applying to a company, to report what a run accomplished, and to respect the per-run budget across sessions.",
+      inputSchema: {
+        status: z.string().optional(),
+        limit: z.number().int().positive().max(2000).optional(),
+        offset: z.number().int().nonnegative().optional()
+      }
+    },
+    async (args) => {
+      const mcpSettings = await getMcpSettings();
+      ensureMcpAgentEnabled(mcpSettings);
+      const result = await listApplications({
+        status: args?.status,
+        limit: args?.limit,
+        offset: args?.offset
+      });
+      return asToolResult(result);
+    }
+  );
+
+  mcpServer.registerTool(
     "draft_cover_letter",
     {
       description: "Generate a cover letter draft for a posting using applicantee information.",
@@ -736,7 +907,14 @@ async function main() {
   await mcpServer.connect(transport);
 }
 
-module.exports = { findCandidates, resolveListFilter, normalizeAtsArgument, openDatabase };
+module.exports = {
+  findCandidates,
+  resolveListFilter,
+  normalizeAtsArgument,
+  buildQueryPostingsInput,
+  buildIgnoredByLabel,
+  openDatabase
+};
 
 if (require.main === module) {
   main().catch((error) => {
