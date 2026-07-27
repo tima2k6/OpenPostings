@@ -104,6 +104,7 @@ const { findCompanies, findPostings, runReadOnlyQuery, rejectUnsafeQuery, MAX_RO
 const { DB_BROWSER_PAGE } = require("./services/db-browser-page.js");
 const { runQuery: runPostingQuery } = require("./services/db-query.js");
 const { computeFacets } = require("./services/db-facets.js");
+const { listSavedQueries, saveQuery, deleteQuery } = require("./services/saved-queries.js");
 
 
 const PORT = Number(process.env.PORT || 8787);
@@ -1070,6 +1071,24 @@ function createServer() {
     } catch (error) {
       res.status(400).json({ error: String(error?.message || error) });
     }
+  });
+
+  // Saved queries live on the server so they survive a browser eviction, a different
+  // device, and the overnight sync they are usually waiting on.
+  app.get("/db/saved", (_req, res) => {
+    res.json({ items: listSavedQueries() });
+  });
+
+  app.post("/db/saved", (req, res) => {
+    try {
+      res.json({ item: saveQuery({ name: req.body?.name, state: req.body?.state }) });
+    } catch (error) {
+      res.status(400).json({ error: String(error?.message || error) });
+    }
+  });
+
+  app.delete("/db/saved/:id", (req, res) => {
+    res.json({ deleted: deleteQuery(req.params.id) });
   });
 
   app.get("/db/facets", async (req, res) => {
