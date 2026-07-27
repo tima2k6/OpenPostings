@@ -17,7 +17,11 @@ const { buildQuery } = require("./db-query.js");
 const { rowMatchesLocationFilters, STATE_CODE_TO_NAME } = require("../helpers/description-filters.js");
 const { inferPostingLocationFromJobUrl, inferAtsFromJobPostingUrl } = require("../helpers/normalize-ats.js");
 
-const FACET_CANDIDATE_CAP = 25000;
+// Sized against measured scan cost, not guessed: 200,000 rows resolve in ~1.2s, and the
+// superset a state filter produces before the real matcher runs is far larger than the set
+// it ends up matching -- WA narrows 189,807 candidates down to 1,895. Capping below the
+// candidate count would refuse to build facets for a result set of under two thousand.
+const FACET_CANDIDATE_CAP = 250000;
 // Facets populate dropdowns rather than a truncated chip list, so every observed value is
 // returned. The bound exists only to stop a pathological set producing an unbounded
 // response; on this data the largest facet (title words) is well under it.
@@ -52,12 +56,36 @@ function titleWords(positionName) {
     .filter((word) => word.length > 2 && !TITLE_STOPWORDS.has(word) && !/^\d+$/.test(word));
 }
 
+// The 51 codes, independent of any query. This is the primary axis and must not come from
+// a facet count: a sampled scan cannot be trusted to mention every state, and the state a
+// user cares about is often not one of the busiest.
+const ALL_STATES = STATE_CODES.map((code) => ({ value: code, name: STATE_CODE_TO_NAME[code] }));
+
 async function computeFacets(input = {}) {
   const db = await getReadOnlyDb();
   const built = buildQuery(input);
 
-  // Reuse the builder's predicate but ignore its ordering and page size: facets describe
-  // the whole matching set, not the page being displayed.
+  // How many rows the scan would have to read. This is the SQL predicate only: when a
+  // state filter is active it is a superset, since the real matcher runs in JS afterwards.
+  // Gating on it bounds the work, which is the thing that actually needs bounding.
+  //
+  // The gate exists because facets over an unnarrowed set are worse than useless. The scan
+  // is bounded and has no ORDER BY, so without this it was describing an arbitrary 3% of
+  // the table while presenting the counts as the breakdown. Saying "narrow first" is more
+  // honest than a number that is quietly a sample.
+  const candidateRow = await db.get(`SELECT COUNT(*) AS n FROM Postings ${built.where};`, built.params);
+  const candidateCount = Number(candidateRow?.n || 0);
+
+  if (candidateCount > FACET_CANDIDATE_CAP) {
+    return {
+      total: candidateCount,
+      scanned: 0,
+      needs_narrowing: true,
+      all_states: ALL_STATES,
+      facets: { states: [], companies: [], title_words: [], ats: [] }
+    };
+  }
+
   const sql =
     `SELECT company_name, position_name, location, hidden, pay_min, pay_max, job_posting_url\n` +
     `FROM Postings\n${built.where}\nLIMIT ${FACET_CANDIDATE_CAP}`;
@@ -70,6 +98,7 @@ async function computeFacets(input = {}) {
   const byAts = new Map();
   let visible = 0;
   let withPay = 0;
+  let matched = 0;
 
   // Location strings repeat heavily, and the state matcher is the expensive part of this
   // loop, so each distinct string is resolved once and reused.
@@ -98,6 +127,7 @@ async function computeFacets(input = {}) {
       if (!rowMatchesLocationFilters(location, activeStates, [], [], [])) continue;
     }
 
+    matched += 1;
     if (Number(row.hidden) === 0) visible += 1;
     if (Number(row.pay_max || row.pay_min || 0) > 0) withPay += 1;
 
@@ -112,11 +142,15 @@ async function computeFacets(input = {}) {
   }
 
   return {
+    // Rows that survived the JS refine, not the candidate superset that was scanned.
+    total: matched,
     scanned: rows.length,
-    // True when the cap was hit, so the counts are a sample rather than the whole set.
-    approximate: rows.length >= FACET_CANDIDATE_CAP,
+    needs_narrowing: false,
+    all_states: ALL_STATES,
+    // Every candidate was read, so these counts are exact rather than sampled.
+    approximate: false,
     visible,
-    hidden: rows.length - visible,
+    hidden: matched - visible,
     with_pay: withPay,
     facets: {
       states: top(byState),

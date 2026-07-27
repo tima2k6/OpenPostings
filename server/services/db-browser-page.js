@@ -299,17 +299,49 @@ ORDER BY n DESC</textarea>
   };
   var FACET_LABEL = { states: "State", title_words: "Title contains", companies: "Company", ats: "ATS" };
 
+  function wireFacetSelects(out) {
+    Array.prototype.forEach.call(out.querySelectorAll("select[data-facet]"), function (sel) {
+      sel.addEventListener("change", function () {
+        if (!sel.value) return;
+        var t = FACET_TARGET[sel.getAttribute("data-facet")];
+        addTerm(t.id, sel.value, t.replace);
+        run();
+      });
+    });
+  }
+
   function loadFacets() {
     var params = new URLSearchParams(readFilters()).toString();
     get("/db/facets?" + params).then(function (data) {
-      var summary = '<p class="hint">' + (data.approximate ? "sampled " : "") + data.scanned +
-        " rows \u00b7 " + data.visible + " visible, " + data.hidden + " hidden \u00b7 " +
-        data.with_pay + " with a pay figure" +
-        (data.approximate ? " \u2014 counts are a sample, narrow further for exact numbers" : "") + "</p>";
+      var out = document.getElementById("facet-out");
+
+      // State is always offered, from the fixed list of 51 rather than from counts: it is
+      // the primary axis, and it has to be selectable before anything has been narrowed.
+      var stateOptions = '<label class="facet-pick"><span class="facet-name">State</span>' +
+        '<select data-facet="states"><option value="">\u2014 any \u2014</option>' +
+        (data.all_states || []).map(function (st) {
+          return '<option value="' + esc(st.value) + '">' + esc(st.value) + "</option>";
+        }).join("") + "</select></label>";
+
+      if (data.needs_narrowing) {
+        out.innerHTML =
+          '<p class="hint"><b>' + data.total.toLocaleString() + " rows.</b> Company and title breakdowns " +
+          "are only shown once the set is small enough to count exactly \u2014 over a set this size they " +
+          "would describe a fraction of it and read as if they described all of it. Pick a state, or add a " +
+          "title or date filter, and they appear.</p>" +
+          '<div class="facet-row">' + stateOptions + "</div>";
+        wireFacetSelects(out);
+        return;
+      }
+
+      var summary = '<p class="hint">' + data.total.toLocaleString() + " rows, counted exactly \u00b7 " +
+        data.visible + " visible, " + data.hidden + " hidden \u00b7 " +
+        data.with_pay + " with a pay figure</p>";
       // Every observed value, in a dropdown. A truncated chip list hid whole states from
       // anyone outside the biggest markets; a dropdown holds all of them, stays the same
       // size on screen, and the browser's type-ahead makes 8,000 title words navigable.
-      var groups = '<div class="facet-row">' + Object.keys(FACET_TARGET).map(function (key) {
+      var groups = '<div class="facet-row">' + stateOptions + Object.keys(FACET_TARGET).map(function (key) {
+        if (key === "states") return "";
         var items = (data.facets[key] || []);
         if (!items.length) return "";
         return '<label class="facet-pick"><span class="facet-name">' + FACET_LABEL[key] +
@@ -320,16 +352,8 @@ ORDER BY n DESC</textarea>
             return '<option value="' + esc(it.value) + '">' + esc(it.value) + " (" + it.count + ")</option>";
           }).join("") + "</select></label>";
       }).join("") + "</div>";
-      var out = document.getElementById("facet-out");
       out.innerHTML = summary + groups;
-      Array.prototype.forEach.call(out.querySelectorAll("select[data-facet]"), function (sel) {
-        sel.addEventListener("change", function () {
-          if (!sel.value) return;
-          var t = FACET_TARGET[sel.getAttribute("data-facet")];
-          addTerm(t.id, sel.value, t.replace);
-          run();
-        });
-      });
+      wireFacetSelects(out);
     }).catch(function (e) { document.getElementById("facet-out").innerHTML = '<p class="err">' + esc(e.message) + "</p>"; });
   }
 

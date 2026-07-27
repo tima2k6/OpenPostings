@@ -14,10 +14,11 @@ const { rowMatchesLocationFilters, STATE_CODE_TO_NAME } = require("../helpers/de
 const { inferPostingLocationFromJobUrl, inferAtsFromJobPostingUrl } = require("../helpers/normalize-ats.js");
 
 const MAX_ROWS = 1000;
-// When a real state filter is active the rows have to be tested in JS, so a bounded
-// candidate set is pulled first. Large enough that ordinary queries are exact, small
-// enough that it cannot stall the single-threaded API.
-const STATE_CANDIDATE_CAP = 40000;
+// Must stay equal to FACET_CANDIDATE_CAP in db-facets.js. Both paths refine the same SQL
+// superset in JS, so a smaller cap here made the result count a floor while the facet
+// count was exact -- the same query reported 1,895 rows in one place and 6,744 in the
+// other. Two numbers for one question is worse than one slow number.
+const STATE_CANDIDATE_CAP = 250000;
 
 const SORTABLE = new Map([
   ["last_seen", "last_seen_epoch"],
