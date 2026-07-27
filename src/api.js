@@ -20,8 +20,43 @@ function isTransientAndroidLocalBackendError(errorValue) {
   return (
     message.includes("network request failed") ||
     message.includes("failed to fetch") ||
-    message.includes("connection refused")
+    message.includes("connection refused") ||
+    message.includes("timed out")
   );
+}
+
+// Without this, a request that hangs never settles: the caller sits on the promise, its
+// catch never runs, and the page renders with no data and no error -- indistinguishable
+// from "there are no postings". The API is single-threaded on one SQLite connection that
+// it shares with the sync, so a stall is a realistic state, not a hypothetical one. The
+// window is deliberately generous: a slow response is still worth waiting for, and the
+// point is to eventually say something rather than to fail fast.
+const REQUEST_TIMEOUT_MS = 30000;
+
+// The browser deliberately refuses to distinguish a refused connection from a blocked
+// CORS response -- both surface as an opaque TypeError -- so this cannot claim which one
+// happened. It reports what is actually known, and names the address being called, which
+// is the thing most often wrong when the app is opened from a different host.
+function describeRequestError(errorValue, url) {
+  if (errorValue?.name === "AbortError") {
+    return new Error(
+      `Request to ${url} timed out after ${Math.round(REQUEST_TIMEOUT_MS / 1000)}s. ` +
+        "The API may be busy (a sync competes with it for the same database connection)."
+    );
+  }
+
+  const message = String(errorValue?.message || errorValue || "");
+  const looksUnreachable =
+    errorValue instanceof TypeError ||
+    /failed to fetch|network request failed|load failed/i.test(message);
+
+  if (looksUnreachable) {
+    return new Error(
+      `Could not reach the API at ${url}. It may be down, or unreachable from this device.`
+    );
+  }
+
+  return errorValue;
 }
 
 async function request(path, options = {}) {
@@ -33,27 +68,35 @@ async function request(path, options = {}) {
   let lastError;
 
   for (let attempt = 0; attempt <= ANDROID_LOCAL_BACKEND_RETRY_DELAYS_MS.length; attempt += 1) {
+    // A controller cannot be reused once aborted, so each attempt gets its own.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
-      const res = await fetch(url, requestOptions);
+      const res = await fetch(url, { ...requestOptions, signal: controller.signal });
 
       if (!res.ok) {
         const text = await res.text();
         throw new Error(`HTTP ${res.status}: ${text}`);
       }
 
-      return res.json();
+      return await res.json();
     } catch (errorValue) {
-      lastError = errorValue;
+      const described = describeRequestError(errorValue, url);
+      lastError = described;
       const shouldRetry =
         IS_ANDROID_LOCAL_BACKEND &&
         attempt < ANDROID_LOCAL_BACKEND_RETRY_DELAYS_MS.length &&
-        isTransientAndroidLocalBackendError(errorValue);
+        isTransientAndroidLocalBackendError(described);
 
       if (!shouldRetry) {
-        throw errorValue;
+        throw described;
       }
 
       await sleep(ANDROID_LOCAL_BACKEND_RETRY_DELAYS_MS[attempt]);
+    } finally {
+      // Always cleared: leaving it pending would abort a later, unrelated request on a
+      // reused controller, and keeps a timer alive for every request the app makes.
+      clearTimeout(timeoutId);
     }
   }
 
