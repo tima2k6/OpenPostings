@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   ActivityIndicator,
   AppRegistry,
+  AppState,
   FlatList,
   Image,
   Linking,
@@ -59,6 +60,19 @@ const POSTING_SORT_OPTIONS = [
   { value: "recent", label: "Recently synced" },
   { value: "company_asc", label: "Company A-Z" }
 ];
+
+// A backgrounded tab or app has no one looking at it, but its polling intervals keep
+// firing: every open tab was pulling a full postings page every refresh cycle, so load
+// scaled with how many tabs existed rather than with how many were being used. The
+// server is single-threaded on one SQLite connection and shares it with the sync, so
+// those idle polls compete with the reads someone is actually waiting on.
+function isAppForeground() {
+  if (Platform.OS === "web") {
+    if (typeof document === "undefined") return true;
+    return document.visibilityState !== "hidden";
+  }
+  return AppState.currentState !== "background";
+}
 
 const PAGE_KEYS = {
   POSTINGS: "postings",
@@ -1370,6 +1384,7 @@ export default function App() {
   const [postingFilterOptionsLoading, setPostingFilterOptionsLoading] = useState(false);
   const [postingsFilterPanelOpen, setPostingsFilterPanelOpen] = useState(false);
   const [showPostingDescriptions, setShowPostingDescriptions] = useState(true);
+  const showPostingDescriptionsRef = useRef(showPostingDescriptions);
   const [postings, setPostings] = useState([]);
   const [applications, setApplications] = useState([]);
   const [applicationsLoading, setApplicationsLoading] = useState(false);
@@ -1694,7 +1709,10 @@ export default function App() {
     }
     setError("");
     try {
-      const response = await fetchPostings(q, FRONTEND_POSTINGS_FETCH_LIMIT, 0, filters);
+      const response = await fetchPostings(q, FRONTEND_POSTINGS_FETCH_LIMIT, 0, {
+        ...filters,
+        include_descriptions: showPostingDescriptionsRef.current
+      });
       if (requestSequence !== postingsRequestSequenceRef.current) {
         return;
       }
@@ -2601,6 +2619,39 @@ export default function App() {
     postingsFiltersRef.current = postingsFilters;
   }, [postingsFilters]);
 
+  // Pausing the poll while hidden means a tab can come back arbitrarily stale, so becoming
+  // visible triggers one immediate refresh. That is strictly cheaper than the polling it
+  // replaces: one fetch per time the tab is looked at, instead of one per minute forever.
+  useEffect(() => {
+    if (!filtersHydrated) return;
+
+    const refreshIfForeground = () => {
+      if (!isAppForeground()) return;
+      if (postingsRefreshInFlightRef.current) return;
+      loadPostings(searchRef.current, { silent: true, filters: postingsFiltersRef.current });
+    };
+
+    if (Platform.OS === "web") {
+      if (typeof document === "undefined") return undefined;
+      document.addEventListener("visibilitychange", refreshIfForeground);
+      return () => document.removeEventListener("visibilitychange", refreshIfForeground);
+    }
+
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state === "active") refreshIfForeground();
+    });
+    return () => subscription.remove();
+  }, [filtersHydrated, loadPostings]);
+
+  // The toggle changes what the server is asked to send, not just what is rendered, so a
+  // refetch is needed when it flips: turning descriptions back on has to go get them.
+  useEffect(() => {
+    const previous = showPostingDescriptionsRef.current;
+    showPostingDescriptionsRef.current = showPostingDescriptions;
+    if (!filtersHydrated || previous === showPostingDescriptions) return;
+    loadPostings(searchRef.current, { silent: true, filters: postingsFiltersRef.current });
+  }, [showPostingDescriptions, filtersHydrated, loadPostings]);
+
   useEffect(() => {
     if (Platform.OS !== "windows") return undefined;
 
@@ -2724,6 +2775,9 @@ export default function App() {
   useEffect(() => {
     const id = setInterval(async () => {
       if (statusPollInFlightRef.current) return;
+      // Nothing is being displayed, so nothing needs fetching. The visibilitychange
+      // listener below catches up the moment the tab is looked at again.
+      if (!isAppForeground()) return;
 
       statusPollInFlightRef.current = true;
       try {
