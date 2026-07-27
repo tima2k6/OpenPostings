@@ -694,15 +694,19 @@ function hasStateCodeSlugMatch(locationText, code) {
 // Portland, OR" flattens into one list, and a whole-string rule would drop its genuine WA
 // match. This also subsumes the Washington/DC case, though the explicit DC guards below
 // stay for the fused spellings ("washingtondc") that never produce a clean segment.
+// Built once. This runs per segment per row, and a location filter with no search term
+// has to consider every visible posting -- rebuilding the pair list on each call turned
+// one allocation into tens of millions across a single request.
+const STATE_NAME_TO_CODE = new Map(
+  Object.entries(STATE_CODE_TO_NAME).map(([code, name]) => [name, code])
+);
+
 function isDifferentState(segment, code) {
   const segmentCode = String(segment || "").trim().toUpperCase();
   if (STATE_CODE_TO_NAME[segmentCode] && segmentCode !== code) return true;
 
-  const segmentName = normalizeGeoText(segment);
-  for (const [otherCode, otherName] of Object.entries(STATE_CODE_TO_NAME)) {
-    if (otherCode !== code && segmentName === otherName) return true;
-  }
-  return false;
+  const matchedCode = STATE_NAME_TO_CODE.get(normalizeGeoText(segment));
+  return Boolean(matchedCode) && matchedCode !== code;
 }
 
 function isNonUsCountry(segment) {

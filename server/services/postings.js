@@ -1,7 +1,7 @@
 const { normalizePostingSort } = require("../helpers/normalize-strings");
 const { normalizeAtsFilters, normalizeAtsFilterValue, inferAtsFromJobPostingUrl, inferPostingLocationFromJobUrl  } = require("../helpers/normalize-ats");
 const { normalizeStringArray, normalizeLikeText, normalizeAppliedByType, normalizeAppliedByLabel, normalizeIgnoredByLabel, cleanHtmlText } = require("../helpers/normalize-strings");
-const { normalizeCompensationType, normalizeCompensationPayPeriod, normalizeEducationLevels, parseEducationLevels, normalizeCompensationCurrencyCode, parseCountyFilters, parseCountryFilters, parseRegionFilters, normalizeRemoteFilters, buildIndustryMatchersByKey, rowMatchesIndustryLikeParts, rowMatchesEducationFilter, rowMatchesCompensationFilter, rowMatchesCompensationRangeFilter, rowMatchesLocationFilters, rowMatchesRemoteFilter, buildDefaultCountryFilterOptions, inferLocationGeo, LOCATION_REGION_OPTIONS } = require("../helpers/description-filters");
+const { normalizeCompensationType, normalizeCompensationPayPeriod, normalizeEducationLevels, parseEducationLevels, normalizeCompensationCurrencyCode, parseCountyFilters, parseCountryFilters, parseRegionFilters, normalizeRemoteFilters, buildIndustryMatchersByKey, rowMatchesIndustryLikeParts, rowMatchesEducationFilter, rowMatchesCompensationFilter, rowMatchesCompensationRangeFilter, rowMatchesLocationFilters, rowMatchesRemoteFilter, buildDefaultCountryFilterOptions, inferLocationGeo, LOCATION_REGION_OPTIONS, STATE_CODE_TO_NAME } = require("../helpers/description-filters");
 const { normalizePayFilterNumber, normalizeBoolean, parseNonNegativeInteger, nowEpochSeconds, parsePostingDateToEpochSeconds, getPostingFreshnessWindowSeconds } = require("../helpers/normalize-numbers");
 const { inferAshbyLocationFromDescription } = require("../ats/ashby/service.js");
 const { getDb, setDb, getPostingLocationByJobUrl } = require("../services/runtime-context")
@@ -63,7 +63,7 @@ function escapeLikeTerm(term) {
 // narrow silently loses postings. Only filters that can be proven superset-safe against a
 // stored column are included; ats, industry, location and remote all match on values
 // derived at read time (inferred from the URL, joined from companies) and are left to JS.
-function buildCandidatePrefilter({ searchTerms, payMinFilter, payMaxFilter, payPeriods }) {
+function buildCandidatePrefilter({ searchTerms, payMinFilter, payMaxFilter, payPeriods, stateCodes }) {
   const clauses = [];
   const params = [];
 
@@ -101,6 +101,34 @@ function buildCandidatePrefilter({ searchTerms, payMinFilter, payMaxFilter, payP
       clauses.push(`AND (CASE WHEN COALESCE(pay_min, 0) > 0 THEN pay_min ELSE pay_max END) <= ?`);
       params.push(payMaxFilter);
     }
+  }
+
+  // rowMatchesLocationFilters ANDs the state test: when any state is selected, every row it
+  // keeps must satisfy it. A state match needs either the bare code or the full state name
+  // present in the location text, so requiring one of those as a substring is a superset of
+  // what JS keeps -- weak as a filter ("%wa%" also matches Warsaw), but enough to stop a
+  // location-only query from materialising every visible posting.
+  //
+  // Rows with an empty location column are always kept: their enriched value is inferred
+  // from the job URL, which this query cannot see. Getting that wrong would silently drop
+  // every Workday posting, since none of them store a location.
+  if (Array.isArray(stateCodes) && stateCodes.length > 0) {
+    const stateClauses = [];
+    for (const code of stateCodes) {
+      const stateName = STATE_CODE_TO_NAME[String(code || "").trim().toUpperCase()];
+      stateClauses.push(`LOWER(location) LIKE ? ESCAPE '\\'`);
+      params.push(`%${escapeLikeTerm(String(code || "").toLowerCase())}%`);
+      if (stateName) {
+        stateClauses.push(`LOWER(location) LIKE ? ESCAPE '\\'`);
+        params.push(`%${escapeLikeTerm(stateName)}%`);
+      }
+    }
+    clauses.push(`
+      AND (
+        location IS NULL
+        OR TRIM(location) = ''
+        OR ${stateClauses.join("\n        OR ")}
+      )`);
   }
 
   // A row whose pay_period is absent can never be in the selected set, since the JS filter
@@ -495,7 +523,8 @@ async function listPostingsWithFilters(options = {}) {
       searchTerms: search.toLowerCase().split(/\s+/).filter(Boolean),
       payMinFilter,
       payMaxFilter,
-      payPeriods
+      payPeriods,
+      stateCodes
     });
     rows = await db.all(
       `
