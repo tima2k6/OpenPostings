@@ -116,7 +116,10 @@ async function computeFacets(input = {}) {
     hidden: rows.length - visible,
     with_pay: withPay,
     facets: {
-      states: top(byState),
+      // Every state that appears, not the top N. States are a bounded set, and truncating
+      // by count means anyone outside the few biggest markets never sees their own state
+      // to click -- the list is dominated by CA/TX/NY long before WA shows up.
+      states: top(byState, 60),
       companies: top(byCompany),
       title_words: top(byWord),
       ats: top(byAts, 8)
