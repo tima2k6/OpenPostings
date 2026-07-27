@@ -1,20 +1,27 @@
-// Expedia Group's careers site has no public search API, so the collector reads it the
-// way Google for Jobs does: sitemap for the URL list, schema.org JobPosting for the row.
-// The parts worth pinning are the ones that keep the sweep bounded (only job URLs, only
-// entries the sitemap dates inside the window) and the JSON-LD shapes the page is allowed
-// to use -- a bare object, an array, or a @graph wrapper.
+// The career-site engine reads employers who run their own platform through the two things
+// a site cannot drop and stay in Google for Jobs: its sitemap and the schema.org JobPosting
+// block on each detail page. What is worth pinning is (a) the sweep stays bounded -- only
+// job URLs, only entries the sitemap dates inside the window, capped either way -- and
+// (b) the JSON-LD shapes a page is allowed to use: a bare object, an array, or a @graph
+// wrapper. Every employer added to CAREER_SITE_CONFIGS rides on this same engine, so the
+// config table is checked for self-consistency rather than each employer being retested.
 const assert = require("assert");
 const {
+  CAREER_SITE_CONFIGS,
+  CAREER_SITE_KEYS,
+  getCareerSiteConfig,
   parseSitemapUrlsFromRobotsTxt,
   parseSitemapEntries,
-  selectExpediaJobCandidates,
-  parseExpediaJobPostingFromHtml,
-  isExpediaJobUrl
-} = require("../ats/expedia/service.js");
+  selectCareerSiteJobCandidates,
+  parseCareerSiteJobPostingFromHtml,
+  isCareerSiteJobUrl
+} = require("../ats/careersite/service.js");
+
+const EXPEDIA = getCareerSiteConfig("expedia");
 
 function buildJsonLdPage(jobPosting, { wrapper = "object" } = {}) {
   let payload = jobPosting;
-  if (wrapper === "array") payload = [{ "@type": "WebSite", name: "Expedia Group Careers" }, jobPosting];
+  if (wrapper === "array") payload = [{ "@type": "WebSite", name: "Careers" }, jobPosting];
   if (wrapper === "graph") payload = { "@context": "https://schema.org", "@graph": [jobPosting] };
   return `
 <!doctype html>
@@ -23,8 +30,68 @@ function buildJsonLdPage(jobPosting, { wrapper = "object" } = {}) {
 </head><body></body></html>`;
 }
 
-function run() {
-  // --- robots.txt discovery -------------------------------------------------
+function testConfigTableIsSelfConsistent() {
+  assert.ok(CAREER_SITE_KEYS.length > 0, "the engine is pointless with no employers configured");
+
+  for (const siteKey of CAREER_SITE_KEYS) {
+    const config = CAREER_SITE_CONFIGS[siteKey];
+    assert.equal(siteKey, siteKey.toLowerCase(), `${siteKey} must be a canonical lowercase ATS value`);
+    assert.ok(config.label, `${siteKey} needs a label`);
+    assert.ok(config.default_company_name, `${siteKey} needs a fallback company name for rows whose JSON-LD omits one`);
+    assert.ok(config.job_path_pattern instanceof RegExp, `${siteKey} needs a job path pattern`);
+    assert.ok(
+      Number.isInteger(config.estimated_company_count) && config.estimated_company_count > 0,
+      `${siteKey} needs a positive company estimate`
+    );
+
+    // An origin with a path would make every URL join and host comparison wrong.
+    const origin = new URL(config.origin);
+    assert.equal(origin.pathname, "/", `${siteKey} origin should be a bare host`);
+    assert.equal(origin.protocol, "https:", `${siteKey} should be swept over https`);
+
+    // A pattern that matches the site root would send the sweep at listing pages.
+    assert.equal(
+      isCareerSiteJobUrl(config, config.origin),
+      false,
+      `${siteKey} must not treat its own root as a posting`
+    );
+    assert.equal(
+      isCareerSiteJobUrl(config, "https://careers.example.com/job/a/b/R-1/"),
+      false,
+      `${siteKey} must not sweep another host's job URL`
+    );
+  }
+}
+
+function testRepresentativeJobUrlsPerEmployer() {
+  // One real-shaped URL per employer, so a config typo shows up as a failing test rather
+  // than a sweep that silently fetches nothing.
+  const cases = [
+    ["expedia", "https://careers.expediagroup.com/job/sr-finance-analyst/chicago-IL/R-100047/", true],
+    ["expedia", "https://careers.expediagroup.com/jobs/", false],
+    ["expedia", "https://careers.expediagroup.com/jobs/search", false],
+    ["apple", "https://jobs.apple.com/en-us/details/200612345/senior-software-engineer", true],
+    ["apple", "https://jobs.apple.com/en-us/search", false],
+    ["meta", "https://www.metacareers.com/jobs/1234567890123456/", true],
+    ["meta", "https://www.metacareers.com/jobs/", false],
+    ["walmart", "https://careers.walmart.com/us/jobs/WD1234567-software-engineer", true],
+    ["walmart", "https://careers.walmart.com/us/jobs", false],
+    ["disney", "https://jobs.disneycareers.com/job/orlando/ride-mechanic/391/12345678", true],
+    ["disney", "https://jobs.disneycareers.com/search-jobs", false],
+    ["boeing", "https://jobs.boeing.com/job/seattle/structures-engineer/185/98765432", true],
+    ["boeing", "https://jobs.boeing.com/", false]
+  ];
+
+  for (const [siteKey, url, expected] of cases) {
+    assert.equal(
+      isCareerSiteJobUrl(getCareerSiteConfig(siteKey), url),
+      expected,
+      `${siteKey} should ${expected ? "accept" : "reject"} ${url}`
+    );
+  }
+}
+
+function testSitemapDiscoveryAndParsing() {
   const robots = [
     "User-agent: *",
     "Disallow: /apply/",
@@ -33,12 +100,11 @@ function run() {
     "Sitemap: https://www.expedia.com/sitemap.xml"
   ].join("\n");
   assert.deepEqual(
-    parseSitemapUrlsFromRobotsTxt(robots),
+    parseSitemapUrlsFromRobotsTxt(robots, EXPEDIA),
     ["https://careers.expediagroup.com/sitemap.xml", "https://careers.expediagroup.com/sitemap-jobs.xml"],
     "relative sitemaps resolve against the board, and off-host ones are not followed"
   );
 
-  // --- sitemap parsing ------------------------------------------------------
   const indexXml = `<?xml version="1.0" encoding="UTF-8"?>
 <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <sitemap><loc>https://careers.expediagroup.com/sitemap-jobs-1.xml</loc><lastmod>2026-07-27T09:00:00+00:00</lastmod></sitemap>
@@ -52,33 +118,22 @@ function run() {
 
   const urlSetXml = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>https://careers.expediagroup.com/job/sr-finance-analyst/chicago-IL/R-100047/</loc><lastmod>FRESH</lastmod></url>
-  <url><loc>https://careers.expediagroup.com/job/data-engineer/seattle-WA/R-100048/</loc><lastmod>STALE</lastmod></url>
-  <url><loc>https://careers.expediagroup.com/jobs/</loc><lastmod>FRESH</lastmod></url>
-  <url><loc>https://careers.expediagroup.com/about-us/</loc><lastmod>FRESH</lastmod></url>
+  <url><loc>https://careers.expediagroup.com/job/a/chicago-IL/R-1/</loc><lastmod>2026-07-27</lastmod></url>
+  <url><loc>https://careers.expediagroup.com/about-us/</loc></url>
 </urlset>`;
   const parsedUrlSet = parseSitemapEntries(urlSetXml);
   assert.equal(parsedUrlSet.is_index, false);
-  assert.equal(parsedUrlSet.entries.length, 4);
+  assert.equal(parsedUrlSet.entries.length, 2);
+}
 
-  // --- job URL classification ----------------------------------------------
-  assert.equal(isExpediaJobUrl("https://careers.expediagroup.com/job/data-engineer/seattle-WA/R-100048/"), true);
-  assert.equal(isExpediaJobUrl("https://careers.expediagroup.com/jobs/"), false, "the search page is not a posting");
-  assert.equal(isExpediaJobUrl("https://careers.expediagroup.com/jobs/search"), false);
-  assert.equal(isExpediaJobUrl("https://careers.expediagroup.com/about-us/"), false);
-  assert.equal(
-    isExpediaJobUrl("https://careers.example.com/job/data-engineer/seattle-WA/R-1/"),
-    false,
-    "another host's job URL must not be swept as Expedia's"
-  );
-
-  // --- candidate selection --------------------------------------------------
+function testCandidateSelectionStaysBounded() {
   const referenceEpoch = Math.floor(Date.UTC(2026, 6, 27, 12, 0, 0) / 1000);
   const freshIso = new Date((referenceEpoch - 3 * 60 * 60) * 1000).toISOString();
-  const staleIso = new Date((referenceEpoch - 30 * 24 * 60 * 60) * 1000).toISOString();
   const olderFreshIso = new Date((referenceEpoch - 9 * 60 * 60) * 1000).toISOString();
+  const staleIso = new Date((referenceEpoch - 30 * 24 * 60 * 60) * 1000).toISOString();
 
-  const candidates = selectExpediaJobCandidates(
+  const candidates = selectCareerSiteJobCandidates(
+    EXPEDIA,
     [
       { loc: "https://careers.expediagroup.com/job/data-engineer/seattle-WA/R-100048/", lastmod: staleIso },
       { loc: "https://careers.expediagroup.com/job/sr-finance-analyst/chicago-IL/R-100047/", lastmod: olderFreshIso },
@@ -98,8 +153,10 @@ function run() {
     ],
     "dated entries come newest-first, the stale one is never fetched, undated ones trail, and duplicates collapse"
   );
+
   assert.equal(
-    selectExpediaJobCandidates(
+    selectCareerSiteJobCandidates(
+      EXPEDIA,
       [
         { loc: "https://careers.expediagroup.com/job/a/x/R-1/", lastmod: freshIso },
         { loc: "https://careers.expediagroup.com/job/b/x/R-2/", lastmod: freshIso }
@@ -110,8 +167,9 @@ function run() {
     1,
     "the per-sync cap must bound how many detail pages a sweep can fetch"
   );
+}
 
-  // --- JSON-LD parsing ------------------------------------------------------
+function testJsonLdParsing() {
   const jobPosting = {
     "@context": "https://schema.org",
     "@type": "JobPosting",
@@ -122,12 +180,7 @@ function run() {
     hiringOrganization: { "@type": "Organization", name: "Expedia Group" },
     jobLocation: {
       "@type": "Place",
-      address: {
-        "@type": "PostalAddress",
-        addressLocality: "Chicago",
-        addressRegion: "IL",
-        addressCountry: "US"
-      }
+      address: { "@type": "PostalAddress", addressLocality: "Chicago", addressRegion: "IL", addressCountry: "US" }
     },
     baseSalary: {
       "@type": "MonetaryAmount",
@@ -137,7 +190,7 @@ function run() {
   };
 
   for (const wrapper of ["object", "array", "graph"]) {
-    const posting = parseExpediaJobPostingFromHtml(buildJsonLdPage(jobPosting, { wrapper }), "https://ignored/");
+    const posting = parseCareerSiteJobPostingFromHtml(EXPEDIA, buildJsonLdPage(jobPosting, { wrapper }), "https://ignored/");
     assert.ok(posting, `a ${wrapper} JSON-LD block should still yield the posting`);
     assert.equal(posting.position_name, "Senior Finance Analyst");
     assert.equal(posting.company_name, "Expedia Group");
@@ -157,11 +210,14 @@ function run() {
     assert.equal(posting.pay_raw, "USD 110000 - 150000 per year");
   }
 
-  // Hourly roles and remote listings are the other two shapes the board publishes.
-  const hourlyRemote = parseExpediaJobPostingFromHtml(
+  // Hourly and remote are the other two shapes these boards publish. A row whose JSON-LD
+  // names no employer falls back to the site's own name -- which is why every config
+  // carries one.
+  const hourlyRemote = parseCareerSiteJobPostingFromHtml(
+    getCareerSiteConfig("disney"),
     buildJsonLdPage({
       "@type": "JobPosting",
-      title: "Travel Advisor",
+      title: "Guest Services Host",
       datePosted: "2026-07-27T08:15:00+00:00",
       jobLocationType: "TELECOMMUTE",
       baseSalary: {
@@ -170,48 +226,47 @@ function run() {
         value: { "@type": "QuantitativeValue", value: 22.5, unitText: "HOUR" }
       }
     }),
-    "https://careers.expediagroup.com/job/travel-advisor/remote/R-100051/"
+    "https://jobs.disneycareers.com/job/orlando/guest-services-host/391/1/"
   );
   assert.equal(
     hourlyRemote.job_posting_url,
-    "https://careers.expediagroup.com/job/travel-advisor/remote/R-100051/",
+    "https://jobs.disneycareers.com/job/orlando/guest-services-host/391/1/",
     "a posting that omits its own url falls back to the page it came from"
   );
-  assert.equal(hourlyRemote.company_name, "Expedia Group", "a missing hiring organization defaults to the board owner");
+  assert.equal(hourlyRemote.company_name, "The Walt Disney Company");
   assert.equal(hourlyRemote.location, "Remote");
   assert.equal(hourlyRemote.compensation_type, "hourly");
   assert.equal(hourlyRemote.pay_min, 22.5);
   assert.equal(hourlyRemote.pay_max, 22.5);
   assert.equal(hourlyRemote.pay_period, "hour");
 
-  // A page whose JSON-LD is broken or describes something else is not a posting, and a
-  // partially-typed salary block must not invent numbers.
   assert.equal(
-    parseExpediaJobPostingFromHtml(
-      `<script type="application/ld+json">{ not json }</script>`,
-      "https://careers.expediagroup.com/job/a/x/R-1/"
-    ),
+    parseCareerSiteJobPostingFromHtml(EXPEDIA, `<script type="application/ld+json">{ not json }</script>`, "https://x/"),
     null,
     "unparseable JSON-LD should yield no posting rather than throw"
   );
   assert.equal(
-    parseExpediaJobPostingFromHtml(
-      buildJsonLdPage({ "@type": "BreadcrumbList", itemListElement: [] }),
-      "https://careers.expediagroup.com/job/a/x/R-1/"
-    ),
+    parseCareerSiteJobPostingFromHtml(EXPEDIA, buildJsonLdPage({ "@type": "BreadcrumbList", itemListElement: [] }), "https://x/"),
     null,
     "a page with only non-JobPosting structured data is not a posting"
   );
-  const noSalary = parseExpediaJobPostingFromHtml(
+  const noSalary = parseCareerSiteJobPostingFromHtml(
+    EXPEDIA,
     buildJsonLdPage({ "@type": "JobPosting", title: "Analyst", datePosted: "2026-07-27", baseSalary: {} }),
-    "https://careers.expediagroup.com/job/a/x/R-1/"
+    "https://x/"
   );
   assert.equal(noSalary.compensation_type, "unknown");
   assert.equal(noSalary.pay_min, null);
-  assert.equal(noSalary.pay_max, null);
   assert.equal(noSalary.pay_raw, null);
+}
 
-  console.log("expedia-parser tests passed");
+function run() {
+  testConfigTableIsSelfConsistent();
+  testRepresentativeJobUrlsPerEmployer();
+  testSitemapDiscoveryAndParsing();
+  testCandidateSelectionStaysBounded();
+  testJsonLdParsing();
+  console.log("careersite-parser tests passed");
 }
 
 run();

@@ -96,7 +96,12 @@ const { collectPostingsForCaloppsDynamic, CALOPPS_ESTIMATED_COMPANY_COUNT } = re
 const { collectPostingsForStatejobsnyDynamic, STATEJOBSNY_ESTIMATED_COMPANY_COUNT } = require("../ats/statejobsny/service.js");
 const { collectPostingsForHcareersDynamic, HCAREERS_ESTIMATED_COMPANY_COUNT } = require("../ats/hcareers/service.js");
 const { collectPostingsForAmazonDynamic, AMAZON_ESTIMATED_COMPANY_COUNT } = require("../ats/amazon/service.js");
-const { collectPostingsForExpediaDynamic, EXPEDIA_ESTIMATED_COMPANY_COUNT } = require("../ats/expedia/service.js");
+const {
+  CAREER_SITE_CONFIGS,
+  CAREER_SITE_KEYS,
+  collectPostingsForCareerSiteDynamic,
+  getCareerSiteEstimatedCompanyCount
+} = require("../ats/careersite/service.js");
 const { collectPostingsForMicrosoftDynamic, MICROSOFT_ESTIMATED_COMPANY_COUNT } = require("../ats/microsoft/service.js");
 
 const syncStatus = {
@@ -626,15 +631,12 @@ async function collectPostingsForCompany(company, options = {}) {
   ) {
     return collectPostingsForAmazonDynamic();
   }
-  if (
-    atsName === "expedia" ||
-    atsName === "expediagroup" ||
-    atsName === "expediagroup.com" ||
-    atsName === "expediagroupcom" ||
-    atsName === "careers.expediagroup.com" ||
-    atsName === "careersexpediagroupcom"
-  ) {
-    return collectPostingsForExpediaDynamic();
+  // Every employer read through the shared sitemap/JSON-LD engine dispatches by its own
+  // key, so adding one there needs no branch here. Host spellings ("careers.walmart.com")
+  // are folded onto the key first, the way the hand-written branches above accept theirs.
+  const careerSiteKey = normalizeAtsFilterValue(atsName);
+  if (CAREER_SITE_KEYS.includes(careerSiteKey)) {
+    return collectPostingsForCareerSiteDynamic(careerSiteKey);
   }
   if (
     atsName === "microsoft" ||
@@ -806,15 +808,17 @@ const BOARD_WIDE_SYNC_TARGETS = [
     ATS_name: "amazon"
   },
   {
-    company_name: "Expedia Group (dynamic)",
-    url_string: "https://careers.expediagroup.com/sitemap.xml",
-    ATS_name: "expedia"
-  },
-  {
     company_name: "Microsoft Careers (dynamic)",
     url_string: "https://gcsservices.careers.microsoft.com/search/api/v1/search?o=Recent",
     ATS_name: "microsoft"
-  }
+  },
+  // Employers read through the shared sitemap/JSON-LD engine. Listing them from the config
+  // keeps this table and the collector from drifting apart as employers are added.
+  ...CAREER_SITE_KEYS.map((siteKey) => ({
+    company_name: `${CAREER_SITE_CONFIGS[siteKey].label} (dynamic)`,
+    url_string: `${CAREER_SITE_CONFIGS[siteKey].origin}/sitemap.xml`,
+    ATS_name: siteKey
+  }))
 ];
 
 async function runAtsSyncInternal() {
@@ -1565,11 +1569,13 @@ async function getSyncScopeStats() {
   if (enabledAts.has("amazon")) {
     syncEnabledCompanyCount += AMAZON_ESTIMATED_COMPANY_COUNT;
   }
-  if (enabledAts.has("expedia")) {
-    syncEnabledCompanyCount += EXPEDIA_ESTIMATED_COMPANY_COUNT;
-  }
   if (enabledAts.has("microsoft")) {
     syncEnabledCompanyCount += MICROSOFT_ESTIMATED_COMPANY_COUNT;
+  }
+  for (const siteKey of CAREER_SITE_KEYS) {
+    if (enabledAts.has(siteKey)) {
+      syncEnabledCompanyCount += getCareerSiteEstimatedCompanyCount(siteKey);
+    }
   }
 
   return {

@@ -151,6 +151,11 @@ Current sync support includes:
 - `Amazon Jobs`
 - `Expedia Group`
 - `Microsoft Careers`
+- `Apple`
+- `Meta`
+- `Walmart`
+- `Disney`
+- `Boeing`
 - `prismhr`
 - `silkroad`
 - `paycor`

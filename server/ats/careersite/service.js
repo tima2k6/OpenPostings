@@ -7,27 +7,86 @@ const {
 const { normalizeCompensationPayPeriod, normalizeCompensationCurrencyCode } = require("../../helpers/description-filters");
 const { fetchWithAtsRateLimit } = require("../../services/queue");
 
-const EXPEDIA_RATE_LIMIT_WAIT_MS = 60 * 1000;
-const EXPEDIA_BASE_ORIGIN = "https://careers.expediagroup.com";
-const EXPEDIA_ROBOTS_URL = `${EXPEDIA_BASE_ORIGIN}/robots.txt`;
-const EXPEDIA_FALLBACK_SITEMAP_URL = `${EXPEDIA_BASE_ORIGIN}/sitemap.xml`;
+const CAREER_SITE_RATE_LIMIT_WAIT_MS = 60 * 1000;
 const MAX_SITEMAPS_PER_SYNC = 12;
-// Every candidate costs one detail fetch, so the sweep is capped even if the board
-// republishes its whole sitemap with a fresh lastmod.
+// Every candidate costs one detail fetch, so a sweep is capped even if a site republishes
+// its whole sitemap with a fresh lastmod.
 const MAX_JOB_PAGES_PER_SYNC = 200;
-// Expedia Group posts for its brands -- Expedia, Vrbo, Hotels.com, Egencia, Expedia
-// Partner Solutions and the rest -- under one careers site, which is what the estimate
-// counts. Nothing here aggregates outside employers.
-const EXPEDIA_ESTIMATED_COMPANY_COUNT = 8;
 
-// The careers site is a marketing front end whose search endpoint is a vendor-private URL
-// that changes whenever the vendor does. The sitemap and the schema.org JobPosting block
-// on each detail page are not: Google for Jobs requires both, so they are the stable
-// contract to read the board through.
-function parseSitemapUrlsFromRobotsTxt(robotsText, baseOrigin = EXPEDIA_BASE_ORIGIN) {
+// Large employers who run their own careers platform have no ATS vendor host to seed a
+// company row against, and each one's search endpoint is private and moves when its vendor
+// does. What none of them can drop is the sitemap and the schema.org JobPosting block on
+// each detail page: Google for Jobs requires both, and these employers depend on being
+// indexed there. That standard pair is the contract this collector reads them through, so
+// adding an employer is a config entry rather than another bespoke parser.
+//
+// job_path_pattern is matched against the URL path with any trailing slash removed. Getting
+// it wrong costs wasted detail fetches on listing pages, not bad rows -- a page with no
+// JobPosting block yields nothing.
+const CAREER_SITE_CONFIGS = Object.freeze({
+  expedia: {
+    label: "Expedia Group",
+    origin: "https://careers.expediagroup.com",
+    job_path_pattern: /^\/jobs?\/(?!search|results|browse|all|categor(?:y|ies)|locations?|teams?)[^/]+/i,
+    default_company_name: "Expedia Group",
+    // Expedia, Vrbo, Hotels.com, Egencia, Expedia Partner Solutions and the rest post here.
+    estimated_company_count: 8
+  },
+  apple: {
+    label: "Apple",
+    origin: "https://jobs.apple.com",
+    job_path_pattern: /^\/[a-z]{2}(?:-[a-z]{2})?\/details\/[^/]+/i,
+    default_company_name: "Apple",
+    estimated_company_count: 1
+  },
+  meta: {
+    label: "Meta",
+    origin: "https://www.metacareers.com",
+    job_path_pattern: /^\/jobs\/\d+/i,
+    default_company_name: "Meta",
+    estimated_company_count: 1
+  },
+  walmart: {
+    label: "Walmart",
+    origin: "https://careers.walmart.com",
+    job_path_pattern: /^\/(?:us\/)?jobs?\/[^/]+/i,
+    default_company_name: "Walmart",
+    // Walmart US, Sam's Club and Walmart Global Tech all post to this site.
+    estimated_company_count: 3
+  },
+  disney: {
+    label: "Disney",
+    origin: "https://jobs.disneycareers.com",
+    job_path_pattern: /^\/job\/[^/]+/i,
+    default_company_name: "The Walt Disney Company",
+    // ESPN, ABC, Marvel, Pixar, Disney Parks and the studios share one board.
+    estimated_company_count: 6
+  },
+  boeing: {
+    label: "Boeing",
+    origin: "https://jobs.boeing.com",
+    job_path_pattern: /^\/job\/[^/]+/i,
+    default_company_name: "Boeing",
+    estimated_company_count: 1
+  }
+});
+
+const CAREER_SITE_KEYS = Object.freeze(Object.keys(CAREER_SITE_CONFIGS));
+
+function getCareerSiteConfig(siteKey) {
+  const config = CAREER_SITE_CONFIGS[String(siteKey || "").trim().toLowerCase()];
+  if (!config) throw new Error(`Unknown career site '${String(siteKey)}'`);
+  return config;
+}
+
+function careerSiteHost(config) {
+  return new URL(config.origin).host.toLowerCase();
+}
+
+function parseSitemapUrlsFromRobotsTxt(robotsText, config) {
   const urls = [];
   const seen = new Set();
-  const expectedHost = new URL(baseOrigin).host.toLowerCase();
+  const expectedHost = careerSiteHost(config);
 
   for (const line of String(robotsText || "").split(/\r?\n/)) {
     const match = line.match(/^\s*sitemap\s*:\s*(\S+)\s*$/i);
@@ -35,7 +94,7 @@ function parseSitemapUrlsFromRobotsTxt(robotsText, baseOrigin = EXPEDIA_BASE_ORI
 
     let resolved = "";
     try {
-      resolved = new URL(match[1], `${baseOrigin}/`).toString();
+      resolved = new URL(match[1], `${config.origin}/`).toString();
     } catch {
       continue;
     }
@@ -70,10 +129,7 @@ function parseSitemapEntries(xml) {
   return { is_index: isIndex, entries };
 }
 
-// Detail pages sit under /job/<title>/<location>/<requisition-id>/, while /jobs/ and its
-// facet pages are the search UI. Anything with no segment past the /job(s)/ prefix, or
-// whose first segment names a listing view, is not a posting.
-function isExpediaJobUrl(value) {
+function isCareerSiteJobUrl(config, value) {
   const url = String(value || "").trim();
   if (!url) return false;
 
@@ -83,25 +139,28 @@ function isExpediaJobUrl(value) {
   } catch {
     return false;
   }
-  if (parsed.host.toLowerCase() !== new URL(EXPEDIA_BASE_ORIGIN).host.toLowerCase()) return false;
+  if (parsed.host.toLowerCase() !== careerSiteHost(config)) return false;
 
-  const remainder = parsed.pathname.replace(/\/+$/, "").match(/^\/jobs?\/(.+)$/i)?.[1] || "";
-  if (!remainder) return false;
-  return !/^(search|results|browse|all|categor(?:y|ies)|locations?|teams?)(\/|$)/i.test(remainder);
+  return config.job_path_pattern.test(parsed.pathname.replace(/\/+$/, ""));
 }
 
 // Job detail pages are only worth fetching when the sitemap says the page changed inside
-// the freshness window. Entries the board leaves undated sort last and are only reached
-// when the cap has room, so an undated sitemap degrades to a bounded sweep instead of
-// either a full crawl or nothing at all.
-function selectExpediaJobCandidates(entries, referenceEpoch = nowEpochSeconds(), limit = MAX_JOB_PAGES_PER_SYNC) {
+// the freshness window. Entries a site leaves undated sort last and are only reached when
+// the cap has room, so an undated sitemap degrades to a bounded sweep instead of either a
+// full crawl or nothing at all.
+function selectCareerSiteJobCandidates(
+  config,
+  entries,
+  referenceEpoch = nowEpochSeconds(),
+  limit = MAX_JOB_PAGES_PER_SYNC
+) {
   const seen = new Set();
   const dated = [];
   const undated = [];
 
   for (const entry of Array.isArray(entries) ? entries : []) {
     const loc = String(entry?.loc || "").trim();
-    if (!isExpediaJobUrl(loc) || seen.has(loc)) continue;
+    if (!isCareerSiteJobUrl(config, loc) || seen.has(loc)) continue;
     seen.add(loc);
 
     const lastmod = String(entry?.lastmod || "").trim();
@@ -172,7 +231,7 @@ function extractSchemaOrgName(value) {
   return cleanHtmlText(value?.name);
 }
 
-function buildExpediaLocation(jobPosting) {
+function buildCareerSiteLocation(jobPosting) {
   const locations = Array.isArray(jobPosting?.jobLocation) ? jobPosting.jobLocation : [jobPosting?.jobLocation];
   for (const location of locations) {
     const address = location?.address;
@@ -201,7 +260,7 @@ function toPositiveNumber(value) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
-function extractExpediaCompensation(jobPosting) {
+function extractCareerSiteCompensation(jobPosting) {
   const empty = {
     compensation_type: "unknown",
     pay_min: null,
@@ -245,23 +304,22 @@ function extractExpediaCompensation(jobPosting) {
   };
 }
 
-function parseExpediaJobPostingFromHtml(html, pageUrl) {
+function parseCareerSiteJobPostingFromHtml(config, html, pageUrl) {
   const jobPosting = extractJsonLdObjects(html).find((object) => isJobPostingObject(object));
   if (!jobPosting) return null;
 
   const jobPostingUrl = String(cleanHtmlText(jobPosting?.url) || pageUrl || "").trim();
   if (!jobPostingUrl) return null;
 
-  const compensation = extractExpediaCompensation(jobPosting);
-  const description = cleanHtmlText(jobPosting?.description) || null;
+  const compensation = extractCareerSiteCompensation(jobPosting);
 
   return {
-    company_name: extractSchemaOrgName(jobPosting?.hiringOrganization) || "Expedia Group",
+    company_name: extractSchemaOrgName(jobPosting?.hiringOrganization) || config.default_company_name,
     position_name: cleanHtmlText(jobPosting?.title) || "Untitled Position",
     job_posting_url: jobPostingUrl,
     posting_date: cleanHtmlText(jobPosting?.datePosted) || null,
-    location: buildExpediaLocation(jobPosting),
-    job_description: description,
+    location: buildCareerSiteLocation(jobPosting),
+    job_description: cleanHtmlText(jobPosting?.description) || null,
     compensation_type: compensation.compensation_type,
     pay_min: compensation.pay_min,
     pay_max: compensation.pay_max,
@@ -271,44 +329,43 @@ function parseExpediaJobPostingFromHtml(html, pageUrl) {
   };
 }
 
-async function fetchExpediaText(rateLimitKey, url, accept) {
-  const res = await fetchWithAtsRateLimit("expedia", EXPEDIA_RATE_LIMIT_WAIT_MS, url, {
+async function fetchCareerSiteText(siteKey, requestKind, url, accept) {
+  const res = await fetchWithAtsRateLimit(siteKey, CAREER_SITE_RATE_LIMIT_WAIT_MS, url, {
     method: "GET",
     headers: {
       Accept: accept,
       "Accept-Language": "en-US,en;q=0.9",
-      Referer: `${EXPEDIA_BASE_ORIGIN}/`,
       "User-Agent": DEFAULT_BROWSER_USER_AGENT
     }
   });
 
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Expedia ${rateLimitKey} request failed (${res.status}): ${body.slice(0, 180)}`);
+    throw new Error(`${siteKey} ${requestKind} request failed (${res.status}): ${body.slice(0, 180)}`);
   }
 
   return res.text();
 }
 
-async function discoverExpediaSitemapUrls() {
+async function discoverCareerSiteSitemapUrls(siteKey, config) {
   let robotsText = "";
   try {
-    robotsText = await fetchExpediaText("robots", EXPEDIA_ROBOTS_URL, "text/plain,*/*");
+    robotsText = await fetchCareerSiteText(siteKey, "robots", `${config.origin}/robots.txt`, "text/plain,*/*");
   } catch {
     // A missing or blocked robots.txt only costs the discovery shortcut; the conventional
     // sitemap location still has to be tried before the sweep can be called a failure.
     robotsText = "";
   }
 
-  const advertised = parseSitemapUrlsFromRobotsTxt(robotsText);
-  return advertised.length > 0 ? advertised : [EXPEDIA_FALLBACK_SITEMAP_URL];
+  const advertised = parseSitemapUrlsFromRobotsTxt(robotsText, config);
+  return advertised.length > 0 ? advertised : [`${config.origin}/sitemap.xml`];
 }
 
-// Sitemap indexes point at child sitemaps; job URLs live one level down. Children whose
-// own lastmod is outside the window are skipped, and job-named children are preferred so
-// the per-sync sitemap budget is not spent on the site's marketing pages.
-async function collectExpediaSitemapEntries(referenceEpoch) {
-  const pending = await discoverExpediaSitemapUrls();
+// Sitemap indexes point at child sitemaps; job URLs live one level down. Children whose own
+// lastmod is outside the window are skipped, and job-named children are preferred so the
+// per-sync sitemap budget is not spent on a site's marketing pages.
+async function collectCareerSiteSitemapEntries(siteKey, config, referenceEpoch) {
+  const pending = await discoverCareerSiteSitemapUrls(siteKey, config);
   const visited = new Set();
   const entries = [];
   let fetchedSitemaps = 0;
@@ -320,7 +377,7 @@ async function collectExpediaSitemapEntries(referenceEpoch) {
 
     let xml = "";
     try {
-      xml = await fetchExpediaText("sitemap", sitemapUrl, "application/xml,text/xml,*/*");
+      xml = await fetchCareerSiteText(siteKey, "sitemap", sitemapUrl, "application/xml,text/xml,*/*");
     } catch {
       continue;
     }
@@ -344,10 +401,11 @@ async function collectExpediaSitemapEntries(referenceEpoch) {
   return entries;
 }
 
-async function collectPostingsForExpediaDynamic() {
+async function collectPostingsForCareerSiteDynamic(siteKey) {
+  const config = getCareerSiteConfig(siteKey);
   const referenceEpoch = nowEpochSeconds();
-  const sitemapEntries = await collectExpediaSitemapEntries(referenceEpoch);
-  const candidateUrls = selectExpediaJobCandidates(sitemapEntries, referenceEpoch);
+  const sitemapEntries = await collectCareerSiteSitemapEntries(siteKey, config, referenceEpoch);
+  const candidateUrls = selectCareerSiteJobCandidates(config, sitemapEntries, referenceEpoch);
 
   const seenUrls = new Set();
   const postings = [];
@@ -355,13 +413,13 @@ async function collectPostingsForExpediaDynamic() {
   for (const candidateUrl of candidateUrls) {
     let html = "";
     try {
-      html = await fetchExpediaText("job", candidateUrl, "text/html,application/xhtml+xml");
+      html = await fetchCareerSiteText(siteKey, "job", candidateUrl, "text/html,application/xhtml+xml");
     } catch {
       // One unreachable detail page should not abandon the rest of the sweep.
       continue;
     }
 
-    const posting = parseExpediaJobPostingFromHtml(html, candidateUrl);
+    const posting = parseCareerSiteJobPostingFromHtml(config, html, candidateUrl);
     if (!posting) continue;
 
     const postingUrl = String(posting?.job_posting_url || "").trim();
@@ -375,12 +433,19 @@ async function collectPostingsForExpediaDynamic() {
   return postings;
 }
 
+function getCareerSiteEstimatedCompanyCount(siteKey) {
+  return getCareerSiteConfig(siteKey).estimated_company_count;
+}
+
 module.exports = {
-  collectPostingsForExpediaDynamic,
+  CAREER_SITE_CONFIGS,
+  CAREER_SITE_KEYS,
+  getCareerSiteConfig,
+  getCareerSiteEstimatedCompanyCount,
+  collectPostingsForCareerSiteDynamic,
   parseSitemapUrlsFromRobotsTxt,
   parseSitemapEntries,
-  selectExpediaJobCandidates,
-  parseExpediaJobPostingFromHtml,
-  isExpediaJobUrl,
-  EXPEDIA_ESTIMATED_COMPANY_COUNT
+  selectCareerSiteJobCandidates,
+  parseCareerSiteJobPostingFromHtml,
+  isCareerSiteJobUrl
 };

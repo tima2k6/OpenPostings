@@ -1,12 +1,13 @@
-// Amazon, Expedia Group and Microsoft are swept from a single target each, so the thing
-// that keeps a sync affordable is not the parser but where the sweep stops. Amazon and
-// Microsoft page newest-first and must stop at the first page with nothing in the
-// freshness window; Expedia must reach exactly one detail page per fresh sitemap entry and
-// never fetch a stale or non-job URL. All three are checked here against a stubbed fetch,
-// since the real boards are not reachable from a test run.
+// Each employer board is swept from a single target, so the thing that keeps a sync
+// affordable is not the parser but where the sweep stops. Amazon and Microsoft page
+// newest-first and must stop at the first page with nothing in the freshness window; the
+// shared career-site engine must reach exactly one detail page per fresh sitemap entry and
+// never fetch a stale or non-job URL. Expedia stands in for every employer on that engine,
+// since they differ only by config. All of it runs against a stubbed fetch, since the real
+// boards are not reachable from a test run.
 const assert = require("assert");
 const { collectPostingsForAmazonDynamic } = require("../ats/amazon/service.js");
-const { collectPostingsForExpediaDynamic } = require("../ats/expedia/service.js");
+const { collectPostingsForCareerSiteDynamic } = require("../ats/careersite/service.js");
 const { collectPostingsForMicrosoftDynamic } = require("../ats/microsoft/service.js");
 
 function jsonResponse(body) {
@@ -155,7 +156,7 @@ async function testExpediaFetchesOnlyFreshJobPages() {
       }
       throw new Error(`unexpected fetch: ${url}`);
     },
-    () => collectPostingsForExpediaDynamic()
+    () => collectPostingsForCareerSiteDynamic("expedia")
   );
 
   assert.equal(result.length, 1, "only the fresh posting should be stored");
@@ -186,7 +187,7 @@ async function testExpediaFallsBackWhenRobotsIsUnavailable() {
       if (url.endsWith("/sitemap.xml")) return textResponse("<urlset></urlset>");
       throw new Error(`unexpected fetch: ${url}`);
     },
-    () => collectPostingsForExpediaDynamic()
+    () => collectPostingsForCareerSiteDynamic("expedia")
   );
 
   assert.deepEqual(requested, [

@@ -28,7 +28,7 @@
     "test:backend:posting-query-plan": "node server/tests/posting-query-plan.test.js",
     "test:backend:posting-filter-pushdown": "node server/tests/posting-filter-pushdown.test.js",
     "test:backend:amazon-parser": "node server/tests/amazon-parser.test.js",
-    "test:backend:expedia-parser": "node server/tests/expedia-parser.test.js",
+    "test:backend:careersite-parser": "node server/tests/careersite-parser.test.js",
     "test:backend:microsoft-parser": "node server/tests/microsoft-parser.test.js",
     "test:backend:board-sweep-bounds": "node server/tests/board-sweep-bounds.test.js",
     "apply": "./scripts/apply.sh",
