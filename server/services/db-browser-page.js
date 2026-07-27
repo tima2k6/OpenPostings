@@ -49,6 +49,37 @@ const DB_BROWSER_PAGE = `<!doctype html>
   .err { color: #b3261e; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; margin: 10px 0; }
   footer { padding: 0 18px 30px; }
   .hint { font-size: 12px; color: #66798c; margin: 8px 0; }
+  #sort-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 0 8px; }
+  #sort-bar .facet-name { margin-right: 2px; }
+  button.sortbtn { border: 1px solid #c6ceda; background: #fff; color: inherit; border-radius: 999px;
+                   padding: 4px 10px; cursor: pointer; font: inherit; font-size: 12px; }
+  button.sortbtn:hover { border-color: #1f6feb; color: #1f6feb; }
+  button.sortbtn.on { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  @media (prefers-color-scheme: dark) { button.sortbtn { background: #18202a; border-color: #2d3947; }
+                                        button.sortbtn.on { background: #1f6feb; border-color: #1f6feb; } }
+  .plist { list-style: none; margin: 0; padding: 0; border: 1px solid #d3dae2; border-radius: 10px;
+           overflow: hidden; background: #fff; }
+  @media (prefers-color-scheme: dark) { .plist { background: #141c24; border-color: #26313d; } }
+  .pitem { display: grid; grid-template-columns: 1fr auto; grid-template-areas: "title side" "meta side";
+           gap: 1px 12px; padding: 10px 12px; border-bottom: 1px solid #e6ebf1; }
+  @media (prefers-color-scheme: dark) { .pitem { border-color: #222c37; } }
+  .pitem:last-child { border-bottom: none; }
+  .pitem:hover { background: #f2f6fa; }
+  @media (prefers-color-scheme: dark) { .pitem:hover { background: #1a232d; } }
+  .ptitle { grid-area: title; font-weight: 600; text-decoration: none; overflow-wrap: anywhere; }
+  .ptitle:hover { text-decoration: underline; }
+  .pmeta { grid-area: meta; font-size: 12px; color: #66798c; overflow-wrap: anywhere; }
+  @media (prefers-color-scheme: dark) { .pmeta { color: #8b9cb0; } }
+  .pco { font-weight: 500; }
+  .psep { opacity: .5; }
+  .pside { grid-area: side; display: flex; flex-direction: column; align-items: flex-end;
+           justify-content: center; gap: 2px; white-space: nowrap; }
+  .ppay { font-size: 13px; font-weight: 600; }
+  .page { font-size: 11px; color: #7b8794; }
+  .adv { margin-bottom: 10px; }
+  .adv > summary { cursor: pointer; font-size: 12px; font-weight: 600; color: #52606d;
+                   padding: 6px 0; list-style-position: inside; }
+  @media (prefers-color-scheme: dark) { .adv > summary { color: #9fb0c4; } }
   .facet-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
                gap: 10px; margin: 10px 0 14px; }
   .facet-pick { display: flex; flex-direction: column; gap: 4px; }
@@ -92,6 +123,8 @@ const DB_BROWSER_PAGE = `<!doctype html>
   </section>
 
   <section id="panel-postings" hidden>
+    <details class="adv">
+      <summary>Filters (edit by hand)</summary>
     <div class="grid">
       <label>Title has <b>any</b> of<input id="f-title-any" placeholder="manager, director, head of"></label>
       <label>Title has <b>all</b> of<input id="f-title-all" placeholder="operations"></label>
@@ -123,6 +156,7 @@ const DB_BROWSER_PAGE = `<!doctype html>
       <label>ATS<input id="f-ats" placeholder="workday, greenhouse"></label>
       <label>Max rows<input id="f-limit" type="number" value="200"></label>
     </div>
+    </details>
     <p class="hint">Terms are comma-separated. Within a box they are OR-ed; each box is AND-ed with the others &mdash; so <em>any</em>=manager,director with <em>none</em>=assistant gives (manager OR director) AND NOT assistant. Only <b>All rows</b> shows postings the app is currently hiding. <b>State</b> uses real state matching &mdash; "WA" will not match Warwick or Sweetwater the way a location-text search does.</p>
     <div class="row">
       <button class="go" id="posting-go">Run</button>
@@ -134,6 +168,7 @@ const DB_BROWSER_PAGE = `<!doctype html>
     <div class="row" id="saved-row"></div>
     <pre id="posting-sqlout" hidden></pre>
     <div id="facet-out"></div>
+    <div id="sort-bar"></div>
     <div id="posting-out"></div>
   </section>
 
@@ -253,6 +288,79 @@ ORDER BY n DESC</textarea>
       document.getElementById(id).value = state[FIELDS[id]] === undefined ? "" : state[FIELDS[id]];
     });
   }
+  // Mirrors SORTABLE in server/services/db-query.js. Clicking the active field flips the
+  // direction, which is the behaviour a column header would have had before the table was
+  // replaced by a list -- the sort control was otherwise only reachable inside the
+  // collapsed filter form.
+  var SORTS = [
+    { value: "last_seen", label: "Last seen" },
+    { value: "first_seen", label: "First found" },
+    { value: "pay", label: "Pay" },
+    { value: "posted", label: "Posted" },
+    { value: "company", label: "Company" },
+    { value: "position", label: "Position" },
+    { value: "location", label: "Location" }
+  ];
+
+  function renderSortBar() {
+    var current = document.getElementById("f-sort").value || "last_seen";
+    var dir = document.getElementById("f-dir").value || "desc";
+    var bar = document.getElementById("sort-bar");
+    bar.innerHTML = '<span class="facet-name">Sort</span>' + SORTS.map(function (o) {
+      var active = o.value === current;
+      return '<button class="sortbtn' + (active ? " on" : "") + '" data-sort="' + o.value + '">' +
+        o.label + (active ? (dir === "asc" ? " \u25b2" : " \u25bc") : "") + "</button>";
+    }).join("");
+    Array.prototype.forEach.call(bar.querySelectorAll("button.sortbtn"), function (b) {
+      b.addEventListener("click", function () {
+        var picked = b.getAttribute("data-sort");
+        var sortEl = document.getElementById("f-sort");
+        var dirEl = document.getElementById("f-dir");
+        if (sortEl.value === picked) {
+          dirEl.value = dirEl.value === "asc" ? "desc" : "asc";
+        } else {
+          sortEl.value = picked;
+          // Text reads naturally A-Z; recency and pay are wanted highest-first.
+          dirEl.value = (picked === "company" || picked === "position" || picked === "location") ? "asc" : "desc";
+        }
+        run();
+      });
+    });
+  }
+
+  // "3d" carries the same signal as a full timestamp here and costs a tenth of the width.
+  function ago(epoch) {
+    var n = Number(epoch);
+    if (!n) return "";
+    var secs = Math.max(0, Math.floor(Date.now() / 1000) - n);
+    if (secs < 3600) return Math.floor(secs / 60) + "m";
+    if (secs < 86400) return Math.floor(secs / 3600) + "h";
+    return Math.floor(secs / 86400) + "d";
+  }
+
+  // A list rather than a table: nine nowrap columns guaranteed horizontal scrolling, and
+  // two of them were full ISO timestamps. Each posting is one block that reflows, so the
+  // same markup reads on a phone and on a desktop.
+  function postingList(rows) {
+    if (!rows.length) return '<p class="hint">No rows.</p>';
+    return '<ul class="plist">' + rows.map(function (r) {
+      var pay = money(r);
+      return '<li class="pitem">' +
+        '<a class="ptitle" href="' + esc(r.job_posting_url) + '" target="_blank" rel="noopener">' +
+          esc(r.position_name || "Untitled") + "</a>" +
+        '<div class="pmeta">' +
+          (r.hidden ? '<span class="pill warn">hidden</span> ' : "") +
+          '<span class="pco">' + esc(r.company_name) + "</span>" +
+          (r.location ? ' <span class="psep">\u00b7</span> ' + esc(r.location) : "") +
+        "</div>" +
+        '<div class="pside">' +
+          (pay ? '<span class="ppay">' + esc(pay) + "</span>" : "") +
+          '<span class="page" title="last seen">' + ago(r.last_seen_epoch) + "</span>" +
+        "</div>" +
+      "</li>";
+    }).join("") + "</ul>";
+  }
+
   function money(r) {
     var lo = r.pay_min, hi = r.pay_max;
     if (!lo && !hi) return "";
@@ -268,16 +376,8 @@ ORDER BY n DESC</textarea>
         (data.approximate ? "at least " : "") + data.total + " matched \u00b7 " + data.visible +
         " visible, " + (data.total - data.visible) + " hidden \u00b7 showing " + data.shown;
       document.getElementById("posting-sqlout").textContent = data.sql;
-      document.getElementById("posting-out").innerHTML = table(data.rows, {
-        head: "<th>company</th><th>position</th><th>location</th><th>pay</th><th>posted</th><th>state</th><th>first found</th><th>last seen</th><th>link</th>",
-        row: function (r) {
-          return "<td>" + esc(r.company_name) + '</td><td class="wrap">' + esc(r.position_name) +
-            "</td><td>" + esc(r.location) + "</td><td>" + esc(money(r)) + "</td><td>" + esc(r.posting_date) + "</td><td>" +
-            (r.hidden ? '<span class="pill warn">hidden</span>' : '<span class="pill ok">visible</span>') +
-            "</td><td>" + when(r.first_seen_epoch) + "</td><td>" + when(r.last_seen_epoch) +
-            '</td><td><a href="' + esc(r.job_posting_url) + '" target="_blank" rel="noopener">open</a></td>';
-        }
-      });
+      renderSortBar();
+      document.getElementById("posting-out").innerHTML = postingList(data.rows);
     }).catch(function (e) { fail("posting-out", e.message); });
   }
 
