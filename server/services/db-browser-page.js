@@ -49,6 +49,14 @@ const DB_BROWSER_PAGE = `<!doctype html>
   .err { color: #b3261e; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; margin: 10px 0; }
   footer { padding: 0 18px 30px; }
   .hint { font-size: 12px; color: #66798c; margin: 8px 0; }
+  #active-filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 0 10px; }
+  button.afchip { border: 1px solid #1f6feb; background: #eaf1fd; color: #14539a; border-radius: 999px;
+                  padding: 4px 10px; cursor: pointer; font: inherit; font-size: 12px; }
+  button.afchip b { font-weight: 650; }
+  button.afchip:hover { background: #d8e6fb; }
+  button.afclear { border: none; background: none; color: #66798c; cursor: pointer; font: inherit;
+                   font-size: 12px; text-decoration: underline; }
+  @media (prefers-color-scheme: dark) { button.afchip { background: #16243a; border-color: #2b5ea8; color: #9cc4ff; } }
   #sort-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 0 8px; }
   #sort-bar .facet-name { margin-right: 2px; }
   button.sortbtn { border: 1px solid #c6ceda; background: #fff; color: inherit; border-radius: 999px;
@@ -167,6 +175,7 @@ const DB_BROWSER_PAGE = `<!doctype html>
     </div>
     <div class="row" id="saved-row"></div>
     <pre id="posting-sqlout" hidden></pre>
+    <div id="active-filters"></div>
     <div id="facet-out"></div>
     <div id="sort-bar"></div>
     <div id="posting-out"></div>
@@ -323,7 +332,7 @@ ORDER BY n DESC</textarea>
           // Text reads naturally A-Z; recency and pay are wanted highest-first.
           dirEl.value = (picked === "company" || picked === "position" || picked === "location") ? "asc" : "desc";
         }
-        run();
+        run(true);
       });
     });
   }
@@ -399,6 +408,51 @@ ORDER BY n DESC</textarea>
   };
   var FACET_LABEL = { states: "State", title_words: "Title contains", companies: "Company", ats: "ATS" };
 
+  var FILTER_LABEL = {
+    title_any: "Title any", title_all: "Title has", title_none: "Title not",
+    company_any: "Company", company_none: "Company not",
+    states: "State", location_any: "Location", location_none: "Location not",
+    ats: "ATS", pay_min: "Pay \u2265", pay_max: "Pay \u2264",
+    seen_days: "Seen \u2264 d", found_days: "Found \u2264 d", visibility: "Show"
+  };
+
+  // The dropdowns are add-a-filter controls and reset to "any" after each run, which read
+  // as the selection being lost. This shows what is actually applied, and is the place to
+  // remove one -- it also handles fields holding several values, which a single select
+  // cannot represent.
+  function renderActiveFilters() {
+    var state = readFilters();
+    var bar = document.getElementById("active-filters");
+    var parts = [];
+    Object.keys(FILTER_LABEL).forEach(function (key) {
+      var raw = state[key];
+      if (!raw || key === "visibility" && raw === "all") return;
+      String(raw).split(",").map(function (t) { return t.trim(); }).filter(Boolean).forEach(function (term) {
+        parts.push('<button class="afchip" data-key="' + key + '" data-term="' + esc(term) + '">' +
+          FILTER_LABEL[key] + ": <b>" + esc(term) + "</b> &times;</button>");
+      });
+    });
+    bar.innerHTML = parts.length
+      ? '<span class="facet-name">Applied</span>' + parts.join("") +
+        '<button class="afclear">clear all</button>'
+      : "";
+    Array.prototype.forEach.call(bar.querySelectorAll("button.afchip"), function (b) {
+      b.addEventListener("click", function () {
+        var key = b.getAttribute("data-key"), term = b.getAttribute("data-term");
+        var id = Object.keys(FIELDS).filter(function (k) { return FIELDS[k] === key; })[0];
+        var el = document.getElementById(id);
+        var kept = el.value.split(",").map(function (t) { return t.trim(); })
+          .filter(function (t) { return t && t !== term; });
+        el.value = kept.join(", ");
+        run();
+      });
+    });
+    var clear = bar.querySelector("button.afclear");
+    if (clear) clear.addEventListener("click", function () {
+      writeFilters({}); document.getElementById("f-limit").value = "200"; run();
+    });
+  }
+
   function wireFacetSelects(out) {
     Array.prototype.forEach.call(out.querySelectorAll("select[data-facet]"), function (sel) {
       sel.addEventListener("change", function () {
@@ -457,7 +511,15 @@ ORDER BY n DESC</textarea>
     }).catch(function (e) { document.getElementById("facet-out").innerHTML = '<p class="err">' + esc(e.message) + "</p>"; });
   }
 
-  function run() { loadPostings(); loadFacets(); }
+  // Facets describe the matching set, which sorting cannot change -- verified identical
+  // across sort orders. Re-fetching them on a sort click cost a multi-second recompute for
+  // a guaranteed-identical answer, and re-rendering the dropdowns made it look as though
+  // the selection had been wiped.
+  function run(resultsOnly) {
+    loadPostings();
+    renderActiveFilters();
+    if (!resultsOnly) loadFacets();
+  }
 
   // Saved queries come from the server, so they survive a browser eviction, a different
   // device, and the overnight sync they are usually waiting on.
