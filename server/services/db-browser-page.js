@@ -49,6 +49,14 @@ const DB_BROWSER_PAGE = `<!doctype html>
   .err { color: #b3261e; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; margin: 10px 0; }
   footer { padding: 0 18px 30px; }
   .hint { font-size: 12px; color: #66798c; margin: 8px 0; }
+  #sort-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 0 8px; }
+  #sort-bar .facet-name { margin-right: 2px; }
+  button.sortbtn { border: 1px solid #c6ceda; background: #fff; color: inherit; border-radius: 999px;
+                   padding: 4px 10px; cursor: pointer; font: inherit; font-size: 12px; }
+  button.sortbtn:hover { border-color: #1f6feb; color: #1f6feb; }
+  button.sortbtn.on { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  @media (prefers-color-scheme: dark) { button.sortbtn { background: #18202a; border-color: #2d3947; }
+                                        button.sortbtn.on { background: #1f6feb; border-color: #1f6feb; } }
   .plist { list-style: none; margin: 0; padding: 0; border: 1px solid #d3dae2; border-radius: 10px;
            overflow: hidden; background: #fff; }
   @media (prefers-color-scheme: dark) { .plist { background: #141c24; border-color: #26313d; } }
@@ -160,6 +168,7 @@ const DB_BROWSER_PAGE = `<!doctype html>
     <div class="row" id="saved-row"></div>
     <pre id="posting-sqlout" hidden></pre>
     <div id="facet-out"></div>
+    <div id="sort-bar"></div>
     <div id="posting-out"></div>
   </section>
 
@@ -279,6 +288,46 @@ ORDER BY n DESC</textarea>
       document.getElementById(id).value = state[FIELDS[id]] === undefined ? "" : state[FIELDS[id]];
     });
   }
+  // Mirrors SORTABLE in server/services/db-query.js. Clicking the active field flips the
+  // direction, which is the behaviour a column header would have had before the table was
+  // replaced by a list -- the sort control was otherwise only reachable inside the
+  // collapsed filter form.
+  var SORTS = [
+    { value: "last_seen", label: "Last seen" },
+    { value: "first_seen", label: "First found" },
+    { value: "pay", label: "Pay" },
+    { value: "posted", label: "Posted" },
+    { value: "company", label: "Company" },
+    { value: "position", label: "Position" },
+    { value: "location", label: "Location" }
+  ];
+
+  function renderSortBar() {
+    var current = document.getElementById("f-sort").value || "last_seen";
+    var dir = document.getElementById("f-dir").value || "desc";
+    var bar = document.getElementById("sort-bar");
+    bar.innerHTML = '<span class="facet-name">Sort</span>' + SORTS.map(function (o) {
+      var active = o.value === current;
+      return '<button class="sortbtn' + (active ? " on" : "") + '" data-sort="' + o.value + '">' +
+        o.label + (active ? (dir === "asc" ? " \u25b2" : " \u25bc") : "") + "</button>";
+    }).join("");
+    Array.prototype.forEach.call(bar.querySelectorAll("button.sortbtn"), function (b) {
+      b.addEventListener("click", function () {
+        var picked = b.getAttribute("data-sort");
+        var sortEl = document.getElementById("f-sort");
+        var dirEl = document.getElementById("f-dir");
+        if (sortEl.value === picked) {
+          dirEl.value = dirEl.value === "asc" ? "desc" : "asc";
+        } else {
+          sortEl.value = picked;
+          // Text reads naturally A-Z; recency and pay are wanted highest-first.
+          dirEl.value = (picked === "company" || picked === "position" || picked === "location") ? "asc" : "desc";
+        }
+        run();
+      });
+    });
+  }
+
   // "3d" carries the same signal as a full timestamp here and costs a tenth of the width.
   function ago(epoch) {
     var n = Number(epoch);
@@ -327,6 +376,7 @@ ORDER BY n DESC</textarea>
         (data.approximate ? "at least " : "") + data.total + " matched \u00b7 " + data.visible +
         " visible, " + (data.total - data.visible) + " hidden \u00b7 showing " + data.shown;
       document.getElementById("posting-sqlout").textContent = data.sql;
+      renderSortBar();
       document.getElementById("posting-out").innerHTML = postingList(data.rows);
     }).catch(function (e) { fail("posting-out", e.message); });
   }
