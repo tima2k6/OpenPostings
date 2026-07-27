@@ -209,6 +209,12 @@ async function openDatabase() {
     filename: DB_PATH,
     driver: sqlite3.Database
   });
+  // The API server writes to this same file, hardest in the minutes after its own restart
+  // when a fresh sync pass is committing constantly -- which is exactly when an MCP client
+  // tends to (re)connect. SQLite's default is to fail a locked write immediately, so the
+  // DDL below died with SQLITE_BUSY at startup and the client reported the whole server as
+  // failed. Waiting is the right behavior; 15s comfortably outlasts a sync commit.
+  await db.exec("PRAGMA busy_timeout = 15000;");
   // The shared services read their handle from the runtime context rather than taking one.
   setDb(db);
   await ensureTables();
