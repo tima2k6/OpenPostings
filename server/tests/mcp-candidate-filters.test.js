@@ -189,6 +189,60 @@ async function testDisabledAgentRefuses() {
   assert.strictEqual(capture.options, undefined, "the query must not be reached at all");
 }
 
+// query_postings speaks arrays over MCP but runQuery speaks the comma-separated strings the
+// /db/query route uses. This pins the translation: a group that stops arriving joined is a
+// silently dropped criterion, same failure mode as the candidate filters above.
+function testQueryPostingsInputMapping() {
+  const { buildQueryPostingsInput } = require(MCP_SERVER);
+  const input = buildQueryPostingsInput({
+    title_any: ["manager", "director"],
+    title_none: ["assistant", "shift"],
+    company_none: ["staffing"],
+    location_any: ["seattle"],
+    ats: ["greenhouse", "lever"],
+    states: ["WA", "OR"],
+    regions: ["AMER"],
+    pay_min: 140000,
+    seen_days: 3,
+    has_pay: true,
+    sort: "pay",
+    dir: "desc",
+    limit: 50
+  });
+
+  assert.strictEqual(input.title_any, "manager,director");
+  assert.strictEqual(input.title_none, "assistant,shift");
+  assert.strictEqual(input.company_none, "staffing");
+  assert.strictEqual(input.location_any, "seattle");
+  assert.strictEqual(input.ats, "greenhouse,lever");
+  assert.strictEqual(input.states, "WA,OR");
+  assert.strictEqual(input.regions, "AMER");
+  assert.strictEqual(input.pay_min, 140000);
+  assert.strictEqual(input.seen_days, 3);
+  assert.strictEqual(input.has_pay, "1", "has_pay=true must become the '1' flag the route uses");
+  assert.strictEqual(input.sort, "pay");
+  assert.strictEqual(input.dir, "desc");
+  assert.strictEqual(input.limit, 50);
+
+  const empty = buildQueryPostingsInput({});
+  assert.strictEqual(empty.title_any, "", "absent groups must arrive empty, not undefined");
+  assert.strictEqual(empty.has_pay, "", "has_pay unset must not become the '1' flag");
+  assert.strictEqual(empty.visibility, "all", "default visibility looks under the hidden flag");
+}
+
+function testIgnoredByLabel() {
+  const { buildIgnoredByLabel } = require(MCP_SERVER);
+  assert.strictEqual(
+    buildIgnoredByLabel("OpenPostings Agent", "requires onsite in Boston"),
+    "OpenPostings Agent: requires onsite in Boston"
+  );
+  assert.strictEqual(
+    buildIgnoredByLabel("OpenPostings Agent", "  "),
+    "OpenPostings Agent marked not a fit",
+    "a blank reason still names the agent as the decider"
+  );
+}
+
 // The settings reader has to name preferred_regions and preferred_countries in its SELECT.
 // Reading them off the row object is not enough -- a column that is not selected is simply
 // absent, which parses as an empty preference and looks like the user set nothing.
@@ -206,6 +260,8 @@ async function run() {
   await testUseSettingsFalseIgnoresPreferences();
   await testFullFilterSurfaceReachesTheQuery();
   await testDisabledAgentRefuses();
+  testQueryPostingsInputMapping();
+  testIgnoredByLabel();
   testSettingsReaderSelectsGeoColumns();
   console.log("mcp-candidate-filters tests passed");
 }

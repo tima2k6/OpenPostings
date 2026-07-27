@@ -75,6 +75,29 @@ names, states, counties (pass `states` to scope them), ISO country codes, region
 levels, compensation types and pay periods. Values outside those lists match nothing rather
 than reporting an error, so an agent should read this before filtering.
 
+## The screening workflow
+
+`get_resume` extracts the text of the file in `resume_file_path` (PDF, docx, txt or md; PDF
+via pdf.js) so the agent screens against the actual resume rather than the profile summary.
+The path must exist on the machine running the MCP server; when it cannot be read there, the
+tool returns the path so clients with their own file tools can read it directly.
+`document=projects_portfolio` reads the portfolio document instead.
+
+Four more tools carry the loop between shortlisting and applying:
+
+- `query_postings` — precision queries the candidate filters cannot phrase: `title_any`
+  ORs its terms, groups AND together, `*_none` excludes, plus pay bounds, `seen_days` /
+  `found_days` recency, and `visibility` to look under the hidden flag. Ignores saved
+  preferences and the freshness window by design.
+- `get_posting_details` — everything stored about named postings, full description
+  included, so fit is decided from the database before a browser session is spent.
+- `ignore_posting` — marks a posting not-a-fit (with a reason shown in the app), which
+  removes it from every future candidate query. Reversible with `ignored=false`.
+- `list_applications` — application history with attribution, for dedupe across runs.
+
+The `dry_run_only` and `require_final_approval` toggles gate only the apply/record path;
+the screening tools are read-or-tracking-state and run whenever the agent is enabled.
+
 ## API endpoints tied to this page
 
 - `GET /settings/mcp`

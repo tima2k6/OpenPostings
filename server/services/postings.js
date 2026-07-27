@@ -833,6 +833,49 @@ async function enrichPostingsWithApplicationState(items) {
   });
 }
 
+// Full detail for a handful of named postings, so a caller holding URLs from a shortlist
+// can screen them before applying. The listing query cannot answer this: it pages over
+// filters and treats the description as a cost to avoid, while screening is exactly the
+// moment the description is the point.
+async function getPostingsByUrls(jobPostingUrls) {
+  const db = getDb()
+  const urls = Array.from(
+    new Set(
+      (Array.isArray(jobPostingUrls) ? jobPostingUrls : [])
+        .map((url) => String(url || "").trim())
+        .filter(Boolean)
+    )
+  );
+  if (urls.length === 0) return [];
+
+  const placeholders = urls.map(() => "?").join(", ");
+  const rows = await db.all(
+    `
+      SELECT id, company_name, position_name, job_posting_url, posting_date, location,
+             job_description, compensation_type, education_levels, pay_min, pay_max,
+             pay_currency, pay_period, pay_raw, hidden, first_seen_epoch, last_seen_epoch
+      FROM Postings
+      WHERE job_posting_url IN (${placeholders});
+    `,
+    urls
+  );
+
+  const items = rows.map((row) => {
+    const ats = inferAtsFromJobPostingUrl(row?.job_posting_url);
+    return {
+      ...row,
+      ats,
+      location: String(row?.location || "").trim() || inferPostingLocationFromJobUrl(row?.job_posting_url) || "",
+      education_levels: parseEducationLevels(row?.education_levels),
+      job_description: normalizeJobDescription(row?.job_description, ats),
+      pay_currency: normalizeCompensationCurrencyCode(row?.pay_currency),
+      pay_raw: String(row?.pay_raw || "").trim() || null
+    };
+  });
+
+  return enrichPostingsWithApplicationState(items);
+}
+
 
 async function markPostingAppliedState(payload) {
   const db = getDb()
@@ -971,4 +1014,4 @@ async function getCounts() {
   };
 }
 
-module.exports = { listPostingsWithFilters, setPostingIgnoredState, getCounts, getPostingLocationGeoFilterOptions, markPostingAppliedState, getWideScanStats, buildCandidatePrefilter }
+module.exports = { listPostingsWithFilters, setPostingIgnoredState, getCounts, getPostingLocationGeoFilterOptions, markPostingAppliedState, getWideScanStats, buildCandidatePrefilter, getPostingsByUrls, enrichPostingsWithApplicationState }
