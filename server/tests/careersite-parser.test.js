@@ -240,6 +240,41 @@ function testJsonLdParsing() {
   assert.equal(hourlyRemote.pay_max, 22.5);
   assert.equal(hourlyRemote.pay_period, "hour");
 
+  // Which ATS a posting belongs to is inferred from its stored URL everywhere it matters,
+  // so a canonical URL pointing at an apply vendor would store a row no ATS filter could
+  // reach. The employer's own page URL has to win in that case.
+  const offHostCanonical = parseCareerSiteJobPostingFromHtml(
+    EXPEDIA,
+    buildJsonLdPage({
+      "@type": "JobPosting",
+      title: "Analyst",
+      datePosted: "2026-07-27",
+      url: "https://apply.somevendor.com/postings/abc123"
+    }),
+    "https://careers.expediagroup.com/job/analyst/chicago-IL/R-1/"
+  );
+  assert.equal(
+    offHostCanonical.job_posting_url,
+    "https://careers.expediagroup.com/job/analyst/chicago-IL/R-1/",
+    "an off-host canonical URL must not displace the employer's own job page"
+  );
+  assert.equal(
+    require("../helpers/normalize-ats.js").inferAtsFromJobPostingUrl(offHostCanonical.job_posting_url),
+    "expedia",
+    "the stored URL has to stay one the ATS filters can attribute"
+  );
+
+  const malformedCanonical = parseCareerSiteJobPostingFromHtml(
+    EXPEDIA,
+    buildJsonLdPage({ "@type": "JobPosting", title: "Analyst", datePosted: "2026-07-27", url: "not a url" }),
+    "https://careers.expediagroup.com/job/analyst/chicago-IL/R-2/"
+  );
+  assert.equal(
+    malformedCanonical.job_posting_url,
+    "https://careers.expediagroup.com/job/analyst/chicago-IL/R-2/",
+    "a malformed canonical URL is no better than an absent one"
+  );
+
   assert.equal(
     parseCareerSiteJobPostingFromHtml(EXPEDIA, `<script type="application/ld+json">{ not json }</script>`, "https://x/"),
     null,

@@ -304,11 +304,28 @@ function extractCareerSiteCompensation(jobPosting) {
   };
 }
 
+// Which ATS a posting belongs to is derived from its stored URL everywhere it matters --
+// the postings list, the facet counts and the MCP candidate search all call
+// inferAtsFromJobPostingUrl rather than reading a column. A JSON-LD block that advertises
+// its apply vendor's host in `url` would therefore store a row no ATS filter can reach, so
+// the canonical URL is only taken when it stays on the employer's own site.
+function resolveCareerSiteJobUrl(config, jobPosting, pageUrl) {
+  const canonical = String(cleanHtmlText(jobPosting?.url) || "").trim();
+  if (canonical) {
+    try {
+      if (new URL(canonical).host.toLowerCase() === careerSiteHost(config)) return canonical;
+    } catch {
+      // A malformed canonical URL is no better than an absent one.
+    }
+  }
+  return String(pageUrl || "").trim();
+}
+
 function parseCareerSiteJobPostingFromHtml(config, html, pageUrl) {
   const jobPosting = extractJsonLdObjects(html).find((object) => isJobPostingObject(object));
   if (!jobPosting) return null;
 
-  const jobPostingUrl = String(cleanHtmlText(jobPosting?.url) || pageUrl || "").trim();
+  const jobPostingUrl = resolveCareerSiteJobUrl(config, jobPosting, pageUrl);
   if (!jobPostingUrl) return null;
 
   const compensation = extractCareerSiteCompensation(jobPosting);
