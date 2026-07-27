@@ -137,7 +137,8 @@ const DYNAMIC_ATS_OPTIONS = new Set([
   // Both sweep their whole board from a single target, so seeding one as a company row
   // would only queue the same full sweep again under a second name.
   "amazon",
-  "expedia"
+  "expedia",
+  "microsoft"
 ]);
 const SEEDED_ATS_OPTIONS = new Set(
   Array.from(ATS_FILTER_OPTIONS).filter((ats) => !DYNAMIC_ATS_OPTIONS.has(String(ats || "").trim().toLowerCase()))

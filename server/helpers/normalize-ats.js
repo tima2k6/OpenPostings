@@ -43,6 +43,7 @@ const ATS_FILTER_OPTIONS = new Set([
   "hcareers",
   "amazon",
   "expedia",
+  "microsoft",
   "hrmdirect",
   "talentlyft",
   "talexio",
@@ -191,6 +192,7 @@ const ATS_FILTER_OPTION_ITEMS = Object.freeze([
   { value: "hcareers", label: "Hcareers" },
   { value: "amazon", label: "Amazon Jobs" },
   { value: "expedia", label: "Expedia Group" },
+  { value: "microsoft", label: "Microsoft Careers" },
   { value: "hrmdirect", label: "HRMDirect" },
   { value: "talentlyft", label: "Talentlyft" },
   { value: "talexio", label: "Talexio" },
@@ -542,6 +544,18 @@ function normalizeAtsFilterValue(value) {
   ) {
     return "expedia";
   }
+  if (
+    normalized === "microsoft.com" ||
+    normalized === "microsoftcom" ||
+    normalized === "careers.microsoft.com" ||
+    normalized === "careersmicrosoftcom" ||
+    normalized === "jobs.careers.microsoft.com" ||
+    normalized === "jobscareersmicrosoftcom" ||
+    normalized === "gcsservices.careers.microsoft.com" ||
+    normalized === "gcsservicescareersmicrosoftcom"
+  ) {
+    return "microsoft";
+  }
   if (normalized === "hrmdirect.com" || normalized === "hrmdirectcom") {
     return "hrmdirect";
   }
@@ -768,6 +782,7 @@ function inferAtsFromJobPostingUrl(value) {
   if (url.includes("hcareers.com/jobs/")) return "hcareers";
   if (url.includes("amazon.jobs/") && url.includes("/jobs/")) return "amazon";
   if (url.includes("careers.expediagroup.com/job")) return "expedia";
+  if (url.includes("jobs.careers.microsoft.com/") && url.includes("/job/")) return "microsoft";
   if (url.includes(".hrmdirect.com/employment/job-opening.php")) return "hrmdirect";
   if (url.includes(".talentlyft.com/jobs/")) return "talentlyft";
   if (url.includes(".talexio.com/jobs")) return "talexio";

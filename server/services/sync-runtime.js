@@ -97,6 +97,7 @@ const { collectPostingsForStatejobsnyDynamic, STATEJOBSNY_ESTIMATED_COMPANY_COUN
 const { collectPostingsForHcareersDynamic, HCAREERS_ESTIMATED_COMPANY_COUNT } = require("../ats/hcareers/service.js");
 const { collectPostingsForAmazonDynamic, AMAZON_ESTIMATED_COMPANY_COUNT } = require("../ats/amazon/service.js");
 const { collectPostingsForExpediaDynamic, EXPEDIA_ESTIMATED_COMPANY_COUNT } = require("../ats/expedia/service.js");
+const { collectPostingsForMicrosoftDynamic, MICROSOFT_ESTIMATED_COMPANY_COUNT } = require("../ats/microsoft/service.js");
 
 const syncStatus = {
   running: false,
@@ -635,6 +636,17 @@ async function collectPostingsForCompany(company, options = {}) {
   ) {
     return collectPostingsForExpediaDynamic();
   }
+  if (
+    atsName === "microsoft" ||
+    atsName === "microsoft.com" ||
+    atsName === "microsoftcom" ||
+    atsName === "careers.microsoft.com" ||
+    atsName === "careersmicrosoftcom" ||
+    atsName === "jobs.careers.microsoft.com" ||
+    atsName === "jobscareersmicrosoftcom"
+  ) {
+    return collectPostingsForMicrosoftDynamic();
+  }
   if (atsName === "hrmdirect" || atsName === "hrmdirect.com" || atsName === "hrmdirectcom") {
     return collectPostingsForHrmDirectCompany(company);
   }
@@ -785,9 +797,9 @@ const BOARD_WIDE_SYNC_TARGETS = [
     url_string: "https://academicjobsonline.org/ajo?joblst---0----0-p--",
     ATS_name: "academicjobsonline"
   },
-  // Amazon and Expedia Group each run their own careers platform rather than renting an
-  // ATS, so there is no seeded company row that could reach them. They belong here for
-  // the same reason the boards above do: one target sweeps the whole employer.
+  // Amazon, Expedia Group and Microsoft each run their own careers platform rather than
+  // renting an ATS, so there is no seeded company row that could reach them. They belong
+  // here for the same reason the boards above do: one target sweeps the whole employer.
   {
     company_name: "Amazon Jobs (dynamic)",
     url_string: "https://www.amazon.jobs/en/search.json?sort=recent",
@@ -797,6 +809,11 @@ const BOARD_WIDE_SYNC_TARGETS = [
     company_name: "Expedia Group (dynamic)",
     url_string: "https://careers.expediagroup.com/sitemap.xml",
     ATS_name: "expedia"
+  },
+  {
+    company_name: "Microsoft Careers (dynamic)",
+    url_string: "https://gcsservices.careers.microsoft.com/search/api/v1/search?o=Recent",
+    ATS_name: "microsoft"
   }
 ];
 
@@ -1550,6 +1567,9 @@ async function getSyncScopeStats() {
   }
   if (enabledAts.has("expedia")) {
     syncEnabledCompanyCount += EXPEDIA_ESTIMATED_COMPANY_COUNT;
+  }
+  if (enabledAts.has("microsoft")) {
+    syncEnabledCompanyCount += MICROSOFT_ESTIMATED_COMPANY_COUNT;
   }
 
   return {

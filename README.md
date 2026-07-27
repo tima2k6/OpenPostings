@@ -150,6 +150,7 @@ Current sync support includes:
 - `Hcareers`
 - `Amazon Jobs`
 - `Expedia Group`
+- `Microsoft Careers`
 - `prismhr`
 - `silkroad`
 - `paycor`

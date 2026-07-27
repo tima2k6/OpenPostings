@@ -1,12 +1,13 @@
-// Amazon and Expedia Group are swept from a single target each, so the thing that keeps a
-// sync affordable is not the parser but where the sweep stops. Amazon pages newest-first
-// and must stop at the first page with nothing in the freshness window; Expedia must reach
-// exactly one detail page per fresh sitemap entry and never fetch a stale or non-job URL.
-// Both are checked here against a stubbed fetch, since the real boards are not reachable
-// from a test run.
+// Amazon, Expedia Group and Microsoft are swept from a single target each, so the thing
+// that keeps a sync affordable is not the parser but where the sweep stops. Amazon and
+// Microsoft page newest-first and must stop at the first page with nothing in the
+// freshness window; Expedia must reach exactly one detail page per fresh sitemap entry and
+// never fetch a stale or non-job URL. All three are checked here against a stubbed fetch,
+// since the real boards are not reachable from a test run.
 const assert = require("assert");
 const { collectPostingsForAmazonDynamic } = require("../ats/amazon/service.js");
 const { collectPostingsForExpediaDynamic } = require("../ats/expedia/service.js");
+const { collectPostingsForMicrosoftDynamic } = require("../ats/microsoft/service.js");
 
 function jsonResponse(body) {
   return { ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) };
@@ -74,6 +75,36 @@ async function testAmazonStopsAtTheFirstStalePage() {
   );
   assert.ok(
     requested.every((url) => new URL(url).searchParams.get("sort") === "recent"),
+    "every page must be requested newest-first, which is what makes the early stop sound"
+  );
+}
+
+async function testMicrosoftStopsAtTheFirstStalePage() {
+  const nowIso = new Date().toISOString();
+
+  const { result, requested } = await withStubbedFetch(
+    (url) => {
+      const pageNo = Number(new URL(url).searchParams.get("pg"));
+      const job = pageNo === 1
+        ? { jobId: "1858732", title: "Fresh Role", postingDate: nowIso, properties: { primaryLocation: "Redmond, Washington, United States" } }
+        : { jobId: "1000001", title: "Old Role", postingDate: "2024-01-03T00:00:00+00:00", properties: {} };
+      return jsonResponse({ operationResult: { result: { totalJobs: 5000, jobs: [job] } } });
+    },
+    () => collectPostingsForMicrosoftDynamic()
+  );
+
+  assert.equal(result.length, 1, "only the posting inside the freshness window should be stored");
+  assert.equal(
+    result[0].job_posting_url,
+    "https://jobs.careers.microsoft.com/global/en/job/1858732/Fresh-Role"
+  );
+  assert.equal(
+    requested.length,
+    2,
+    "the sweep should stop on the first page with nothing fresh rather than page the whole board"
+  );
+  assert.ok(
+    requested.every((url) => new URL(url).searchParams.get("o") === "Recent"),
     "every page must be requested newest-first, which is what makes the early stop sound"
   );
 }
@@ -166,6 +197,7 @@ async function testExpediaFallsBackWhenRobotsIsUnavailable() {
 
 async function run() {
   await testAmazonStopsAtTheFirstStalePage();
+  await testMicrosoftStopsAtTheFirstStalePage();
   await testExpediaFetchesOnlyFreshJobPages();
   await testExpediaFallsBackWhenRobotsIsUnavailable();
   console.log("board-sweep-bounds tests passed");
