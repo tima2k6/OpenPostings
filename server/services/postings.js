@@ -412,6 +412,8 @@ async function listPostingsWithFilters(options = {}) {
   const hideNoDate = normalizeBoolean(options?.hide_no_date, false);
   const includeApplied = normalizeBoolean(options?.include_applied, true);
   const includeIgnored = normalizeBoolean(options?.include_ignored, false);
+  // Defaults true so existing callers, including the MCP tools, are unaffected.
+  const includeDescriptions = normalizeBoolean(options?.include_descriptions, true);
   const hasStructuredFilters =
     atsFilters.length > 0 ||
     industryKeys.length > 0 ||
@@ -696,7 +698,13 @@ async function listPostingsWithFilters(options = {}) {
   // Only now, on the page that is actually being returned, is it worth building the
   // display-only fields.
   items = items.map(({ _has_real_source_posting_date, ...row }) => buildPostingDisplayFields(row));
-  items = await hydrateJobDescriptions(db, items);
+  // Descriptions are the bulk of the payload -- on one instance 435MB of a 931MB database
+  // lived in them -- and the listing has a toggle that hides them outright. When the client
+  // says it is not rendering them, neither fetching nor shipping them is worth it. The
+  // field is still present and null so consumers do not have to special-case its absence.
+  items = includeDescriptions
+    ? await hydrateJobDescriptions(db, items)
+    : items.map((item) => ({ ...item, job_description: null }));
   items = await enrichPostingsWithApplicationState(items);
 
   if (!includeApplied) {
