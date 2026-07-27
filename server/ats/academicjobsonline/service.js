@@ -117,7 +117,11 @@ function parseAcademicJobsOnlinePostingsFromHtml(pageHtml, baseUrl) {
 }
 
 async function collectPostingsForAcademicJobsOnlineDynamic() {
-  const endpoint = "https://academicjobsonline.org/ajo?joblst-44-0-0-0---0-p--";
+  // The leading field id in the joblst query scopes the page to one subject area. It was pinned
+  // to 44, which lists ~31 positions whose newest posting was days old, so the 24h filter below
+  // emptied every run. Leaving the id blank lists the whole board (~500 open positions); the
+  // trailing "p" keeps it sorted by posted date so the fresh rows are at the top.
+  const endpoint = "https://academicjobsonline.org/ajo?joblst---0----0-p--";
   const res = await fetchWithAtsRateLimit("academicjobsonline", 60 * 1000, endpoint, {
     method: "GET",
     headers: {
