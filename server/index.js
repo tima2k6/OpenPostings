@@ -76,9 +76,9 @@ const { parseTaleoCompany } = require("./ats/taleonet/service.js");
 
 // import helpers
 const { nowEpochSeconds, parseNonNegativeInteger, normalizeBoolean, normalizePayFilterNumber } = require("./helpers/normalize-numbers.js");
-const { inferAtsFromJobPostingUrl, normalizeSyncEnabledAts, normalizeAtsFilterValue, ATS_FILTER_OPTIONS, ATS_FILTER_OPTION_ITEMS } = require("./helpers/normalize-ats.js");
+const { inferAtsFromJobPostingUrl, normalizeAtsFilterValue, ATS_FILTER_OPTIONS, ATS_FILTER_OPTION_ITEMS } = require("./helpers/normalize-ats.js");
 const { parseCsvParam, normalizeStringArray, normalizeSourceUrlString, APPLICATION_STATUS_OPTIONS } = require("./helpers/normalize-strings.js");
-const { COMPENSATION_TYPE_OPTION_ITEMS, COMPENSATION_PAY_PERIOD_OPTION_ITEMS, EDUCATION_LEVEL_OPTION_ITEMS, STATE_CODE_TO_NAME, normalizeRemoteFilter } = require("./helpers/description-filters.js");
+const { normalizeRemoteFilter } = require("./helpers/description-filters.js");
 const { MCP_SETTINGS_DEFAULTS } = require("./helpers/normalize-mcp-settings.js")
 
 // import services
@@ -90,7 +90,8 @@ const { getMcpSettings, upsertMcpSettings, buildMcpRunbook, buildCoverLetterDraf
 const { listApplications, createApplication, updateApplicationStatus, deleteApplicationById } = require("./services/applications.js");
 const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable, startSyncStallWatchdog } = require("./services/sync-runtime.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
-const { listPostingsWithFilters, setPostingIgnoredState, getCounts, getPostingLocationGeoFilterOptions, getWideScanStats } = require("./services/postings.js");
+const { listPostingsWithFilters, setPostingIgnoredState, getCounts, getWideScanStats } = require("./services/postings.js");
+const { getPostingFilterOptions } = require("./services/filter-options.js");
 const { getDb, setDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
 
 const cors = require("cors");
@@ -1304,129 +1305,8 @@ function createServer() {
   app.post("/sync/ats", handleSyncRequest);
 
   app.get("/postings/filter-options", async (req, res) => {
-    const selectedStates = parseCsvParam(req.query.states).map((state) => state.toUpperCase());
-    const syncSettings = await getSyncServiceSettings();
-    const enabledAts = new Set(normalizeSyncEnabledAts(syncSettings?.sync_enabled_ats));
-    const ats = ATS_FILTER_OPTION_ITEMS.map((item) => ({
-      value: item.value,
-      label: item.label,
-      enabled: enabledAts.has(item.value)
-    }));
-    const sort_options = [
-      { value: "recent", label: "Most Recently Seen" },
-      { value: "company_asc", label: "Company (A-Z)" }
-    ];
-
-    let industries = [];
-    try {
-      industries = await db.all(
-        `
-          SELECT industry_key AS value, industry_label AS label
-          FROM job_industry_categories
-          ORDER BY industry_label ASC;
-        `
-      );
-    } catch {
-      industries = await db.all(
-        `
-          SELECT industry_key AS value, industry_label AS label
-          FROM job_position_industry
-          GROUP BY industry_key, industry_label
-          ORDER BY industry_label ASC;
-        `
-      );
-    }
-
-    let states = [];
-    try {
-      const stateRows = await db.all(
-        `
-          SELECT DISTINCT state_usps
-          FROM state_location_index
-          WHERE state_usps IS NOT NULL AND TRIM(state_usps) <> ''
-          ORDER BY state_usps ASC;
-        `
-      );
-      states = stateRows.map((row) => {
-        const code = String(row?.state_usps || "").trim().toUpperCase();
-        const readableName = STATE_CODE_TO_NAME[code];
-        return {
-          value: code,
-          label: readableName ? `${code} - ${readableName.replace(/\b\w/g, (c) => c.toUpperCase())}` : code
-        };
-      });
-    } catch {
-      states = [];
-    }
-
-    let counties = [];
-    try {
-      let countyRows = [];
-      if (selectedStates.length === 0) {
-        countyRows = await db.all(
-          `
-            SELECT DISTINCT state_usps, search_location_name
-            FROM state_location_index
-            WHERE location_type = 'county'
-              AND search_location_name IS NOT NULL
-              AND TRIM(search_location_name) <> ''
-            ORDER BY state_usps ASC, search_location_name ASC;
-          `
-        );
-      } else {
-        const placeholders = selectedStates.map(() => "?").join(", ");
-        countyRows = await db.all(
-          `
-            SELECT DISTINCT state_usps, search_location_name
-            FROM state_location_index
-            WHERE location_type = 'county'
-              AND search_location_name IS NOT NULL
-              AND TRIM(search_location_name) <> ''
-              AND state_usps IN (${placeholders})
-            ORDER BY state_usps ASC, search_location_name ASC;
-          `,
-          selectedStates
-        );
-      }
-
-      counties = countyRows.map((row) => {
-        const stateCode = String(row?.state_usps || "").trim().toUpperCase();
-        const countyName = String(row?.search_location_name || "").trim();
-        return {
-          value: `${stateCode}|${countyName}`,
-          label: `${countyName} (${stateCode})`,
-          state: stateCode,
-          county: countyName
-        };
-      });
-    } catch {
-      counties = [];
-    }
-
-    const locationGeoOptions = await getPostingLocationGeoFilterOptions();
-    let countries = Array.isArray(locationGeoOptions?.countries) ? locationGeoOptions.countries : [];
-    if (countries.length === 0 && states.length > 0) {
-      countries = [
-        {
-          value: "US",
-          label: "United States",
-          region: "AMER"
-        }
-      ];
-    }
-
-    res.json({
-      ats,
-      sort_options,
-      industries,
-      compensation_types: COMPENSATION_TYPE_OPTION_ITEMS,
-      pay_periods: COMPENSATION_PAY_PERIOD_OPTION_ITEMS,
-      education_levels: EDUCATION_LEVEL_OPTION_ITEMS,
-      regions: Array.isArray(locationGeoOptions?.regions) ? locationGeoOptions.regions : [],
-      countries,
-      states,
-      counties
-    });
+    const options = await getPostingFilterOptions({ states: parseCsvParam(req.query.states) });
+    res.json(options);
   });
 
   app.get("/settings/personal-information", async (_req, res) => {

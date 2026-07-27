@@ -3,6 +3,10 @@ const { parseJsonArray } = require("../helpers/normalize-strings");
 const { parseNonNegativeInteger } = require("../helpers/normalize-numbers");
 const { getDb, setDb } = require("./runtime-context.js");
 
+// The SELECT below has to name preferred_regions and preferred_countries explicitly. It did
+// not, so upsertMcpSettings wrote both columns and every read handed back [] -- the settings
+// page showed the saved regions and countries while the candidate query behaved as though
+// none were set.
 async function getMcpSettings() {
   const db = getDb();
   const row = await db.get(
@@ -21,6 +25,8 @@ async function getMcpSettings() {
         preferred_search,
         preferred_remote,
         preferred_industries,
+        preferred_regions,
+        preferred_countries,
         preferred_states,
         preferred_counties,
         instructions_for_agent

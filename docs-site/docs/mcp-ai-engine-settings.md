@@ -60,6 +60,21 @@ When MCP settings are saved:
 - OpenPostings runs a preview candidate query.
 - UI confirms with match count: `MCP settings saved. <count> candidate postings currently match.`
 
+## How preferences reach the agent
+
+The targeting fields above are defaults, not limits. `find_posting_candidates` accepts every
+filter the job list offers — `search`, `ats`, `industries`, `compensation_types`,
+`pay_periods`, `pay_min`, `pay_max`, `education_levels`, `states`, `counties`, `countries`,
+`regions`, `remote`, `sort_by`, `hide_no_date`, `limit`, `offset`, `include_applied`,
+`include_ignored`, `include_descriptions` — and a filter the agent passes explicitly replaces
+the saved preference for that field only. Passing `use_settings=false` ignores the saved
+preferences entirely.
+
+`get_filter_options` returns the accepted values for each list filter: industry keys, ATS
+names, states, counties (pass `states` to scope them), ISO country codes, regions, education
+levels, compensation types and pay periods. Values outside those lists match nothing rather
+than reporting an error, so an agent should read this before filtering.
+
 ## API endpoints tied to this page
 
 - `GET /settings/mcp`
