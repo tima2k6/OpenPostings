@@ -139,10 +139,6 @@ const DYNAMIC_ATS_OPTIONS = new Set([
   "amazon",
   "expedia",
   "microsoft",
-  "apple",
-  "meta",
-  "walmart",
-  "disney",
   "boeing"
 ]);
 const SEEDED_ATS_OPTIONS = new Set(

@@ -23,44 +23,40 @@ const MAX_JOB_PAGES_PER_SYNC = 200;
 // job_path_pattern is matched against the URL path with any trailing slash removed. Getting
 // it wrong costs wasted detail fetches on listing pages, not bad rows -- a page with no
 // JobPosting block yields nothing.
+//
+// sitemap_paths is only needed by boards whose robots.txt names no sitemap and which do not
+// keep one at /sitemap.xml either. It is a list of paths to try instead of that guess, not
+// an extra crawl surface: everything reached through it is still same-host and still spends
+// the same per-sync sitemap budget.
+//
+// Every employer listed here was checked against the live board on 2026-07-27: the sitemap
+// resolves, job_path_pattern matches the URLs it actually contains, and the detail pages
+// carry a schema.org JobPosting block. Employers whose boards fail any of those three are
+// deliberately absent -- see the note below the table.
 const CAREER_SITE_CONFIGS = Object.freeze({
   expedia: {
     label: "Expedia Group",
     origin: "https://careers.expediagroup.com",
+    // Live URLs are /job/<title-slug>/<location-slug>/<req-id>/, so the pattern has to admit
+    // a multi-segment tail while still rejecting the /jobs/search-style listing pages.
     job_path_pattern: /^\/jobs?\/(?!search|results|browse|all|categor(?:y|ies)|locations?|teams?)[^/]+/i,
     default_company_name: "Expedia Group",
     // Expedia, Vrbo, Hotels.com, Egencia, Expedia Partner Solutions and the rest post here.
     estimated_company_count: 8
   },
-  apple: {
-    label: "Apple",
-    origin: "https://jobs.apple.com",
-    job_path_pattern: /^\/[a-z]{2}(?:-[a-z]{2})?\/details\/[^/]+/i,
-    default_company_name: "Apple",
+  microsoft: {
+    label: "Microsoft Careers",
+    // The board that answered at jobs.careers.microsoft.com through its own search service
+    // has been retired: that host 301s here, and the gcsservices.careers.microsoft.com API it
+    // used to call no longer even presents a certificate for its own name. What replaced it
+    // is a Phenom site, which is exactly the sitemap + JobPosting pair this engine reads.
+    origin: "https://apply.careers.microsoft.com",
+    job_path_pattern: /^\/careers\/job\/[^/]+/i,
+    // robots.txt here allows the board but advertises no sitemap, and /sitemap.xml is a 404.
+    sitemap_paths: ["/careers/sitemap.xml"],
+    default_company_name: "Microsoft",
+    // One board for Microsoft proper. LinkedIn and GitHub recruit on their own sites.
     estimated_company_count: 1
-  },
-  meta: {
-    label: "Meta",
-    origin: "https://www.metacareers.com",
-    job_path_pattern: /^\/jobs\/\d+/i,
-    default_company_name: "Meta",
-    estimated_company_count: 1
-  },
-  walmart: {
-    label: "Walmart",
-    origin: "https://careers.walmart.com",
-    job_path_pattern: /^\/(?:us\/)?jobs?\/[^/]+/i,
-    default_company_name: "Walmart",
-    // Walmart US, Sam's Club and Walmart Global Tech all post to this site.
-    estimated_company_count: 3
-  },
-  disney: {
-    label: "Disney",
-    origin: "https://jobs.disneycareers.com",
-    job_path_pattern: /^\/job\/[^/]+/i,
-    default_company_name: "The Walt Disney Company",
-    // ESPN, ABC, Marvel, Pixar, Disney Parks and the studios share one board.
-    estimated_company_count: 6
   },
   boeing: {
     label: "Boeing",
@@ -70,6 +66,28 @@ const CAREER_SITE_CONFIGS = Object.freeze({
     estimated_company_count: 1
   }
 });
+
+// Deliberately not in the table, each checked against the live board on 2026-07-27:
+//
+//   apple    jobs.apple.com publishes no sitemap at all (/robots.txt, /sitemap.xml and
+//            /sitemap_index.xml are all 404s, and /en-us/sitemap.xml is the SPA shell
+//            answering 200 with HTML), and its detail pages carry no JSON-LD of any kind.
+//            Neither half of the contract is there.
+//   meta     www.metacareers.com advertises two sitemaps in robots.txt and serves neither to
+//            this collector: the .gz answers 403 and /jobsearch/sitemap.xml answers 400. The
+//            same robots.txt states that automated collection is prohibited without written
+//            permission, so the block is a decision rather than a fault to route around.
+//   walmart  careers.walmart.com does publish a sitemap listing all ~15k jobs, but its detail
+//            pages are a Next.js app that keeps the posting in __NEXT_DATA__ and emits no
+//            JobPosting block. Reading it means parsing that blob, which is a bespoke
+//            collector, not this engine.
+//   disney   jobs.disneycareers.com publishes a good sitemap and its job URLs match the shape
+//            this engine expects, but the detail pages carry no JSON-LD -- checked on three
+//            separate postings. Boeing runs the same vendor and does emit it, so this is a
+//            per-tenant setting Disney has off rather than something the engine can fix.
+//
+// All four need their own collector or should stay dropped; none of them can be made to work
+// by widening a pattern here.
 
 const CAREER_SITE_KEYS = Object.freeze(Object.keys(CAREER_SITE_CONFIGS));
 
@@ -309,16 +327,37 @@ function extractCareerSiteCompensation(jobPosting) {
 // inferAtsFromJobPostingUrl rather than reading a column. A JSON-LD block that advertises
 // its apply vendor's host in `url` would therefore store a row no ATS filter can reach, so
 // the canonical URL is only taken when it stays on the employer's own site.
+// Microsoft and Expedia both publish their canonical URL as http:// even though the board
+// only answers on https and redirects there. Storing the http:// form gives every reader a
+// link that costs a redirect, so the scheme is taken from the configured origin while the
+// rest of the canonical URL is kept exactly as published.
 function resolveCareerSiteJobUrl(config, jobPosting, pageUrl) {
+  const originProtocol = new URL(config.origin).protocol;
   const canonical = String(cleanHtmlText(jobPosting?.url) || "").trim();
   if (canonical) {
     try {
-      if (new URL(canonical).host.toLowerCase() === careerSiteHost(config)) return canonical;
+      const parsed = new URL(canonical);
+      if (parsed.host.toLowerCase() === careerSiteHost(config)) {
+        if (parsed.protocol !== originProtocol) parsed.protocol = originProtocol;
+        return parsed.toString();
+      }
     } catch {
       // A malformed canonical URL is no better than an absent one.
     }
   }
-  return String(pageUrl || "").trim();
+
+  const fallback = String(pageUrl || "").trim();
+  if (!fallback) return "";
+  try {
+    const parsed = new URL(fallback);
+    if (parsed.host.toLowerCase() === careerSiteHost(config) && parsed.protocol !== originProtocol) {
+      parsed.protocol = originProtocol;
+      return parsed.toString();
+    }
+  } catch {
+    // Fall through to the raw candidate URL; it is what the sweep actually fetched.
+  }
+  return fallback;
 }
 
 function parseCareerSiteJobPostingFromHtml(config, html, pageUrl) {
@@ -375,7 +414,27 @@ async function discoverCareerSiteSitemapUrls(siteKey, config) {
   }
 
   const advertised = parseSitemapUrlsFromRobotsTxt(robotsText, config);
-  return advertised.length > 0 ? advertised : [`${config.origin}/sitemap.xml`];
+  if (advertised.length > 0) return advertised;
+
+  // A board that names no sitemap is usually still keeping one at the conventional path, so
+  // that guess stays the default. sitemap_paths is for the ones that are not -- it replaces
+  // the guess rather than adding to it, so a configured board does not also pay for a fetch
+  // of a path its operator already knows is a 404.
+  const configuredPaths = Array.isArray(config.sitemap_paths) ? config.sitemap_paths : [];
+  if (configuredPaths.length > 0) {
+    return configuredPaths.map((sitemapPath) => new URL(sitemapPath, `${config.origin}/`).toString());
+  }
+
+  return [`${config.origin}/sitemap.xml`];
+}
+
+// A single-page careers site answers an unknown path with its own HTML shell and a 200
+// rather than a 404, so "the fetch succeeded" is not the same as "a sitemap was read".
+// Counting that shell as a readable sitemap is what turns a moved sitemap into a clean zero
+// instead of the error the sweep is supposed to raise, so a document has to actually look
+// like one before it counts.
+function looksLikeSitemapXml(xml) {
+  return /<(?:urlset|sitemapindex)[\s>]/i.test(String(xml || ""));
 }
 
 // Sitemap indexes point at child sitemaps; job URLs live one level down. Children whose own
@@ -386,6 +445,7 @@ async function collectCareerSiteSitemapEntries(siteKey, config, referenceEpoch) 
   const visited = new Set();
   const entries = [];
   let fetchedSitemaps = 0;
+  let lastSitemapError = null;
 
   while (pending.length > 0 && fetchedSitemaps < MAX_SITEMAPS_PER_SYNC) {
     const sitemapUrl = pending.shift();
@@ -395,7 +455,12 @@ async function collectCareerSiteSitemapEntries(siteKey, config, referenceEpoch) 
     let xml = "";
     try {
       xml = await fetchCareerSiteText(siteKey, "sitemap", sitemapUrl, "application/xml,text/xml,*/*");
-    } catch {
+    } catch (error) {
+      lastSitemapError = error;
+      continue;
+    }
+    if (!looksLikeSitemapXml(xml)) {
+      lastSitemapError = new Error(`${siteKey} sitemap request to ${sitemapUrl} answered with a non-sitemap document`);
       continue;
     }
     fetchedSitemaps += 1;
@@ -406,13 +471,30 @@ async function collectCareerSiteSitemapEntries(siteKey, config, referenceEpoch) 
       continue;
     }
 
-    const children = parsed.entries.filter(
-      (entry) => !entry.lastmod || shouldStorePostingByDate(entry.lastmod, referenceEpoch)
-    );
+    // robots.txt entries are host-checked on the way in; child sitemaps have to be too, or
+    // an index naming a CDN or a partner host would walk the sweep off the employer's site
+    // and past the one host an operator allowlisted for it.
+    const children = parsed.entries.filter((entry) => {
+      if (entry.lastmod && !shouldStorePostingByDate(entry.lastmod, referenceEpoch)) return false;
+      try {
+        return new URL(entry.loc).host.toLowerCase() === careerSiteHost(config);
+      } catch {
+        return false;
+      }
+    });
     const jobChildren = children.filter((entry) => /job/i.test(String(entry.loc || "")));
     for (const child of jobChildren.length > 0 ? jobChildren : children) {
       if (!visited.has(child.loc)) pending.push(child.loc);
     }
+  }
+
+  // Reaching no sitemap at all is not "this employer posted nothing today" -- it means the
+  // sweep never started. Returning an empty list would report that as a clean zero and hide
+  // a blocked host, a moved sitemap or a dead site behind a number that looks like a quiet
+  // hiring day, on a collector whose whole job is to notice new postings.
+  if (fetchedSitemaps === 0) {
+    throw lastSitemapError ||
+      new Error(`${siteKey} sitemap sweep found no readable sitemap under ${config.origin}`);
   }
 
   return entries;
@@ -426,13 +508,17 @@ async function collectPostingsForCareerSiteDynamic(siteKey) {
 
   const seenUrls = new Set();
   const postings = [];
+  let failedJobPages = 0;
+  let lastJobPageError = null;
 
   for (const candidateUrl of candidateUrls) {
     let html = "";
     try {
       html = await fetchCareerSiteText(siteKey, "job", candidateUrl, "text/html,application/xhtml+xml");
-    } catch {
+    } catch (error) {
       // One unreachable detail page should not abandon the rest of the sweep.
+      failedJobPages += 1;
+      lastJobPageError = error;
       continue;
     }
 
@@ -445,6 +531,14 @@ async function collectPostingsForCareerSiteDynamic(siteKey) {
 
     seenUrls.add(postingUrl);
     postings.push(posting);
+  }
+
+  // Same reasoning one level down: if the sitemap named fresh jobs and every single one of
+  // them failed to load, the sweep found nothing because it could not read, not because
+  // there was nothing to read.
+  if (candidateUrls.length > 0 && failedJobPages === candidateUrls.length) {
+    throw lastJobPageError ||
+      new Error(`${siteKey} could not read any of its ${candidateUrls.length} candidate job pages`);
   }
 
   return postings;
@@ -464,5 +558,7 @@ module.exports = {
   parseSitemapEntries,
   selectCareerSiteJobCandidates,
   parseCareerSiteJobPostingFromHtml,
-  isCareerSiteJobUrl
+  isCareerSiteJobUrl,
+  looksLikeSitemapXml,
+  discoverCareerSiteSitemapUrls
 };

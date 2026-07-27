@@ -26,18 +26,29 @@ function firstNonEmptyAmazonValue(job, keys) {
   return "";
 }
 
-// Rows carry the detail page as `job_path` ("/en/jobs/2847362/software-development-engineer").
-// Older payloads only had `id` ("jobs/2847362") and `id_icims`, so fall back through both
-// rather than dropping a posting whose primary key simply moved.
+// Rows carry the detail page as `job_path` ("/en/jobs/10485204/certified-pharmacy-technician").
+//
+// The fallbacks below it are ordered by what the board actually serves. `id_icims` is the
+// numeric job id, and /en/jobs/<id_icims> resolves on its own (verified 200 against the live
+// board). `id` is a UUID -- "6df269ff-fb01-40a9-9381-6f2dd0a9493b" -- and pasting that after
+// /en/ builds a 404, so it is only usable on the older payloads where it held a path like
+// "jobs/2847362". Trying it first, as this did, would turn a row missing `job_path` into a
+// stored posting whose link is dead rather than one that simply falls through to the id that
+// works: a broken URL is worse than a dropped row, because ATS attribution and every "open
+// this job" path downstream are derived from it.
+const AMAZON_ID_PATH_PATTERN = /^\/?jobs\/[0-9]+/i;
+
 function buildAmazonJobPostingUrl(job) {
   const jobPath = cleanAmazonText(job?.job_path);
   if (jobPath) return new URL(jobPath, `${AMAZON_BASE_ORIGIN}/`).toString();
 
-  const id = cleanAmazonText(job?.id);
-  if (id) return new URL(`/en/${id.replace(/^\/+/, "")}`, `${AMAZON_BASE_ORIGIN}/`).toString();
-
   const icimsId = cleanAmazonText(job?.id_icims);
   if (icimsId) return `${AMAZON_BASE_ORIGIN}/en/jobs/${icimsId}`;
+
+  const id = cleanAmazonText(job?.id);
+  if (id && AMAZON_ID_PATH_PATTERN.test(id)) {
+    return new URL(`/en/${id.replace(/^\/+/, "")}`, `${AMAZON_BASE_ORIGIN}/`).toString();
+  }
 
   return "";
 }

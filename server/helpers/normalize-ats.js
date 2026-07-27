@@ -44,10 +44,6 @@ const ATS_FILTER_OPTIONS = new Set([
   "amazon",
   "expedia",
   "microsoft",
-  "apple",
-  "meta",
-  "walmart",
-  "disney",
   "boeing",
   "hrmdirect",
   "talentlyft",
@@ -198,10 +194,6 @@ const ATS_FILTER_OPTION_ITEMS = Object.freeze([
   { value: "amazon", label: "Amazon Jobs" },
   { value: "expedia", label: "Expedia Group" },
   { value: "microsoft", label: "Microsoft Careers" },
-  { value: "apple", label: "Apple" },
-  { value: "meta", label: "Meta" },
-  { value: "walmart", label: "Walmart" },
-  { value: "disney", label: "Disney" },
   { value: "boeing", label: "Boeing" },
   { value: "hrmdirect", label: "HRMDirect" },
   { value: "talentlyft", label: "Talentlyft" },
@@ -554,51 +546,19 @@ function normalizeAtsFilterValue(value) {
   ) {
     return "expedia";
   }
+  // apply.careers.microsoft.com is where the board lives now; the two older spellings are
+  // kept because rows stored before the move still carry them.
   if (
     normalized === "microsoft.com" ||
     normalized === "microsoftcom" ||
     normalized === "careers.microsoft.com" ||
     normalized === "careersmicrosoftcom" ||
+    normalized === "apply.careers.microsoft.com" ||
+    normalized === "applycareersmicrosoftcom" ||
     normalized === "jobs.careers.microsoft.com" ||
-    normalized === "jobscareersmicrosoftcom" ||
-    normalized === "gcsservices.careers.microsoft.com" ||
-    normalized === "gcsservicescareersmicrosoftcom"
+    normalized === "jobscareersmicrosoftcom"
   ) {
     return "microsoft";
-  }
-  if (
-    normalized === "apple.com" ||
-    normalized === "applecom" ||
-    normalized === "jobs.apple.com" ||
-    normalized === "jobsapplecom"
-  ) {
-    return "apple";
-  }
-  if (
-    normalized === "metacareers" ||
-    normalized === "metacareers.com" ||
-    normalized === "metacareerscom" ||
-    normalized === "www.metacareers.com" ||
-    normalized === "wwwmetacareerscom"
-  ) {
-    return "meta";
-  }
-  if (
-    normalized === "walmart.com" ||
-    normalized === "walmartcom" ||
-    normalized === "careers.walmart.com" ||
-    normalized === "careerswalmartcom"
-  ) {
-    return "walmart";
-  }
-  if (
-    normalized === "disneycareers" ||
-    normalized === "disneycareers.com" ||
-    normalized === "disneycareerscom" ||
-    normalized === "jobs.disneycareers.com" ||
-    normalized === "jobsdisneycareerscom"
-  ) {
-    return "disney";
   }
   if (
     normalized === "boeing.com" ||
@@ -834,11 +794,10 @@ function inferAtsFromJobPostingUrl(value) {
   if (url.includes("hcareers.com/jobs/")) return "hcareers";
   if (url.includes("amazon.jobs/") && url.includes("/jobs/")) return "amazon";
   if (url.includes("careers.expediagroup.com/job")) return "expedia";
+  // The Microsoft board moved from jobs.careers.microsoft.com to apply.careers.microsoft.com.
+  // Both spellings stay readable so rows stored under the old host keep their attribution.
+  if (url.includes("apply.careers.microsoft.com/") && url.includes("/job/")) return "microsoft";
   if (url.includes("jobs.careers.microsoft.com/") && url.includes("/job/")) return "microsoft";
-  if (url.includes("jobs.apple.com/") && url.includes("/details/")) return "apple";
-  if (url.includes("metacareers.com/jobs/")) return "meta";
-  if (url.includes("careers.walmart.com/") && url.includes("/job")) return "walmart";
-  if (url.includes("jobs.disneycareers.com/job/")) return "disney";
   if (url.includes("jobs.boeing.com/job/")) return "boeing";
   if (url.includes(".hrmdirect.com/employment/job-opening.php")) return "hrmdirect";
   if (url.includes(".talentlyft.com/jobs/")) return "talentlyft";

@@ -64,21 +64,25 @@ function testConfigTableIsSelfConsistent() {
 }
 
 function testRepresentativeJobUrlsPerEmployer() {
-  // One real-shaped URL per employer, so a config typo shows up as a failing test rather
-  // than a sweep that silently fetches nothing.
+  // One real URL per employer, copied from that board's live sitemap rather than invented
+  // from the shape its URLs looked like they had. That distinction is the whole point of
+  // this case: the config table originally carried a Walmart pattern written against
+  // "/us/jobs/WD1234567-...", and the board actually publishes "/us/en/jobs/R-1075582",
+  // which the pattern did not match. A pattern that matches nothing fails silently -- the
+  // sweep reports zero candidates and looks like a quiet hiring day -- so a typo here has
+  // to show up as a failing test.
   const cases = [
-    ["expedia", "https://careers.expediagroup.com/job/sr-finance-analyst/chicago-IL/R-100047/", true],
+    ["expedia", "https://careers.expediagroup.com/job/security-engineer-ii-threat-detection/gurgaon-hary-na/R-107165/", true],
     ["expedia", "https://careers.expediagroup.com/jobs/", false],
     ["expedia", "https://careers.expediagroup.com/jobs/search", false],
-    ["apple", "https://jobs.apple.com/en-us/details/200612345/senior-software-engineer", true],
-    ["apple", "https://jobs.apple.com/en-us/search", false],
-    ["meta", "https://www.metacareers.com/jobs/1234567890123456/", true],
-    ["meta", "https://www.metacareers.com/jobs/", false],
-    ["walmart", "https://careers.walmart.com/us/jobs/WD1234567-software-engineer", true],
-    ["walmart", "https://careers.walmart.com/us/jobs", false],
-    ["disney", "https://jobs.disneycareers.com/job/orlando/ride-mechanic/391/12345678", true],
-    ["disney", "https://jobs.disneycareers.com/search-jobs", false],
-    ["boeing", "https://jobs.boeing.com/job/seattle/structures-engineer/185/98765432", true],
+    [
+      "microsoft",
+      "https://apply.careers.microsoft.com/careers/job/1970393556913009-support-escalation-manager-australia?domain=microsoft.com",
+      true
+    ],
+    ["microsoft", "https://apply.careers.microsoft.com/careers?domain=microsoft.com", false],
+    ["boeing", "https://jobs.boeing.com/job/wichita/entry-level-manufacturing-planner/185/98381256240", true],
+    ["boeing", "https://jobs.boeing.com/category/engineering-jobs/185/11125/1", false],
     ["boeing", "https://jobs.boeing.com/", false]
   ];
 
@@ -214,7 +218,7 @@ function testJsonLdParsing() {
   // names no employer falls back to the site's own name -- which is why every config
   // carries one.
   const hourlyRemote = parseCareerSiteJobPostingFromHtml(
-    getCareerSiteConfig("disney"),
+    getCareerSiteConfig("boeing"),
     buildJsonLdPage({
       "@type": "JobPosting",
       title: "Guest Services Host",
@@ -226,14 +230,14 @@ function testJsonLdParsing() {
         value: { "@type": "QuantitativeValue", value: 22.5, unitText: "HOUR" }
       }
     }),
-    "https://jobs.disneycareers.com/job/orlando/guest-services-host/391/1/"
+    "https://jobs.boeing.com/job/orlando/guest-services-host/185/98380876688"
   );
   assert.equal(
     hourlyRemote.job_posting_url,
-    "https://jobs.disneycareers.com/job/orlando/guest-services-host/391/1/",
+    "https://jobs.boeing.com/job/orlando/guest-services-host/185/98380876688",
     "a posting that omits its own url falls back to the page it came from"
   );
-  assert.equal(hourlyRemote.company_name, "The Walt Disney Company");
+  assert.equal(hourlyRemote.company_name, "Boeing");
   assert.equal(hourlyRemote.location, "Remote");
   assert.equal(hourlyRemote.compensation_type, "hourly");
   assert.equal(hourlyRemote.pay_min, 22.5);

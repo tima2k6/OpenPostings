@@ -92,10 +92,14 @@ function run() {
 
   // The stored date has to age correctly, otherwise the 24h retention pass either keeps
   // stale rows or drops fresh ones.
+  // "July 26, 2026" names a day, not an instant, and the shared parser resolves a bare day
+  // in the host's own timezone. Asserting a UTC midnight here passed only on a UTC box and
+  // failed by the offset anywhere else, so the expectation is built the same way the parser
+  // reads it.
   const referenceEpoch = Math.floor(Date.UTC(2026, 6, 27, 12, 0, 0) / 1000);
   assert.equal(
     parsePostingDateToEpochSeconds("July 26, 2026", referenceEpoch),
-    Math.floor(Date.UTC(2026, 6, 26, 0, 0, 0) / 1000),
+    Math.floor(new Date(2026, 6, 26, 0, 0, 0).getTime() / 1000),
     "an absolute posted date should parse to that day"
   );
   const relativeEpoch = parsePostingDateToEpochSeconds("3 hours ago", nowEpochSeconds());
