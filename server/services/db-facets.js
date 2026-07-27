@@ -18,7 +18,10 @@ const { rowMatchesLocationFilters, STATE_CODE_TO_NAME } = require("../helpers/de
 const { inferPostingLocationFromJobUrl, inferAtsFromJobPostingUrl } = require("../helpers/normalize-ats.js");
 
 const FACET_CANDIDATE_CAP = 25000;
-const TOP_N = 14;
+// Facets populate dropdowns rather than a truncated chip list, so every observed value is
+// returned. The bound exists only to stop a pathological set producing an unbounded
+// response; on this data the largest facet (title words) is well under it.
+const TOP_N = 20000;
 
 // Words that appear in so many titles that counting them says nothing about the set.
 const TITLE_STOPWORDS = new Set([
@@ -116,13 +119,10 @@ async function computeFacets(input = {}) {
     hidden: rows.length - visible,
     with_pay: withPay,
     facets: {
-      // Every state that appears, not the top N. States are a bounded set, and truncating
-      // by count means anyone outside the few biggest markets never sees their own state
-      // to click -- the list is dominated by CA/TX/NY long before WA shows up.
-      states: top(byState, 60),
+      states: top(byState),
       companies: top(byCompany),
       title_words: top(byWord),
-      ats: top(byAts, 8)
+      ats: top(byAts)
     }
   };
 }
