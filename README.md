@@ -352,10 +352,31 @@ MCP helper endpoints:
 
 You can have Codex/Claude/Gemini/Qwen/LLMs do the following for you:
 - Get your applicantee information `get_applicant_context`
+- List every filter value it can search on `get_filter_options`
 - Find the latest relevant jobs for you. `find_posting_candidates`
 - Apply to those jobs (As long as your LLM model has access to a browser)
 - Build a dynamic cover letter for you that relates to your resume, experience and the job you are applying for. `draft_cover_letter`
 - Update job application tracking for you. `record_application_result`
+
+`find_posting_candidates` runs the same filter engine as the app's job list, so the agent can
+search on anything the app can:
+
+| | |
+|---|---|
+| Text | `search` |
+| Source | `ats` |
+| Role | `industries` |
+| Pay | `compensation_types`, `pay_periods`, `pay_min`, `pay_max` |
+| Requirements | `education_levels` |
+| Location | `states`, `counties`, `countries`, `regions`, `remote` |
+| Listing | `sort_by`, `hide_no_date`, `limit`, `offset` |
+| State | `include_applied`, `include_ignored`, `include_descriptions` |
+
+Any filter left empty falls back to the matching preference in `Settings > MCP Settings`; pass
+`use_settings=false` to search without them. Postings you have already applied to or ignored
+are left out unless you ask for them, and job descriptions are omitted unless you set
+`include_descriptions=true`. Call `get_filter_options` first for the valid values — an
+industry key or county that is not on that list matches nothing rather than raising an error.
 
 To turn on the MCP server so your model can interact with OpenPostings run:
 

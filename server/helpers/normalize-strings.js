@@ -43,8 +43,19 @@ function escapeRegExp(value) {
   return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// Accented letters are folded to their base letter rather than being dropped. The
+// [^a-z0-9] pass below turns anything non-ASCII into a *separator*, so without this an
+// accent silently splits a place name in two: "Österreich" became "sterreich", "España"
+// became "espa a" and "México" became "m xico". A name broken that way matches no country
+// alias, so those postings were unreachable by the country filter.
+//
+// NFD splits a precomposed letter into base + combining mark, which the range below then
+// strips. Letters with no decomposition (ø, ß, ł) are unaffected and still normalize the
+// same way on both sides of a comparison, so nothing that matched before stops matching.
 function normalizeGeoText(value) {
   return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .replace(/&/g, " and ")
     .replace(/['’]/g, "")

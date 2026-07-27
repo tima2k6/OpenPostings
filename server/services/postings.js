@@ -270,13 +270,16 @@ async function getPostingLocationGeoFilterOptions() {
   // The map can be ahead of the stored column for rows the running sync has touched
   // but not yet flushed, so consider both.
   const allLocations = new Set([...storedLocations, ...postingLocationByJobUrl.values()]);
+  // Only locations that resolve to an ISO country contribute an option. inferLocationGeo
+  // leaves countryCode empty for the rest, which is most of them -- two thirds of the
+  // distinct locations in a full database name no country at all.
   for (const location of allLocations) {
     const inferred = inferLocationGeo(location);
-    if (inferred.countryValue && inferred.countryLabel) {
-      const existing = countriesByValue.get(inferred.countryValue);
+    if (inferred.countryCode && inferred.countryLabel) {
+      const existing = countriesByValue.get(inferred.countryCode);
       if (!existing) {
-        countriesByValue.set(inferred.countryValue, {
-          value: inferred.countryValue,
+        countriesByValue.set(inferred.countryCode, {
+          value: inferred.countryCode,
           label: inferred.countryLabel,
           region: inferred.region || ""
         });

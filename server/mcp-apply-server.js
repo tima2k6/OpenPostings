@@ -1,535 +1,54 @@
+// The MCP apply agent, served over stdio.
+//
+// Matching now runs through the same services the HTTP API uses. This file used to carry its
+// own copies of the state, county, remote and industry matchers -- roughly 700 lines -- and
+// they drifted: the agent could filter on six criteria while the app it applies on behalf of
+// offered fifteen, and the duplicated location code had to be pinned to the shared helper by
+// a dedicated test to stop the two disagreeing about "Washington, DC". Nothing here decides
+// what matches any more; it only maps tool arguments and saved preferences onto
+// listPostingsWithFilters.
 const path = require("path");
 const { open } = require("sqlite");
 const sqlite3 = require("sqlite3");
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const z = require("zod");
-// Shared with the API server. This file used to carry its own copy of the ATS
-// registry and of both normalizers, which had drifted four ATSs behind.
-const {
-  ATS_FILTER_OPTIONS,
-  normalizeAtsFilters,
-  inferAtsFromJobPostingUrl
-} = require("./helpers/normalize-ats.js");
-const { inferLocationGeo } = require("./helpers/description-filters.js");
 
-const ROOT_DIR = path.resolve(__dirname, "..", "..");
+const { ATS_FILTER_OPTIONS } = require("./helpers/normalize-ats.js");
+const {
+  COMPENSATION_TYPES,
+  COMPENSATION_PAY_PERIODS,
+  EDUCATION_LEVELS,
+  LOCATION_REGION_OPTIONS
+} = require("./helpers/description-filters.js");
+const { nowEpochSeconds, parseNonNegativeInteger, normalizeBoolean } = require("./helpers/normalize-numbers.js");
+const {
+  normalizeLikeText,
+  normalizeStringArray,
+  normalizeAppliedByType,
+  normalizeAppliedByLabel
+} = require("./helpers/normalize-strings.js");
+const { MCP_SETTINGS_DEFAULTS } = require("./helpers/normalize-mcp-settings.js");
+const { setDb } = require("./services/runtime-context.js");
+const { getMcpSettings, buildMcpRunbook, buildCoverLetterDraft } = require("./services/mcp.js");
+const { getPersonalInformation } = require("./services/personal-info.js");
+const { listPostingsWithFilters } = require("./services/postings.js");
+const { getPostingFilterOptions } = require("./services/filter-options.js");
+const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime } = require("./services/sync-settings.js");
+
 const DB_PATH = process.env.DB_PATH || path.resolve(__dirname, "..", "jobs.db");
 
-const GENERIC_TITLE_LIKE_PARTS = new Set([
-  "and",
-  "for",
-  "with",
-  "from",
-  "the",
-  "manager",
-  "assistant",
-  "associate",
-  "specialist",
-  "coordinator",
-  "director",
-  "officer",
-  "analyst",
-  "consultant",
-  "lead",
-  "senior",
-  "junior",
-  "staff",
-  "team",
-  "services",
-  "service",
-  "operations",
-  "operation",
-  "support"
-]);
-const WEAK_INDUSTRY_LIKE_PARTS = new Set([
-  ...GENERIC_TITLE_LIKE_PARTS,
-  "account",
-  "accounts",
-  "representative",
-  "executive",
-  "management",
-  "area",
-  "group",
-  "international",
-  "care",
-  "inside",
-  "outside",
-  "hourly",
-  "commission",
-  "anywhere",
-  "can",
-  "small",
-  "planning",
-  "compliance",
-  "core",
-  "safety",
-  "import",
-  "export",
-  "brand",
-  "ambassador",
-  "customer",
-  "business",
-  "field",
-  "division",
-  "product"
-]);
-const IT_SOFTWARE_INDUSTRY_KEY = "information_technology_software";
-const SALES_BUSINESS_INDUSTRY_KEY = "sales_business_development";
-const IT_TECH_ANCHOR_PARTS = new Set([
-  "software",
-  "developer",
-  "development",
-  "engineer",
-  "engineering",
-  "devops",
-  "platform",
-  "cloud",
-  "security",
-  "cybersecurity",
-  "cyber",
-  "infrastructure",
-  "network",
-  "systems",
-  "system",
-  "administrator",
-  "database",
-  "sql",
-  "data",
-  "analytics",
-  "architect",
-  "automation",
-  "backend",
-  "frontend",
-  "fullstack",
-  "application",
-  "applications",
-  "qa",
-  "test",
-  "testing",
-  "machine",
-  "learning",
-  "mlops",
-  "ai"
-]);
-const IT_HIGH_SIGNAL_ANCHOR_PARTS = new Set([
-  "software",
-  "developer",
-  "development",
-  "engineer",
-  "engineering",
-  "devops",
-  "platform",
-  "cloud",
-  "security",
-  "cybersecurity",
-  "cyber",
-  "infrastructure",
-  "network",
-  "systems",
-  "system",
-  "administrator",
-  "database",
-  "sql",
-  "architect",
-  "automation",
-  "backend",
-  "frontend",
-  "fullstack",
-  "mlops",
-  "machine",
-  "learning",
-  "ai"
-]);
-const IT_SALES_GTM_ROLE_REGEX =
-  /\b(account executive|account manager|business development|brand ambassador|go[\s-]?to[\s-]?market|gtm|inside sales|outside sales|sales representative|territory manager|partnerships?|sales(?!force\b))\b/i;
-const SALES_EXCLUSIVE_ROLE_REGEX =
-  /\b(account executive|account manager|business development|brand ambassador|inside sales|outside sales|sales representative|sales manager|sales director|sales consultant|sales specialist|sales associate|sales advisor|presales?|telesales|territory manager|channel sales|partner sales|salesperson|salesman|salesworker|sales(?!force\b))\b/i;
-
-const STATE_CODE_TO_NAME = {
-  AL: "alabama",
-  AK: "alaska",
-  AZ: "arizona",
-  AR: "arkansas",
-  CA: "california",
-  CO: "colorado",
-  CT: "connecticut",
-  DE: "delaware",
-  FL: "florida",
-  GA: "georgia",
-  HI: "hawaii",
-  ID: "idaho",
-  IL: "illinois",
-  IN: "indiana",
-  IA: "iowa",
-  KS: "kansas",
-  KY: "kentucky",
-  LA: "louisiana",
-  ME: "maine",
-  MD: "maryland",
-  MA: "massachusetts",
-  MI: "michigan",
-  MN: "minnesota",
-  MS: "mississippi",
-  MO: "missouri",
-  MT: "montana",
-  NE: "nebraska",
-  NV: "nevada",
-  NH: "new hampshire",
-  NJ: "new jersey",
-  NM: "new mexico",
-  NY: "new york",
-  NC: "north carolina",
-  ND: "north dakota",
-  OH: "ohio",
-  OK: "oklahoma",
-  OR: "oregon",
-  PA: "pennsylvania",
-  RI: "rhode island",
-  SC: "south carolina",
-  SD: "south dakota",
-  TN: "tennessee",
-  TX: "texas",
-  UT: "utah",
-  VT: "vermont",
-  VA: "virginia",
-  WA: "washington",
-  WV: "west virginia",
-  WI: "wisconsin",
-  WY: "wyoming",
-  DC: "district of columbia"
-};
-
-// Dash-followed-by-whitespace, mirroring splitLocationIntoCountryCandidateSegments in
-// description-filters.js -- see the note there. Workday's URL-inferred locations
-// ("Washington- Seattle Campus") have no space before the dash, and requiring one made
-// every Workday posting unreachable by state filters.
-function splitLocationIntoSegments(locationText) {
-  return String(locationText || "")
-    .split(/[,/|;]+|\s*-\s+/)
-    .map((segment) => segment.trim())
-    .filter(Boolean);
-}
-
-const MCP_SETTINGS_DEFAULTS = {
-  enabled: false,
-  preferred_agent_name: "OpenPostings Agent",
-  agent_login_email: "",
-  agent_login_password: "",
-  mfa_login_email: "",
-  mfa_login_notes: "",
-  dry_run_only: true,
-  require_final_approval: true,
-  max_applications_per_run: 10,
-  preferred_search: "",
-  preferred_remote: "all",
-  preferred_industries: [],
-  preferred_states: [],
-  preferred_counties: [],
-  instructions_for_agent: ""
-};
 const MCP_ATS_FILTER_VALUES = Object.freeze(Array.from(ATS_FILTER_OPTIONS));
-const PHRASE_NGRAM_INDUSTRY_COVERAGE_THRESHOLD = 2;
-const FALLBACK_WORD_INDUSTRY_COVERAGE_THRESHOLD = 2;
-const MIN_INDUSTRY_FALLBACK_WORD_COUNT = 3;
-const MIN_INDUSTRY_PHRASE_NGRAM_COUNT = 2;
+const MCP_REGION_FILTER_VALUES = Object.freeze(LOCATION_REGION_OPTIONS.map((option) => option.value));
+const MCP_REMOTE_FILTER_VALUES = Object.freeze(["all", "remote", "hybrid", "non_remote"]);
+const MCP_SORT_VALUES = Object.freeze(["recent", "company_asc"]);
+const MAX_CANDIDATE_LIMIT = 2000;
 
 let db;
-let wordIndustryCoverageCache = null;
-let phraseNgramIndustryCoverageCache = null;
-
-function nowEpochSeconds() {
-  return Math.floor(Date.now() / 1000);
-}
-
-function normalizeLikeText(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ");
-}
-
-function parseNonNegativeInteger(value) {
-  const parsed = Number.parseInt(String(value ?? "").trim(), 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
-}
-
-function normalizeBoolean(value, defaultValue = false) {
-  if (typeof value === "boolean") return value;
-  const normalized = normalizeLikeText(value);
-  if (!normalized) return Boolean(defaultValue);
-  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
-}
-
-function normalizeRemoteFilter(value) {
-  const normalized = normalizeLikeText(value);
-  if (normalized === "remote" || normalized === "hybrid" || normalized === "non_remote") return normalized;
-  return "all";
-}
 
 function ensureMcpAgentEnabled(settings) {
   if (normalizeBoolean(settings?.enabled, false)) return;
   throw new Error("MCP application agent is disabled in settings.");
-}
-
-function normalizeCountyName(value) {
-  return normalizeLikeText(value)
-    .replace(/\b(county|parish|borough|census area|municipality)\b/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function parseCountyFilters(values) {
-  const parsed = [];
-  for (const rawValue of values || []) {
-    const value = String(rawValue || "").trim();
-    if (!value) continue;
-
-    if (value.includes("|")) {
-      const [stateRaw, countyRaw] = value.split("|");
-      const stateCode = String(stateRaw || "").trim().toUpperCase();
-      const countyLikePart = normalizeCountyName(countyRaw);
-      if (!countyLikePart) continue;
-      parsed.push({ stateCode, countyLikePart });
-      continue;
-    }
-
-    const countyLikePart = normalizeCountyName(value);
-    if (!countyLikePart) continue;
-    parsed.push({ stateCode: "", countyLikePart });
-  }
-  return parsed;
-}
-
-function createLikeParts(value) {
-  const normalized = normalizeLikeText(value);
-  if (!normalized) return [];
-  return normalized
-    .split(/[^a-z0-9]+/)
-    .map((part) => part.trim())
-    .filter((part) => part.length >= 3 && !GENERIC_TITLE_LIKE_PARTS.has(part));
-}
-
-function buildWordNgrams(words, minSize = 2, maxSize = 3) {
-  const source = Array.isArray(words) ? words : [];
-  const ngrams = [];
-  for (let size = minSize; size <= maxSize; size += 1) {
-    if (source.length < size) continue;
-    for (let index = 0; index <= source.length - size; index += 1) {
-      const gram = source.slice(index, index + size).join(" ").trim();
-      if (gram) ngrams.push(gram);
-    }
-  }
-  return ngrams;
-}
-
-function hasBareStateCodeSegmentMatch(locationText, code) {
-  const segments = splitLocationIntoSegments(locationText).map((segment) => segment.toUpperCase());
-  for (const segment of segments) {
-    const words = segment.split(/\s+/).filter(Boolean);
-    if (words.length === 0) continue;
-    if (words[0] === code) return true;
-    const lastWord = words[words.length - 1];
-    if (lastWord === code) return true;
-    if (words.length >= 2 && words[words.length - 2] === code && /^\d{5}(-\d{4})?$/.test(lastWord)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// Mirrors hasStateCodeSlugMatch in description-filters.js -- see the note there. Reads the
-// hyphenated slug shapes ("US-WA-Redmond", "TX-Katy-77494") that leave no separate token
-// for the bare-code check above to find.
-function hasStateCodeSlugMatch(locationText, code) {
-  const stateName = STATE_CODE_TO_NAME[code];
-
-  return splitLocationIntoSegments(locationText).some((segment) => {
-    const parts = String(segment)
-      .split("-")
-      .map((part) => part.trim())
-      .filter(Boolean);
-    if (parts.length < 2) return false;
-
-    if (parts[0].toUpperCase() === "US") {
-      if (parts[1].toUpperCase() === code) return true;
-      if (stateName && normalizeLikeText(parts[1]) === stateName) return true;
-    }
-
-    if (parts[0].toUpperCase() !== code) return false;
-    const lastToken = String(parts[parts.length - 1]).split(/\s+/)[0];
-    return /^\d{5}$/.test(lastToken);
-  });
-}
-
-// Only treats a state name (e.g. "washington") as a match when it's the entire content of a
-// comma/dash-separated segment, e.g. "Seattle, Washington" — not when it's merely one word inside
-// a longer place name segment like "Fort Washington" or "West Virginia".
-function hasStateNameSegmentMatch(locationText, stateName) {
-  const segments = splitLocationIntoSegments(locationText);
-  return segments.some((segment) => normalizeLikeText(segment) === stateName);
-}
-
-// Built once; see the note on STATE_NAME_TO_CODE in description-filters.js.
-const STATE_NAME_TO_CODE = new Map(
-  Object.entries(STATE_CODE_TO_NAME).map(([code, name]) => [name, code])
-);
-
-function isDifferentState(segment, code) {
-  const segmentCode = String(segment || "").trim().toUpperCase();
-  if (STATE_CODE_TO_NAME[segmentCode] && segmentCode !== code) return true;
-
-  const matchedCode = STATE_NAME_TO_CODE.get(normalizeLikeText(segment));
-  return Boolean(matchedCode) && matchedCode !== code;
-}
-
-// Mirrors hasStateNameGroupMatch in description-filters.js -- see the note there. A state
-// name segment is a town when the next segment names a different state ("Washington, PA")
-// or a non-US country sits alongside it ("Washington, Tyne and Wear, United Kingdom").
-// Scoped per location group so "Seattle, Washington / Portland, OR" keeps its WA match.
-//
-// The country half defers to inferLocationGeo from the shared helper rather than growing
-// another hand-maintained table here -- the same direction commit a9fa375 took the ATS
-// registry, and a step toward retiring this duplicated filter logic entirely.
-function hasStateNameGroupMatch(locationText, stateName, code) {
-  const groups = String(locationText || "")
-    .split(/[/|;]+/)
-    .map((group) => group.trim())
-    .filter(Boolean);
-
-  return groups.some((group) => {
-    const segments = group
-      .split(/,+|\s*-\s+/)
-      .map((segment) => segment.trim())
-      .filter(Boolean);
-
-    const nameIndex = segments.findIndex((segment) => normalizeLikeText(segment) === stateName);
-    if (nameIndex < 0) return false;
-
-    const next = segments[nameIndex + 1];
-    if (next && isDifferentState(next, code)) return false;
-
-    const geo = inferLocationGeo(group);
-    return !(geo?.countryCode && geo.countryCode !== "US");
-  });
-}
-
-function hasStateLikeMatch(locationText, stateCode) {
-  const code = String(stateCode || "").trim().toUpperCase();
-  if (!code) return false;
-
-  if (hasBareStateCodeSegmentMatch(locationText, code)) return true;
-  if (hasStateCodeSlugMatch(locationText, code)) return true;
-
-  const stateName = STATE_CODE_TO_NAME[code];
-  if (!stateName) return false;
-
-  if (!hasStateNameGroupMatch(locationText, stateName, code)) return false;
-
-  const normalizedLocation = normalizeLikeText(locationText);
-  if (code === "WA") {
-    // normalizeLikeText keeps commas, so the fused-variant regex below never matched the
-    // ordinary "Washington, DC" form -- the separator between "washington" and "dc" is
-    // ", " and the pattern only allowed spaces and dashes. That made this guard dead for
-    // the one spelling that actually occurs in the data, and DC postings passed as WA.
-    // Collapse separators first, mirroring normalizeGeoText in description-filters.js.
-    const collapsedLocation = normalizedLocation.replace(/[.,/-]+/g, " ").replace(/\s+/g, " ").trim();
-    if (collapsedLocation.includes(STATE_CODE_TO_NAME.DC)) return false;
-    // Trailing boundary is deliberately omitted so fused variants ("washington dcmetro
-    // area") stay caught, matching the previous intent.
-    if (/\bwashington\s*d\s*c/.test(collapsedLocation)) return false;
-  }
-
-  return true;
-}
-
-function rowMatchesLocationFilters(locationText, selectedStateCodes, countyFilters) {
-  const stateCodes = Array.isArray(selectedStateCodes) ? selectedStateCodes : [];
-  const counties = Array.isArray(countyFilters) ? countyFilters : [];
-  if (stateCodes.length === 0 && counties.length === 0) return true;
-
-  const location = String(locationText || "").trim();
-  if (!location) return false;
-  const normalizedLocation = normalizeLikeText(location);
-
-  if (stateCodes.length > 0) {
-    const hasSelectedState = stateCodes.some((stateCode) => hasStateLikeMatch(location, stateCode));
-    if (!hasSelectedState) return false;
-  }
-
-  if (counties.length > 0) {
-    const matchesCounty = counties.some((countyFilter) => {
-      const countyLikePart = String(countyFilter?.countyLikePart || "").trim();
-      if (!countyLikePart) return false;
-
-      if (countyFilter.stateCode && !hasStateLikeMatch(location, countyFilter.stateCode)) {
-        return false;
-      }
-
-      return (
-        normalizedLocation.includes(countyLikePart) ||
-        normalizedLocation.includes(`${countyLikePart} county`) ||
-        normalizedLocation.includes(`${countyLikePart} parish`) ||
-        normalizedLocation.includes(`${countyLikePart} borough`) ||
-        normalizedLocation.includes(`${countyLikePart} census area`)
-      );
-    });
-
-    if (!matchesCounty) return false;
-  }
-
-  return true;
-}
-
-function classifyLocationWorkMode(locationText) {
-  const normalized = normalizeLikeText(locationText);
-  if (!normalized) return "non_remote";
-  const hasHybrid = normalized.includes("hybrid");
-  const hasRemote = normalized.includes("remote") || normalized.includes("work from home") || normalized.includes("wfh");
-  if (hasHybrid) return "hybrid";
-  if (hasRemote) return "remote";
-  return "non_remote";
-}
-
-function rowMatchesRemoteFilter(locationText, remoteFilter) {
-  const normalized = normalizeRemoteFilter(remoteFilter);
-  if (normalized === "all") return true;
-  const mode = classifyLocationWorkMode(locationText);
-  if (normalized === "remote") return mode === "remote";
-  if (normalized === "hybrid") return mode === "hybrid";
-  if (normalized === "non_remote") return mode === "non_remote";
-  return true;
-}
-
-function inferWorkdayLocationFromJobUrl(jobPostingUrl) {
-  try {
-    const parsed = new URL(String(jobPostingUrl || ""));
-    const pathParts = parsed.pathname
-      .split("/")
-      .map((part) => String(part || "").trim())
-      .filter(Boolean);
-    const jobIndex = pathParts.findIndex((part) => part.toLowerCase() === "job");
-    if (jobIndex >= 0 && pathParts[jobIndex + 1]) {
-      return decodeURIComponent(pathParts[jobIndex + 1]).replace(/-/g, " ").replace(/\s+/g, " ").trim();
-    }
-    return "";
-  } catch {
-    return "";
-  }
-}
-
-function inferLocationFromJobUrl(jobPostingUrl) {
-  const url = String(jobPostingUrl || "").trim();
-  if (!url) return "";
-  try {
-    const parsed = new URL(url);
-    if (parsed.hostname.endsWith("myworkdayjobs.com")) {
-      return inferWorkdayLocationFromJobUrl(url);
-    }
-    return "";
-  } catch {
-    return "";
-  }
 }
 
 async function ensureTables() {
@@ -578,6 +97,8 @@ async function ensureTables() {
       preferred_search TEXT NOT NULL DEFAULT '',
       preferred_remote TEXT NOT NULL DEFAULT 'all',
       preferred_industries TEXT NOT NULL DEFAULT '[]',
+      preferred_regions TEXT NOT NULL DEFAULT '[]',
+      preferred_countries TEXT NOT NULL DEFAULT '[]',
       preferred_states TEXT NOT NULL DEFAULT '[]',
       preferred_counties TEXT NOT NULL DEFAULT '[]',
       instructions_for_agent TEXT NOT NULL DEFAULT '',
@@ -619,10 +140,12 @@ async function ensureTables() {
       preferred_search,
       preferred_remote,
       preferred_industries,
+      preferred_regions,
+      preferred_countries,
       preferred_states,
       preferred_counties,
       instructions_for_agent
-    ) VALUES (1, 0, 'OpenPostings Agent', '', '', '', 1, 1, 10, '', 'all', '[]', '[]', '[]', '')
+    ) VALUES (1, 0, 'OpenPostings Agent', '', '', '', 1, 1, 10, '', 'all', '[]', '[]', '[]', '[]', '[]', '')
     ON CONFLICT(id) DO NOTHING;
   `);
 
@@ -655,6 +178,21 @@ async function ensureTables() {
       ADD COLUMN agent_login_password TEXT NOT NULL DEFAULT '';
     `);
   }
+  // Mirrors the migrations in the API server. Without them a database whose McpSettings table
+  // predates these columns makes every settings read fail here, because the shared reader
+  // names both columns in its SELECT.
+  if (!mcpSettingsColumnNames.has("preferred_regions")) {
+    await db.exec(`
+      ALTER TABLE McpSettings
+      ADD COLUMN preferred_regions TEXT NOT NULL DEFAULT '[]';
+    `);
+  }
+  if (!mcpSettingsColumnNames.has("preferred_countries")) {
+    await db.exec(`
+      ALTER TABLE McpSettings
+      ADD COLUMN preferred_countries TEXT NOT NULL DEFAULT '[]';
+    `);
+  }
 }
 
 async function openDatabase() {
@@ -662,506 +200,86 @@ async function openDatabase() {
     filename: DB_PATH,
     driver: sqlite3.Database
   });
+  // The shared services read their handle from the runtime context rather than taking one.
+  setDb(db);
   await ensureTables();
+  // Freshness and enabled-ATS live in the sync settings, and listPostingsWithFilters applies
+  // the freshness window from process state. Without this the agent would silently use the
+  // default window instead of the one configured for this instance.
+  await ensureSyncServiceSettingsTable();
+  await loadSyncServiceSettingsIntoRuntime();
 }
 
-async function getPersonalInformation() {
-  const row = await db.get(
-    `
-      SELECT
-        first_name,
-        middle_name,
-        last_name,
-        email,
-        phone_number,
-        address,
-        linkedin_url,
-        github_url,
-        portfolio_url,
-        resume_file_path,
-        projects_portfolio_file_path,
-        certifications_folder_path,
-        ethnicity,
-        gender,
-        age,
-        veteran_status,
-        disability_status,
-        education_level,
-        years_of_experience
-      FROM PersonalInformation
-      ORDER BY rowid ASC
-      LIMIT 1;
-    `
-  );
-  return row || {};
+// An explicitly passed filter replaces the saved preference; an empty one falls back to it,
+// unless the caller opted out of preferences entirely.
+function resolveListFilter(explicitValues, preferredValues, useSettings) {
+  const explicit = normalizeStringArray(explicitValues);
+  if (explicit.length > 0) return explicit;
+  return useSettings ? normalizeStringArray(preferredValues) : [];
 }
 
-function parseJsonArray(value) {
-  try {
-    const parsed = JSON.parse(String(value || "[]"));
-    if (!Array.isArray(parsed)) return [];
-    return parsed.map((item) => String(item || "").trim()).filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
-async function getMcpSettings() {
-  const row = await db.get(
-    `
-      SELECT
-        enabled,
-        preferred_agent_name,
-        agent_login_email,
-        agent_login_password,
-        mfa_login_email,
-        mfa_login_notes,
-        dry_run_only,
-        require_final_approval,
-        max_applications_per_run,
-        preferred_search,
-        preferred_remote,
-        preferred_industries,
-        preferred_states,
-        preferred_counties,
-        instructions_for_agent
-      FROM McpSettings
-      WHERE id = 1
-      LIMIT 1;
-    `
-  );
-
-  const agentLoginEmail = String(row?.agent_login_email || "");
-  return {
-    ...MCP_SETTINGS_DEFAULTS,
-    enabled: Boolean(Number(row?.enabled || 0)),
-    preferred_agent_name: String(row?.preferred_agent_name || MCP_SETTINGS_DEFAULTS.preferred_agent_name),
-    agent_login_email: agentLoginEmail,
-    agent_login_password: String(row?.agent_login_password || ""),
-    mfa_login_email: agentLoginEmail,
-    mfa_login_notes: String(row?.mfa_login_notes || ""),
-    dry_run_only: row?.dry_run_only === undefined ? true : Boolean(Number(row?.dry_run_only)),
-    require_final_approval:
-      row?.require_final_approval === undefined ? true : Boolean(Number(row?.require_final_approval)),
-    max_applications_per_run: parseNonNegativeInteger(row?.max_applications_per_run) || 10,
-    preferred_search: String(row?.preferred_search || ""),
-    preferred_remote: normalizeRemoteFilter(row?.preferred_remote),
-    preferred_industries: parseJsonArray(row?.preferred_industries),
-    preferred_states: parseJsonArray(row?.preferred_states).map((state) => state.toUpperCase()),
-    preferred_counties: parseJsonArray(row?.preferred_counties),
-    instructions_for_agent: String(row?.instructions_for_agent || "")
-  };
-}
-
-async function buildIndustryMatchersByKey(industryKeys) {
-  if (!Array.isArray(industryKeys) || industryKeys.length === 0) {
-    return new Map();
-  }
-
-  const [wordIndustryCoverage, phraseNgramIndustryCoverage] = await Promise.all([
-    getWordIndustryCoverageMap(),
-    getPhraseNgramIndustryCoverageMap()
-  ]);
-
-  const placeholders = industryKeys.map(() => "?").join(", ");
-  let rows = [];
-  try {
-    rows = await db.all(
-      `
-        SELECT industry_key, normalized_job_title
-        FROM job_position_industry
-        WHERE industry_key IN (${placeholders});
-      `,
-      industryKeys
-    );
-  } catch {
-    return new Map();
-  }
-
-  const byIndustry = new Map();
-  for (const key of industryKeys) {
-    byIndustry.set(key, {
-      exactTitles: new Set(),
-      phraseNgrams: new Set(),
-      fallbackWords: new Set(),
-      wordCounts: new Map(),
-      phraseCounts: new Map()
-    });
-  }
-
-  for (const row of rows) {
-    const key = String(row?.industry_key || "").trim();
-    if (!key || !byIndustry.has(key)) continue;
-    const normalizedTitle = normalizeLikeText(row?.normalized_job_title);
-    const words = createLikeParts(normalizedTitle);
-    const target = byIndustry.get(key);
-    if (normalizedTitle) {
-      target.exactTitles.add(normalizedTitle);
-    }
-
-    for (const word of new Set(words)) {
-      target.wordCounts.set(word, (target.wordCounts.get(word) || 0) + 1);
-    }
-
-    for (const ngram of new Set(buildWordNgrams(words, 2, 3))) {
-      target.phraseCounts.set(ngram, (target.phraseCounts.get(ngram) || 0) + 1);
-    }
-  }
-
-  const finalized = new Map();
-  for (const [industryKey, matcher] of byIndustry.entries()) {
-    const fallbackWords = new Set();
-    for (const [word, count] of matcher.wordCounts.entries()) {
-      if (count < MIN_INDUSTRY_FALLBACK_WORD_COUNT) continue;
-      if (isWeakFallbackWord(word, wordIndustryCoverage)) continue;
-      fallbackWords.add(word);
-    }
-
-    const phraseNgrams = new Set();
-    for (const [ngram, count] of matcher.phraseCounts.entries()) {
-      if (count < MIN_INDUSTRY_PHRASE_NGRAM_COUNT) continue;
-      if (isWeakPhraseNgram(ngram, phraseNgramIndustryCoverage)) continue;
-      phraseNgrams.add(ngram);
-    }
-
-    finalized.set(industryKey, {
-      exactTitles: matcher.exactTitles,
-      phraseNgrams,
-      fallbackWords
-    });
-  }
-
-  return finalized;
-}
-
-async function getWordIndustryCoverageMap() {
-  if (wordIndustryCoverageCache instanceof Map) {
-    return wordIndustryCoverageCache;
-  }
-
-  let rows = [];
-  try {
-    rows = await db.all(
-      `
-        SELECT industry_key, normalized_job_title
-        FROM job_position_industry;
-      `
-    );
-  } catch {
-    wordIndustryCoverageCache = new Map();
-    return wordIndustryCoverageCache;
-  }
-
-  const wordIndustrySets = new Map();
-  for (const row of rows) {
-    const industryKey = String(row?.industry_key || "").trim();
-    if (!industryKey) continue;
-
-    const words = new Set(createLikeParts(row?.normalized_job_title));
-    for (const word of words) {
-      if (!wordIndustrySets.has(word)) {
-        wordIndustrySets.set(word, new Set());
-      }
-      wordIndustrySets.get(word).add(industryKey);
-    }
-  }
-
-  const coverageMap = new Map();
-  for (const [word, keys] of wordIndustrySets.entries()) {
-    coverageMap.set(word, keys.size);
-  }
-
-  wordIndustryCoverageCache = coverageMap;
-  return coverageMap;
-}
-
-async function getPhraseNgramIndustryCoverageMap() {
-  if (phraseNgramIndustryCoverageCache instanceof Map) {
-    return phraseNgramIndustryCoverageCache;
-  }
-
-  let rows = [];
-  try {
-    rows = await db.all(
-      `
-        SELECT industry_key, normalized_job_title
-        FROM job_position_industry;
-      `
-    );
-  } catch {
-    phraseNgramIndustryCoverageCache = new Map();
-    return phraseNgramIndustryCoverageCache;
-  }
-
-  const ngramIndustrySets = new Map();
-  for (const row of rows) {
-    const industryKey = String(row?.industry_key || "").trim();
-    if (!industryKey) continue;
-
-    const words = createLikeParts(row?.normalized_job_title);
-    const ngrams = new Set(buildWordNgrams(words, 2, 3));
-    for (const ngram of ngrams) {
-      if (!ngramIndustrySets.has(ngram)) {
-        ngramIndustrySets.set(ngram, new Set());
-      }
-      ngramIndustrySets.get(ngram).add(industryKey);
-    }
-  }
-
-  const coverageMap = new Map();
-  for (const [ngram, keys] of ngramIndustrySets.entries()) {
-    coverageMap.set(ngram, keys.size);
-  }
-
-  phraseNgramIndustryCoverageCache = coverageMap;
-  return coverageMap;
-}
-
-function isWeakFallbackWord(word, wordIndustryCoverage) {
-  if (!word) return true;
-  if (WEAK_INDUSTRY_LIKE_PARTS.has(word)) return true;
-  const industryCoverage = Number(wordIndustryCoverage?.get(word) || 0);
-  return industryCoverage >= FALLBACK_WORD_INDUSTRY_COVERAGE_THRESHOLD;
-}
-
-function isWeakPhraseNgram(ngram, phraseNgramIndustryCoverage) {
-  if (!ngram) return true;
-  const parts = ngram.split(" ").map((part) => part.trim()).filter(Boolean);
-  if (parts.length < 2) return true;
-  if (parts.every((part) => WEAK_INDUSTRY_LIKE_PARTS.has(part))) return true;
-  const industryCoverage = Number(phraseNgramIndustryCoverage?.get(ngram) || 0);
-  return industryCoverage >= PHRASE_NGRAM_INDUSTRY_COVERAGE_THRESHOLD;
-}
-
-function rowMatchesIndustryLikeParts(positionName, selectedIndustryKeys, industryMatchersByKey) {
-  if (!Array.isArray(selectedIndustryKeys) || selectedIndustryKeys.length === 0) return true;
-  if (!(industryMatchersByKey instanceof Map) || industryMatchersByKey.size === 0) return false;
-
-  const titleText = String(positionName || "");
-  const selectedKeySet = new Set(
-    selectedIndustryKeys.map((key) => String(key || "").trim().toLowerCase()).filter(Boolean)
-  );
-  const isSalesExclusiveRole = SALES_EXCLUSIVE_ROLE_REGEX.test(titleText);
-  if (isSalesExclusiveRole && !selectedKeySet.has(SALES_BUSINESS_INDUSTRY_KEY)) {
-    return false;
-  }
-
-  const normalizedPosition = normalizeLikeText(positionName);
-  const postingWords = createLikeParts(positionName);
-  if (postingWords.length === 0) return false;
-  const postingWordSet = new Set(postingWords);
-  const postingPhraseSet = new Set(buildWordNgrams(postingWords, 2, 3));
-
-  for (const industryKey of selectedIndustryKeys) {
-    const matcher = industryMatchersByKey.get(industryKey);
-    const exactTitles = matcher?.exactTitles;
-    const phraseNgrams = matcher?.phraseNgrams;
-    const fallbackWords = matcher?.fallbackWords;
-    const hasMatcherData =
-      exactTitles instanceof Set || phraseNgrams instanceof Set || fallbackWords instanceof Set;
-    if (!hasMatcherData) continue;
-
-    if (exactTitles instanceof Set && normalizedPosition && exactTitles.has(normalizedPosition)) {
-      if (industryKey === IT_SOFTWARE_INDUSTRY_KEY && IT_SALES_GTM_ROLE_REGEX.test(titleText)) {
-        continue;
-      }
-
-      const hasStrongPhrase =
-        phraseNgrams instanceof Set &&
-        Array.from(postingPhraseSet).some((postingPhrase) => phraseNgrams.has(postingPhrase));
-      const hasStrongWord =
-        fallbackWords instanceof Set &&
-        Array.from(postingWordSet).some((word) => fallbackWords.has(word));
-      if (hasStrongPhrase || hasStrongWord) {
-        return true;
-      }
-      if (
-        industryKey === IT_SOFTWARE_INDUSTRY_KEY &&
-        Array.from(postingWordSet).some((word) => IT_HIGH_SIGNAL_ANCHOR_PARTS.has(word))
-      ) {
-        return true;
-      }
-    }
-
-    if (industryKey === IT_SOFTWARE_INDUSTRY_KEY) {
-      if (IT_SALES_GTM_ROLE_REGEX.test(titleText)) continue;
-      const hasTechAnchor = Array.from(postingWordSet).some((part) => IT_TECH_ANCHOR_PARTS.has(part));
-      if (!hasTechAnchor) continue;
-    }
-
-    if (phraseNgrams instanceof Set && phraseNgrams.size > 0) {
-      for (const postingPhrase of postingPhraseSet) {
-        if (phraseNgrams.has(postingPhrase)) {
-          return true;
-        }
-      }
-    }
-
-    if (fallbackWords instanceof Set && fallbackWords.size > 0) {
-      for (const word of postingWordSet) {
-        if (fallbackWords.has(word)) {
-          if (
-            industryKey !== IT_SOFTWARE_INDUSTRY_KEY ||
-            postingWordSet.size === 1 ||
-            IT_HIGH_SIGNAL_ANCHOR_PARTS.has(word)
-          ) {
-            return true;
-          }
-        }
-      }
-    }
-
-    if (industryKey === IT_SOFTWARE_INDUSTRY_KEY) {
-      for (const word of postingWordSet) {
-        if (IT_HIGH_SIGNAL_ANCHOR_PARTS.has(word) && fallbackWords instanceof Set && fallbackWords.has(word)) {
-          return true;
-        }
-      }
-    }
-  }
-  return false;
-}
-
-async function getAppliedStateByUrl(urls) {
-  const uniqueUrls = Array.from(new Set((urls || []).map((url) => String(url || "").trim()).filter(Boolean)));
-  if (uniqueUrls.length === 0) return new Map();
-
-  const map = new Map();
-  const chunkSize = 800;
-  for (let i = 0; i < uniqueUrls.length; i += chunkSize) {
-    const chunk = uniqueUrls.slice(i, i + chunkSize);
-    const placeholders = chunk.map(() => "?").join(", ");
-    const rows = await db.all(
-      `
-        SELECT
-          job_posting_url,
-          applied,
-          applied_by_type,
-          applied_by_label,
-          applied_at_epoch,
-          last_application_id,
-          ignored,
-          ignored_at_epoch,
-          ignored_by_label
-        FROM posting_application_state
-        WHERE job_posting_url IN (${placeholders});
-      `,
-      chunk
-    );
-
-    for (const row of rows) {
-      map.set(String(row?.job_posting_url || "").trim(), row);
-    }
-  }
-  return map;
+function normalizeAtsArgument(value) {
+  if (Array.isArray(value)) return normalizeStringArray(value);
+  const single = String(value || "").trim();
+  return single ? [single] : [];
 }
 
 async function findCandidates(options = {}) {
   const settings = await getMcpSettings();
   ensureMcpAgentEnabled(settings);
-  const atsFilters = normalizeAtsFilters(options.ats);
-  const industries =
-    Array.isArray(options.industries) && options.industries.length > 0
-      ? options.industries
-      : settings.preferred_industries || [];
-  const states =
-    Array.isArray(options.states) && options.states.length > 0 ? options.states : settings.preferred_states || [];
-  const counties =
-    Array.isArray(options.counties) && options.counties.length > 0
-      ? options.counties
-      : settings.preferred_counties || [];
-  const remote = options.remote ? normalizeRemoteFilter(options.remote) : settings.preferred_remote;
-  const search = String(options.search || settings.preferred_search || "").trim().toLowerCase();
-  const includeApplied = normalizeBoolean(options.include_applied, false);
+
+  const useSettings = normalizeBoolean(options.use_settings, true);
+  const search = String(options.search || "").trim() || (useSettings ? settings.preferred_search : "");
+  const remote = options.remote
+    ? String(options.remote)
+    : useSettings
+      ? settings.preferred_remote
+      : "all";
   const limit = Math.max(
     1,
-    Math.min(2000, parseNonNegativeInteger(options.limit) || parseNonNegativeInteger(settings.max_applications_per_run) || 10)
+    Math.min(
+      MAX_CANDIDATE_LIMIT,
+      parseNonNegativeInteger(options.limit) ||
+        parseNonNegativeInteger(settings.max_applications_per_run) ||
+        MCP_SETTINGS_DEFAULTS.max_applications_per_run
+    )
   );
 
-  const rows = await db.all(
-    `
-      SELECT id, company_name, position_name, job_posting_url, posting_date, location
-      FROM Postings
-      WHERE hidden = 0
-      ORDER BY company_name ASC, position_name ASC;
-    `
-  );
-
-  const industryMatchersByKey = await buildIndustryMatchersByKey(industries);
-  const countyFilters = parseCountyFilters(counties);
-  const searchTerms = search.split(/\s+/).filter(Boolean);
-  const stateCodes = states.map((state) => String(state || "").trim().toUpperCase()).filter(Boolean);
-
-  let items = rows
-    .map((row) => ({
-      ...row,
-      // The sync stores a real location on the row. Deriving it from the URL instead only
-      // ever worked for myworkdayjobs.com hosts (~6% of postings) and returned "" for the
-      // rest, which rowMatchesLocationFilters rejects outright -- so any state or county
-      // preference silently discarded most of the database. The URL stays as a fallback
-      // for rows the sync could not populate.
-      location: String(row?.location || "").trim() || inferLocationFromJobUrl(row?.job_posting_url),
-      ats: inferAtsFromJobPostingUrl(row?.job_posting_url)
-    }))
-    .filter((row) => {
-      const companyName = String(row?.company_name || "").toLowerCase();
-      const positionName = String(row?.position_name || "").toLowerCase();
-      const location = String(row?.location || "").toLowerCase();
-      const ats = String(row?.ats || "").toLowerCase();
-
-      const matchesSearch = searchTerms.every(
-        (term) => companyName.includes(term) || positionName.includes(term) || location.includes(term)
-      );
-      if (!matchesSearch) return false;
-
-      if (atsFilters.length > 0 && !atsFilters.includes(ats)) return false;
-
-      const matchesIndustry = rowMatchesIndustryLikeParts(
-        row?.position_name,
-        industries,
-        industryMatchersByKey
-      );
-      if (!matchesIndustry) return false;
-
-      const matchesLocation = rowMatchesLocationFilters(row?.location, stateCodes, countyFilters);
-      if (!matchesLocation) return false;
-
-      const matchesRemote = rowMatchesRemoteFilter(row?.location, remote);
-      if (!matchesRemote) return false;
-
-      return true;
-    });
-
-  const appliedByUrl = await getAppliedStateByUrl(items.map((item) => item.job_posting_url));
-  items = items.map((item) => {
-    const state = appliedByUrl.get(String(item?.job_posting_url || "").trim());
-    return {
-      ...item,
-      applied: Boolean(Number(state?.applied || 0)),
-      ignored: Boolean(Number(state?.ignored || 0)),
-      applied_by_label: String(state?.applied_by_label || ""),
-      applied_at_epoch: Number(state?.applied_at_epoch || 0)
-    };
+  const result = await listPostingsWithFilters({
+    search,
+    limit,
+    offset: parseNonNegativeInteger(options.offset),
+    sort_by: options.sort_by,
+    ats: normalizeAtsArgument(options.ats),
+    industries: resolveListFilter(options.industries, settings.preferred_industries, useSettings),
+    compensation_types: normalizeStringArray(options.compensation_types),
+    pay_periods: normalizeStringArray(options.pay_periods),
+    pay_min: options.pay_min,
+    pay_max: options.pay_max,
+    education_levels: normalizeStringArray(options.education_levels),
+    states: resolveListFilter(options.states, settings.preferred_states, useSettings),
+    counties: resolveListFilter(options.counties, settings.preferred_counties, useSettings),
+    countries: resolveListFilter(options.countries, settings.preferred_countries, useSettings),
+    regions: resolveListFilter(options.regions, settings.preferred_regions, useSettings),
+    remote,
+    hide_no_date: normalizeBoolean(options.hide_no_date, false),
+    include_applied: normalizeBoolean(options.include_applied, false),
+    include_ignored: normalizeBoolean(options.include_ignored, false),
+    // Descriptions are the bulk of the payload, and an agent that only needs to rank titles
+    // and open URLs does not want them in its context. Opt in per call.
+    include_descriptions: normalizeBoolean(options.include_descriptions, false)
   });
 
-  items = items.filter((item) => !item.ignored);
-
-  if (!includeApplied) {
-    items = items.filter((item) => !item.applied);
-  }
-
-  items = items.slice(0, limit);
   return {
-    filters: {
-      search,
-      ats: atsFilters,
-      industries,
-      states: stateCodes,
-      counties,
-      remote
-    },
-    count: items.length,
-    items
+    filters: result.filters,
+    settings_applied: useSettings,
+    count: result.count,
+    limit: result.limit,
+    offset: result.offset,
+    // The page is cut to `limit` before applied and ignored postings are dropped, so a full
+    // page can come back short. Ask for the next page rather than reading a short one as
+    // "nothing else matches".
+    items: result.items
   };
 }
 
@@ -1272,41 +390,6 @@ async function getExistingAppliedApplicationByPostingUrl(jobPostingUrl) {
   };
 }
 
-function buildCoverLetterDraft(personalInformation, posting, instructions = "") {
-  const firstName = String(personalInformation?.first_name || "").trim() || "Applicant";
-  const lastName = String(personalInformation?.last_name || "").trim();
-  const fullName = `${firstName}${lastName ? ` ${lastName}` : ""}`.trim();
-  const yearsOfExperience = parseNonNegativeInteger(personalInformation?.years_of_experience);
-  const positionName = String(posting?.position_name || "the role").trim();
-  const companyName = String(posting?.company_name || "your company").trim();
-  const linkedinUrl = String(personalInformation?.linkedin_url || "").trim();
-  const githubUrl = String(personalInformation?.github_url || "").trim();
-  const portfolioUrl = String(personalInformation?.portfolio_url || "").trim();
-  const extraInstructions = String(instructions || "").trim();
-
-  const details = [];
-  if (yearsOfExperience > 0) details.push(`${yearsOfExperience}+ years of relevant experience`);
-  if (linkedinUrl) details.push(`LinkedIn: ${linkedinUrl}`);
-  if (githubUrl) details.push(`GitHub: ${githubUrl}`);
-  if (portfolioUrl) details.push(`Portfolio: ${portfolioUrl}`);
-  const detailSentence =
-    details.length > 0
-      ? `My background includes ${details.join(", ")}.`
-      : "My background aligns with fast-paced, delivery-focused teams.";
-  const instructionSentence = extraInstructions ? `I am especially aligned with: ${extraInstructions}.` : "";
-
-  return `Dear Hiring Team,
-
-I am excited to apply for the ${positionName} role at ${companyName}. ${detailSentence}
-
-I am motivated by opportunities where I can contribute quickly and collaborate closely with a strong team. ${instructionSentence}
-
-Thank you for your consideration.
-
-Sincerely,
-${fullName}`.trim();
-}
-
 function asToolResult(payload) {
   return {
     content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
@@ -1414,7 +497,7 @@ async function main() {
 
   const mcpServer = new McpServer({
     name: "openpostings-apply-agent",
-    version: "1.0.0"
+    version: "1.1.0"
   });
 
   mcpServer.registerTool(
@@ -1426,23 +509,48 @@ async function main() {
       const personalInformation = await getPersonalInformation();
       const mcpSettings = await getMcpSettings();
       ensureMcpAgentEnabled(mcpSettings);
-      const runbook = {
-        summary:
-          "Use existing browser/web tools to apply through each posting URL, using applicant data for form fields and MCP login credentials for account/MFA flows.",
-        steps: [
-          "Load context and candidate postings.",
-          "Open posting URL in browser automation.",
-          "Fill application form with applicant data.",
-          "Use agent login email + password for account creation and sign-in when required.",
-          "Use the same agent login email for MFA/approval flows when required.",
-          "Generate and attach a posting-specific cover letter.",
-          "Call record_application_result after submit."
-        ]
-      };
       return asToolResult({
         personal_information: personalInformation,
         mcp_settings: mcpSettings,
-        runbook
+        runbook: buildMcpRunbook(mcpSettings, personalInformation, [])
+      });
+    }
+  );
+
+  mcpServer.registerTool(
+    "get_filter_options",
+    {
+      description:
+        "List every value the find_posting_candidates filters accept: industry keys, ATS names, US states, counties, countries, regions, education levels, compensation types, pay periods and sort options. Call this before filtering -- an industry key or county value that does not appear here matches nothing rather than erroring. Counties are only returned when states is supplied, because the unscoped list runs to thousands of entries.",
+      inputSchema: {
+        states: z.array(z.string()).optional()
+      }
+    },
+    async (args) => {
+      const mcpSettings = await getMcpSettings();
+      ensureMcpAgentEnabled(mcpSettings);
+      const states = normalizeStringArray(args?.states);
+      const options = await getPostingFilterOptions({ states });
+
+      // No RAW: filtering here any more: getPostingFilterOptions only returns ISO countries,
+      // so the app and the agent see the same list.
+      return asToolResult({
+        ...options,
+        counties: states.length > 0 ? options.counties : [],
+        counties_note:
+          states.length > 0
+            ? `Counties scoped to ${states.join(", ")}. Pass the value field ("ST|County Name"), not the label.`
+            : "Counties omitted. Call again with states to get the counties for those states.",
+        remote_options: MCP_REMOTE_FILTER_VALUES.map((value) => ({ value })),
+        current_preferences: {
+          search: mcpSettings.preferred_search,
+          remote: mcpSettings.preferred_remote,
+          industries: mcpSettings.preferred_industries,
+          states: mcpSettings.preferred_states,
+          counties: mcpSettings.preferred_counties,
+          countries: mcpSettings.preferred_countries,
+          regions: mcpSettings.preferred_regions
+        }
       });
     }
   );
@@ -1451,21 +559,31 @@ async function main() {
     "find_posting_candidates",
     {
       description:
-        "Find postings that match MCP preferences using search + industry/location/remote filters with like-parts industry matching.",
+        "Find postings to apply to, using the same filter engine as the app's job list. Any filter left empty falls back to the saved MCP preference for it; pass use_settings=false to ignore saved preferences entirely. Applied and ignored postings are excluded by default. Job descriptions are omitted unless include_descriptions=true. Call get_filter_options for the valid values of the list filters.",
       inputSchema: {
         search: z.string().optional(),
         ats: z
-          .union([
-            z.enum(MCP_ATS_FILTER_VALUES),
-            z.array(z.enum(MCP_ATS_FILTER_VALUES))
-          ])
+          .union([z.enum(MCP_ATS_FILTER_VALUES), z.array(z.enum(MCP_ATS_FILTER_VALUES))])
           .optional(),
         industries: z.array(z.string()).optional(),
+        compensation_types: z.array(z.enum(COMPENSATION_TYPES)).optional(),
+        pay_periods: z.array(z.enum(COMPENSATION_PAY_PERIODS)).optional(),
+        pay_min: z.number().positive().optional(),
+        pay_max: z.number().positive().optional(),
+        education_levels: z.array(z.enum(EDUCATION_LEVELS)).optional(),
         states: z.array(z.string()).optional(),
         counties: z.array(z.string()).optional(),
-        remote: z.enum(["all", "remote", "hybrid", "non_remote"]).optional(),
+        countries: z.array(z.string()).optional(),
+        regions: z.array(z.enum(MCP_REGION_FILTER_VALUES)).optional(),
+        remote: z.enum(MCP_REMOTE_FILTER_VALUES).optional(),
+        sort_by: z.enum(MCP_SORT_VALUES).optional(),
+        hide_no_date: z.boolean().optional(),
         include_applied: z.boolean().optional(),
-        limit: z.number().int().positive().max(2000).optional()
+        include_ignored: z.boolean().optional(),
+        include_descriptions: z.boolean().optional(),
+        use_settings: z.boolean().optional(),
+        limit: z.number().int().positive().max(MAX_CANDIDATE_LIMIT).optional(),
+        offset: z.number().int().nonnegative().optional()
       }
     },
     async (args) => {
@@ -1514,7 +632,7 @@ async function main() {
           position_name: positionName,
           job_posting_url: jobPostingUrl
         },
-        args?.instructions
+        args?.instructions || mcpSettings.instructions_for_agent
       );
 
       return asToolResult({
@@ -1618,7 +736,11 @@ async function main() {
   await mcpServer.connect(transport);
 }
 
-main().catch((error) => {
-  console.error("[openpostings-apply-agent] MCP server failed:", error);
-  process.exit(1);
-});
+module.exports = { findCandidates, resolveListFilter, normalizeAtsArgument, openDatabase };
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error("[openpostings-apply-agent] MCP server failed:", error);
+    process.exit(1);
+  });
+}

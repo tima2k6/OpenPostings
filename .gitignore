@@ -98,3 +98,6 @@ android/app/build/outputs/
 jobs.db
 saved-queries.json
 saved-queries.json.tmp
+
+# Local Claude Code state, including worktrees created inside the repo
+.claude/
