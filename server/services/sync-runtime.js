@@ -691,6 +691,83 @@ function shuffleArrayInPlace(values) {
 }
 
 
+// Board-wide collectors sweep an entire job board in one target rather than one employer, and most
+// of them only keep postings from the last 24 hours. Appended after the ~68k company targets they
+// were reached at the tail of a multi-hour run, by which point a day of postings had already aged
+// out of their window — Hcareers never stored a single row that way. They are queued first now, so
+// every sync collects them within its first minute. ATS_name doubles as the enabled-ATS key.
+const BOARD_WIDE_SYNC_TARGETS = [
+  {
+    company_name: "GovernmentJobs (dynamic)",
+    url_string: "https://www.governmentjobs.com/jobs",
+    ATS_name: "governmentjobs"
+  },
+  {
+    company_name: "PoliceApp (dynamic)",
+    url_string:
+      "https://www.policeapp.com/jobs/urlrewrite_jobpostings/jobResultsAjax.ashx?j=0&r=50&s=0&p=0",
+    ATS_name: "policeapp"
+  },
+  {
+    company_name: "USAJobs (dynamic)",
+    url_string: "https://www.usajobs.gov/Search/ExecuteSearch",
+    ATS_name: "usajobs"
+  },
+  {
+    company_name: "K12JobSpot (dynamic)",
+    url_string: "https://api.k12jobspot.com/api/Jobs/Search",
+    ATS_name: "k12jobspot"
+  },
+  {
+    company_name: "Snaphunt (dynamic)",
+    url_string:
+      "https://api.snaphunt.com/v2/jobs?jobLocationType=onsite%2Chybrid%2Cremote&pageSize=300&isFeatured=false",
+    ATS_name: "snaphunt"
+  },
+  {
+    company_name: "SchoolSpring (dynamic)",
+    url_string:
+      "https://api.schoolspring.com/api/Jobs/GetPagedJobsWithSearch?domainName=&keyword=&location=&category=&gradelevel=&jobtype=&organization=&swLat=&swLon=&neLat=&neLon=&page=1&size=25&sortDateAscending=false",
+    ATS_name: "schoolspring"
+  },
+  {
+    company_name: "CalCareers (dynamic)",
+    url_string: "https://calcareers.ca.gov/CalHRPublic/Search/JobSearchResults.aspx",
+    ATS_name: "calcareers"
+  },
+  {
+    company_name: "CalOpps (dynamic)",
+    url_string: "https://www.calopps.org/job-search-list",
+    ATS_name: "calopps"
+  },
+  {
+    company_name: "StateJobsNY (dynamic)",
+    url_string: "https://www.statejobsny.com/public/vacancyTable.cfm",
+    ATS_name: "statejobsny"
+  },
+  {
+    company_name: "Hcareers (dynamic)",
+    url_string: "https://www.hcareers.com/jobs/recent",
+    ATS_name: "hcareers"
+  },
+  {
+    company_name: "EdJoin (dynamic)",
+    url_string:
+      "https://www.edjoin.org/Home/LoadJobs?rows=25&page=1&sort=postingDate&sortVal=2&order=desc&keywords=&location=&searchType=all&regions=&jobTypes=&days=0&empType=&catID=0&onlineApps=false&recruitmentCenterID=0&stateID=0&regionID=0&districtID=0&searchID=0",
+    ATS_name: "edjoin"
+  },
+  {
+    company_name: "Webcruiter (dynamic)",
+    url_string: "https://candidate.webcruiter.com/en-gb/home/alladverts/webcruiter-id#search",
+    ATS_name: "webcruiter"
+  },
+  {
+    company_name: "AcademicJobsOnline (dynamic)",
+    url_string: "https://academicjobsonline.org/ajo?joblst-44-0-0-0---0-p--",
+    ATS_name: "academicjobsonline"
+  }
+];
+
 async function runAtsSyncInternal() {
   const passGeneration = syncGeneration;
   const syncReferenceEpoch = nowEpochSeconds();
@@ -705,6 +782,11 @@ async function runAtsSyncInternal() {
     const enabledAts = new Set(normalizeSyncEnabledAts(Array.from(getSyncEnabledAts())));
     const shuffledCompanies = shuffleArrayInPlace([...companies]);
     const syncTargets = [];
+    for (const boardTarget of BOARD_WIDE_SYNC_TARGETS) {
+      if (!enabledAts.has(boardTarget.ATS_name)) continue;
+      syncTargets.push({ id: null, ...boardTarget });
+    }
+
     let smartRecruitersInserted = false;
     let companyInsertionsSinceSmartRecruiters = 0;
     for (const company of shuffledCompanies) {
@@ -742,114 +824,6 @@ async function runAtsSyncInternal() {
         company_name: "SmartRecruiters (dynamic)",
         url_string: "https://jobs.smartrecruiters.com/sr-jobs/search",
         ATS_name: "smartrecruiters"
-      });
-    }
-
-    if (enabledAts.has("governmentjobs")) {
-      syncTargets.push({
-        id: null,
-        company_name: "GovernmentJobs (dynamic)",
-        url_string: "https://www.governmentjobs.com/jobs",
-        ATS_name: "governmentjobs"
-      });
-    }
-    if (enabledAts.has("policeapp")) {
-      syncTargets.push({
-        id: null,
-        company_name: "PoliceApp (dynamic)",
-        url_string:
-          "https://www.policeapp.com/jobs/urlrewrite_jobpostings/jobResultsAjax.ashx?j=0&r=50&s=0&p=0",
-        ATS_name: "policeapp"
-      });
-    }
-    if (enabledAts.has("usajobs")) {
-      syncTargets.push({
-        id: null,
-        company_name: "USAJobs (dynamic)",
-        url_string: "https://www.usajobs.gov/Search/ExecuteSearch",
-        ATS_name: "usajobs"
-      });
-    }
-    if (enabledAts.has("k12jobspot")) {
-      syncTargets.push({
-        id: null,
-        company_name: "K12JobSpot (dynamic)",
-        url_string: "https://api.k12jobspot.com/api/Jobs/Search",
-        ATS_name: "k12jobspot"
-      });
-    }
-    if (enabledAts.has("snaphunt")) {
-      syncTargets.push({
-        id: null,
-        company_name: "Snaphunt (dynamic)",
-        url_string: "https://api.snaphunt.com/v2/jobs?jobLocationType=onsite%2Chybrid%2Cremote&pageSize=300&isFeatured=false",
-        ATS_name: "snaphunt"
-      });
-    }
-    if (enabledAts.has("schoolspring")) {
-      syncTargets.push({
-        id: null,
-        company_name: "SchoolSpring (dynamic)",
-        url_string:
-          "https://api.schoolspring.com/api/Jobs/GetPagedJobsWithSearch?domainName=&keyword=&location=&category=&gradelevel=&jobtype=&organization=&swLat=&swLon=&neLat=&neLon=&page=1&size=25&sortDateAscending=false",
-        ATS_name: "schoolspring"
-      });
-    }
-    if (enabledAts.has("calcareers")) {
-      syncTargets.push({
-        id: null,
-        company_name: "CalCareers (dynamic)",
-        url_string: "https://calcareers.ca.gov/CalHRPublic/Search/JobSearchResults.aspx",
-        ATS_name: "calcareers"
-      });
-    }
-    if (enabledAts.has("calopps")) {
-      syncTargets.push({
-        id: null,
-        company_name: "CalOpps (dynamic)",
-        url_string: "https://www.calopps.org/job-search-list",
-        ATS_name: "calopps"
-      });
-    }
-    if (enabledAts.has("statejobsny")) {
-      syncTargets.push({
-        id: null,
-        company_name: "StateJobsNY (dynamic)",
-        url_string: "https://www.statejobsny.com/public/vacancyTable.cfm",
-        ATS_name: "statejobsny"
-      });
-    }
-    if (enabledAts.has("hcareers")) {
-      syncTargets.push({
-        id: null,
-        company_name: "Hcareers (dynamic)",
-        url_string: "https://www.hcareers.com/jobs/recent",
-        ATS_name: "hcareers"
-      });
-    }
-    if (enabledAts.has("edjoin")) {
-      syncTargets.push({
-        id: null,
-        company_name: "EdJoin (dynamic)",
-        url_string:
-          "https://www.edjoin.org/Home/LoadJobs?rows=25&page=1&sort=postingDate&sortVal=2&order=desc&keywords=&location=&searchType=all&regions=&jobTypes=&days=0&empType=&catID=0&onlineApps=false&recruitmentCenterID=0&stateID=0&regionID=0&districtID=0&searchID=0",
-        ATS_name: "edjoin"
-      });
-    }
-    if (enabledAts.has("webcruiter")) {
-      syncTargets.push({
-        id: null,
-        company_name: "Webcruiter (dynamic)",
-        url_string: "https://candidate.webcruiter.com/en-gb/home/alladverts/webcruiter-id#search",
-        ATS_name: "webcruiter"
-      });
-    }
-    if (enabledAts.has("academicjobsonline")) {
-      syncTargets.push({
-        id: null,
-        company_name: "AcademicJobsOnline (dynamic)",
-        url_string: "https://academicjobsonline.org/ajo?joblst-44-0-0-0---0-p--",
-        ATS_name: "academicjobsonline"
       });
     }
 
