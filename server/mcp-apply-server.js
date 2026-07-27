@@ -39,7 +39,7 @@ const {
   enrichPostingsWithApplicationState
 } = require("./services/postings.js");
 const { listApplications } = require("./services/applications.js");
-const { extractDocumentText } = require("./services/applicant-documents.js");
+const { extractDocumentText, getApplicantDocument } = require("./services/applicant-documents.js");
 const { runQuery, SORTABLE, MAX_ROWS } = require("./services/db-query.js");
 const { getPostingFilterOptions } = require("./services/filter-options.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime } = require("./services/sync-settings.js");
@@ -745,7 +745,7 @@ async function main() {
     "get_resume",
     {
       description:
-        "The applicant's actual resume text, extracted from the file configured in personal information (PDF, docx, txt or md). Read this once per run and weigh every posting description against it -- it is the ground truth that the profile fields summarize. document='projects_portfolio' reads the portfolio document instead. If extraction fails, the error explains why and returns file_path so a client with its own file tools can read it directly.",
+        "The applicant's actual resume text. Read this once per run and weigh every posting description against it -- it is the ground truth that the profile fields summarize. Served from the copy uploaded into the database (POST /settings/applicant-documents), which works no matter where this server runs; falls back to the file path in personal information for same-machine installs. document='projects_portfolio' reads the portfolio document instead. If nothing is uploaded and the path fails, the error explains why and returns file_path so a client with its own file tools can read it directly.",
       inputSchema: {
         document: z.enum(["resume", "projects_portfolio"]).optional()
       }
@@ -753,15 +753,24 @@ async function main() {
     async (args) => {
       const mcpSettings = await getMcpSettings();
       ensureMcpAgentEnabled(mcpSettings);
-      const personalInformation = await getPersonalInformation();
       const which = args?.document === "projects_portfolio" ? "projects_portfolio" : "resume";
+
+      const stored = await getApplicantDocument(which);
+      if (stored) {
+        return asToolResult({ document: which, source: "database", ok: true, ...stored });
+      }
+
+      const personalInformation = await getPersonalInformation();
       const filePath =
         which === "projects_portfolio"
           ? personalInformation?.projects_portfolio_file_path
           : personalInformation?.resume_file_path;
 
       const result = await extractDocumentText(filePath);
-      return asToolResult({ document: which, ...result });
+      if (!result.ok) {
+        result.error += " To make the document permanently available to this server, upload it once via POST /settings/applicant-documents.";
+      }
+      return asToolResult({ document: which, source: "file", ...result });
     }
   );
 
