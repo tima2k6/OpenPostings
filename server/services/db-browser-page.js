@@ -49,14 +49,13 @@ const DB_BROWSER_PAGE = `<!doctype html>
   .err { color: #b3261e; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; margin: 10px 0; }
   footer { padding: 0 18px 30px; }
   .hint { font-size: 12px; color: #66798c; margin: 8px 0; }
-  .facet { margin: 8px 0; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .facet-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+               gap: 10px; margin: 10px 0 14px; }
+  .facet-pick { display: flex; flex-direction: column; gap: 4px; }
   .facet-name { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
-                color: #7b8794; min-width: 110px; }
-  button.chip { border: 1px solid #c6ceda; background: #fff; color: inherit; border-radius: 999px;
-                padding: 4px 10px; cursor: pointer; font: inherit; font-size: 12px; }
-  button.chip:hover { border-color: #1f6feb; color: #1f6feb; }
-  button.chip .n { color: #7b8794; font-size: 11px; margin-left: 3px; }
-  @media (prefers-color-scheme: dark) { button.chip { background: #18202a; border-color: #2d3947; } }
+                color: #7b8794; }
+  .facet-name .n { font-weight: 400; text-transform: none; letter-spacing: 0; opacity: .75; }
+  .facet-pick select { width: 100%; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; margin-bottom: 10px; }
   .grid label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #52606d; }
   @media (prefers-color-scheme: dark) { .grid label { color: #9fb0c4; } }
@@ -300,31 +299,61 @@ ORDER BY n DESC</textarea>
   };
   var FACET_LABEL = { states: "State", title_words: "Title contains", companies: "Company", ats: "ATS" };
 
+  function wireFacetSelects(out) {
+    Array.prototype.forEach.call(out.querySelectorAll("select[data-facet]"), function (sel) {
+      sel.addEventListener("change", function () {
+        if (!sel.value) return;
+        var t = FACET_TARGET[sel.getAttribute("data-facet")];
+        addTerm(t.id, sel.value, t.replace);
+        run();
+      });
+    });
+  }
+
   function loadFacets() {
     var params = new URLSearchParams(readFilters()).toString();
     get("/db/facets?" + params).then(function (data) {
-      var summary = '<p class="hint">' + (data.approximate ? "sampled " : "") + data.scanned +
-        " rows \u00b7 " + data.visible + " visible, " + data.hidden + " hidden \u00b7 " +
-        data.with_pay + " with a pay figure" +
-        (data.approximate ? " \u2014 counts are a sample, narrow further for exact numbers" : "") + "</p>";
-      var groups = Object.keys(FACET_TARGET).map(function (key) {
+      var out = document.getElementById("facet-out");
+
+      // State is always offered, from the fixed list of 51 rather than from counts: it is
+      // the primary axis, and it has to be selectable before anything has been narrowed.
+      var stateOptions = '<label class="facet-pick"><span class="facet-name">State</span>' +
+        '<select data-facet="states"><option value="">\u2014 any \u2014</option>' +
+        (data.all_states || []).map(function (st) {
+          return '<option value="' + esc(st.value) + '">' + esc(st.value) + "</option>";
+        }).join("") + "</select></label>";
+
+      if (data.needs_narrowing) {
+        out.innerHTML =
+          '<p class="hint"><b>' + data.total.toLocaleString() + " rows.</b> Company and title breakdowns " +
+          "are only shown once the set is small enough to count exactly \u2014 over a set this size they " +
+          "would describe a fraction of it and read as if they described all of it. Pick a state, or add a " +
+          "title or date filter, and they appear.</p>" +
+          '<div class="facet-row">' + stateOptions + "</div>";
+        wireFacetSelects(out);
+        return;
+      }
+
+      var summary = '<p class="hint">' + data.total.toLocaleString() + " rows, counted exactly \u00b7 " +
+        data.visible + " visible, " + data.hidden + " hidden \u00b7 " +
+        data.with_pay + " with a pay figure</p>";
+      // Every observed value, in a dropdown. A truncated chip list hid whole states from
+      // anyone outside the biggest markets; a dropdown holds all of them, stays the same
+      // size on screen, and the browser's type-ahead makes 8,000 title words navigable.
+      var groups = '<div class="facet-row">' + stateOptions + Object.keys(FACET_TARGET).map(function (key) {
+        if (key === "states") return "";
         var items = (data.facets[key] || []);
         if (!items.length) return "";
-        return '<div class="facet"><span class="facet-name">' + FACET_LABEL[key] + "</span>" +
+        return '<label class="facet-pick"><span class="facet-name">' + FACET_LABEL[key] +
+          ' <span class="n">' + items.length + "</span></span>" +
+          '<select data-facet="' + key + '">' +
+          '<option value="">\u2014 any \u2014</option>' +
           items.map(function (it) {
-            return '<button class="chip" data-facet="' + key + '" data-value="' + esc(it.value) + '">' +
-              esc(it.value) + ' <span class="n">' + it.count + "</span></button>";
-          }).join("") + "</div>";
-      }).join("");
-      var out = document.getElementById("facet-out");
+            return '<option value="' + esc(it.value) + '">' + esc(it.value) + " (" + it.count + ")</option>";
+          }).join("") + "</select></label>";
+      }).join("") + "</div>";
       out.innerHTML = summary + groups;
-      Array.prototype.forEach.call(out.querySelectorAll("button.chip"), function (b) {
-        b.addEventListener("click", function () {
-          var t = FACET_TARGET[b.getAttribute("data-facet")];
-          addTerm(t.id, b.getAttribute("data-value"), t.replace);
-          run();
-        });
-      });
+      wireFacetSelects(out);
     }).catch(function (e) { document.getElementById("facet-out").innerHTML = '<p class="err">' + esc(e.message) + "</p>"; });
   }
 
