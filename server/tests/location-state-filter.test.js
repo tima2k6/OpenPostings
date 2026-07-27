@@ -273,6 +273,78 @@ function run() {
     "hyphenated ATS slugs must still be read whole"
   );
 
+  // Every string below is a real `location` value from the postings table. A WA search
+  // returned all of them, because the District guard only sat on the route that reads the
+  // spelled-out state name -- these arrive by the other two routes, the US-prefixed slug
+  // and the bare code, both of which returned before the guard was consulted.
+  for (const location of [
+    "US-Washington, DC",
+    "US-Washington, D.C.",
+    "DC - Washington",
+    "Washington, Washington, DC",
+    "District of Columbia- Washington",
+    // The ATS put a junk state beside a District city. Checked against the postings
+    // themselves: every one is a Washington DC role, several of them federal contractors.
+    "DC, WA",
+    "Washington, DC, WA",
+    "DC Capital Hill, WA"
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, ["WA"], [], [], []),
+      false,
+      `a WA search must not return the District: ${location}`
+    );
+  }
+
+  // The reverse case, and the reason the District cannot simply be excluded on sight: a
+  // posting may genuinely list a WA site alongside a DC one, and it belongs in a WA search.
+  for (const location of [
+    "Hybrid - US, Hybrid - San Francisco, CA, Hybrid - Seattle, WA, Hybrid - New York, NY, Hybrid - Washington DC",
+    "Washington D.C, Los Angeles, CA; Seattle, WA"
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, ["WA"], [], [], []),
+      true,
+      `a real WA site is still a WA match when a DC site is listed beside it: ${location}`
+    );
+  }
+
+  // Foreign subdivisions that abbreviate the same way as a US state. These are not the
+  // country-code collisions the older guard handled (IN/India, LA/Laos): "WA" is not a
+  // country code at all, so nothing was comparing Western Australia against Washington.
+  for (const [location, stateCode] of [
+    ["Perth, WA, Australia", "WA"],
+    ["WA, WA, Australia", "WA"],
+    ["Chennai, TN, India", "TN"],
+    ["Lagos, LA, Nigeria", "LA"],
+    ["Amsterdam, NH, Netherlands", "NH"],
+    ["Al Ain, Abu Dhabi, United Arab Emirates", "AL"]
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, [stateCode], [], [], []),
+      false,
+      `${stateCode} names a foreign subdivision here, not the US state: ${location}`
+    );
+  }
+
+  // The trailing segment is what settles the country, and only when it is not itself a US
+  // state name. Reading any country-shaped word anywhere in the string instead reclassified
+  // all of these American towns as foreign.
+  for (const [location, stateCode] of [
+    ["Lebanon, NH", "NH"],
+    ["Holland, MI", "MI"],
+    ["Jamaica, NY", "NY"],
+    ["New Britain, CT", "CT"],
+    ["Albuquerque, New Mexico", "NM"],
+    ["Lebanon, IN", "IN"]
+  ]) {
+    assert.equal(
+      rowMatchesLocationFilters(location, [stateCode], [], [], []),
+      true,
+      `an American town whose name is also a country's must still match ${stateCode}: ${location}`
+    );
+  }
+
   console.log("location-state-filter tests passed");
 }
 
