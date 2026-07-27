@@ -150,8 +150,9 @@ function buildMcpRunbook(settings, personalInformation, candidates) {
       "Shortlist, screen, then apply: filter postings down, read each survivor's stored description before opening a browser, and submit only when allowed by settings and credentials.",
     steps: [
       "Read applicantee information and MCP settings from this payload.",
+      "Read the actual resume once with get_resume; it is the ground truth the profile fields summarize.",
       "Shortlist with find_posting_candidates (saved preferences) or query_postings (include/exclude terms, pay floor, recency).",
-      "Screen each shortlisted posting with get_posting_details and weigh its description against the applicant's background before opening anything in a browser.",
+      "Screen each shortlisted posting with get_posting_details and weigh its description against the resume before opening anything in a browser.",
       "Call ignore_posting for postings that are not a fit, so no later run resurfaces them.",
       "For each posting worth applying to, open job_posting_url and fill the application from applicantee information. Keep applicant email separate from agent login email.",
       "If an account or MFA is required, use agent_login_email + agent_login_password for account creation and sign-in flows.",

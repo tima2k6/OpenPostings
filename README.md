@@ -352,6 +352,7 @@ MCP helper endpoints:
 
 You can have Codex/Claude/Gemini/Qwen/LLMs do the following for you:
 - Get your applicantee information `get_applicant_context`
+- Read your actual resume (PDF, docx, txt or md) so screening happens against your real background `get_resume`
 - List every filter value it can search on `get_filter_options`
 - Find the latest relevant jobs for you. `find_posting_candidates`
 - Run precision queries like "(manager OR director) AND NOT assistant, in WA, over 140k, seen in the last 3 days" `query_postings`
@@ -362,10 +363,11 @@ You can have Codex/Claude/Gemini/Qwen/LLMs do the following for you:
 - Build a dynamic cover letter for you that relates to your resume, experience and the job you are applying for. `draft_cover_letter`
 - Update job application tracking for you. `record_application_result`
 
-The intended loop is shortlist → screen → apply: filter with `find_posting_candidates` or
-`query_postings`, read each survivor with `get_posting_details`, `ignore_posting` the
-misses (they stay gone across runs), apply to the rest, and `record_application_result`
-what happened. `list_applications` keeps separate runs from double-applying.
+The intended loop is shortlist → screen → apply: read the resume once with `get_resume`,
+filter with `find_posting_candidates` or `query_postings`, weigh each survivor's
+`get_posting_details` description against the resume, `ignore_posting` the misses (they
+stay gone across runs), apply to the rest, and `record_application_result` what happened.
+`list_applications` keeps separate runs from double-applying.
 
 `find_posting_candidates` runs the same filter engine as the app's job list, so the agent can
 search on anything the app can:

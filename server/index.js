@@ -92,6 +92,7 @@ const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable,
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
 const { listPostingsWithFilters, setPostingIgnoredState, getCounts, getWideScanStats } = require("./services/postings.js");
 const { getPostingFilterOptions } = require("./services/filter-options.js");
+const { extractDocumentText } = require("./services/applicant-documents.js");
 const { getDb, setDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
 
 const cors = require("cors");
@@ -1555,6 +1556,27 @@ function createServer() {
       runbook,
       candidates
     });
+  });
+
+  app.get("/mcp/resume", async (req, res) => {
+    const settings = await getMcpSettings();
+    try {
+      ensureMcpAgentEnabled(settings);
+    } catch (error) {
+      return res.status(Number(error?.statusCode || 403)).json({
+        ok: false,
+        error: String(error?.message || error)
+      });
+    }
+    const personalInformation = await getPersonalInformation();
+    const which = String(req.query.document || "") === "projects_portfolio" ? "projects_portfolio" : "resume";
+    const filePath =
+      which === "projects_portfolio"
+        ? personalInformation?.projects_portfolio_file_path
+        : personalInformation?.resume_file_path;
+
+    const result = await extractDocumentText(filePath);
+    res.json({ document: which, ...result });
   });
 
   app.post("/mcp/cover-letter-draft", async (req, res) => {
