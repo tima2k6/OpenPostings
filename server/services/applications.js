@@ -20,6 +20,17 @@ async function resolveCompanyIdForApplication(companyName) {
 }
 
 
+// The employer as the posting itself names it, used when no companies row matches.
+async function lookupPostingCompanyName(jobPostingUrl) {
+  const normalizedUrl = String(jobPostingUrl || "").trim();
+  if (!normalizedUrl) return "";
+  const row = await getDb().get(
+    `SELECT company_name FROM Postings WHERE job_posting_url = ? LIMIT 1;`,
+    [normalizedUrl]
+  );
+  return String(row?.company_name || "").trim();
+}
+
 async function resolveCompanyIdFromPostingUrl(jobPostingUrl) {
   const normalizedUrl = String(jobPostingUrl || "").trim();
   if (!normalizedUrl) return null;
@@ -77,7 +88,9 @@ function mapApplicationRow(row) {
   const appliedByType = normalizeAppliedByType(row?.applied_by_type);
   return {
     id: Number(row?.id || 0),
-    company_id: Number(row?.company_id || 0),
+    // Null, not 0. An application to an employer outside the crawl table has no company
+    // id, and 0 reads as a real one.
+    company_id: row?.company_id === null || row?.company_id === undefined ? null : Number(row.company_id),
     company_name: String(row?.company_name || "").trim(),
     position_name: String(row?.position_name || "").trim(),
     application_date: Number(row?.application_date || 0),
@@ -94,7 +107,7 @@ async function getApplicationById(applicationId) {
       SELECT
         a.id,
         a.company_id,
-        c.company_name,
+        COALESCE(NULLIF(TRIM(c.company_name), ''), a.company_name) AS company_name,
         a.position_name,
         a.application_date,
         a.status,
@@ -126,7 +139,7 @@ async function listApplications(options = {}) {
         SELECT
           a.id,
           a.company_id,
-          c.company_name,
+          COALESCE(NULLIF(TRIM(c.company_name), ''), a.company_name) AS company_name,
           a.position_name,
           a.application_date,
           a.status,
@@ -149,7 +162,7 @@ async function listApplications(options = {}) {
         SELECT
           a.id,
           a.company_id,
-          c.company_name,
+          COALESCE(NULLIF(TRIM(c.company_name), ''), a.company_name) AS company_name,
           a.position_name,
           a.application_date,
           a.status,
@@ -194,12 +207,20 @@ async function createApplication(input) {
 
   const companyFromPosting = await resolveCompanyIdFromPostingUrl(jobPostingUrl);
   const company = companyFromPosting || (companyName ? await resolveCompanyIdForApplication(companyName) : null);
-  if (!company?.id) {
-    throw new Error(
-      jobPostingUrl
-        ? `Unable to resolve company_id for job_posting_url='${jobPostingUrl}'`
-        : `Unable to resolve company_id for company_name='${companyName}'`
-    );
+
+  // No longer fatal. This used to throw, which meant an application genuinely submitted was
+  // discarded because the employer had no row in the crawl table -- Amazon postings carry
+  // legal entity names ("Amazon.com Services LLC") that match nothing, so every Amazon
+  // application was lost at this line. Best available name, in order of trustworthiness:
+  // the matched company, then the posting's own company_name, then what the caller said.
+  const postingCompanyName = jobPostingUrl ? await lookupPostingCompanyName(jobPostingUrl) : "";
+  const resolvedCompanyName =
+    String(company?.company_name || "").trim() ||
+    postingCompanyName ||
+    companyName ||
+    "";
+  if (!resolvedCompanyName) {
+    throw new Error("An application needs a company_name (or a job_posting_url that resolves to one).");
   }
 
   const status = normalizeApplicationStatus(input?.status);
@@ -213,12 +234,15 @@ async function createApplication(input) {
       `
         INSERT INTO applications (
           company_id,
+          company_name,
           position_name,
           application_date,
           status
-        ) VALUES (?, ?, ?, ?);
+        ) VALUES (?, ?, ?, ?, ?);
       `,
-      [company.id, positionName, applicationDate, status]
+      // company_id is best-effort now; company_name is what actually has to survive, since
+      // an application to an employer outside the crawl table is still an application.
+      [company?.id ?? null, resolvedCompanyName, positionName, applicationDate, status]
     );
 
     await handle.run(

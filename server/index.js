@@ -954,6 +954,55 @@ async function ensureApplicationsTable() {
   // gone. SQLite before 3.35 cannot DROP COLUMN and the column may be NOT NULL, so the
   // values are overwritten with empty strings here and simply never read again -- which
   // also scrubs the secret from any database that already stored one.
+
+  // An application records something that happened in the real world, so it must be
+  // storable whether or not the employer is in the crawl table. It was not: company_id was
+  // NOT NULL and had to point at a `companies` row matched by exact lowercase name, and
+  // Amazon's postings carry legal entity names ("Amazon.com Services LLC", "Amazon Data
+  // Services, Inc.") that have no such row -- nor does plain "Amazon". Submissions really
+  // made were thrown away at the last step because of an internal join.
+  //
+  // company_name is denormalised onto the row so the employer survives regardless, and
+  // company_id becomes optional. SQLite cannot drop a NOT NULL constraint, so the table is
+  // rebuilt when the old one is still in place. Ids are preserved: application_attribution
+  // and posting_application_state.last_application_id both reference them.
+  const applicationColumns = await db.all(`PRAGMA table_info('applications');`);
+  const applicationColumnNames = new Set(applicationColumns.map((column) => String(column?.name || "")));
+  if (!applicationColumnNames.has("company_name")) {
+    await db.exec(`ALTER TABLE applications ADD COLUMN company_name TEXT NOT NULL DEFAULT '';`);
+  }
+  const companyIdIsRequired = applicationColumns.some(
+    (column) => String(column?.name) === "company_id" && Number(column?.notnull) === 1
+  );
+  if (companyIdIsRequired) {
+    await db.exec("BEGIN TRANSACTION;");
+    try {
+      await db.exec(`
+        CREATE TABLE applications_migrated (
+          id INTEGER NOT NULL PRIMARY KEY,
+          company_id INTEGER,
+          company_name TEXT NOT NULL DEFAULT '',
+          position_name TEXT NOT NULL,
+          application_date INTEGER NOT NULL,
+          status TEXT
+        );
+        INSERT INTO applications_migrated (id, company_id, company_name, position_name, application_date, status)
+        SELECT a.id, a.company_id,
+               CASE WHEN TRIM(COALESCE(a.company_name, '')) <> '' THEN a.company_name
+                    ELSE COALESCE(c.company_name, '') END,
+               a.position_name, a.application_date, a.status
+        FROM applications a
+        LEFT JOIN companies c ON c.id = a.company_id;
+        DROP TABLE applications;
+        ALTER TABLE applications_migrated RENAME TO applications;
+      `);
+      await db.exec("COMMIT;");
+    } catch (error) {
+      await db.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
   if (mcpSettingsColumnNames.has("agent_login_password")) {
     await db.run(`UPDATE McpSettings SET agent_login_password = '' WHERE agent_login_password <> '';`);
   }
