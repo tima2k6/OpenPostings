@@ -46,6 +46,10 @@ const DB_BROWSER_PAGE = `<!doctype html>
   .ok { background: #d7f5dd; color: #10683a; }
   .none { background: #ffe0e0; color: #93202a; }
   .warn { background: #ffeccc; color: #8a5300; }
+  /* Neutral, deliberately not warn: a posting outside the date window is still open, so
+     colouring it like a problem would misreport it. Same light-background/dark-text shape
+     as the others, which reads on both colour schemes. */
+  .info { background: #dbeafe; color: #1d4f8a; }
   .err { color: #b3261e; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; margin: 10px 0; }
   footer { padding: 0 18px 30px; }
   .hint { font-size: 12px; color: #66798c; margin: 8px 0; }
@@ -151,7 +155,10 @@ const DB_BROWSER_PAGE = `<!doctype html>
       <label>Show<select id="f-vis">
         <option value="all">All rows</option>
         <option value="visible">Visible in app</option>
-        <option value="hidden">Hidden from app</option>
+        <option value="open">Still applyable (visible + past date window)</option>
+        <option value="stale_dated">Still listed, past date window</option>
+        <option value="delisted">Delisted by the employer</option>
+        <option value="hidden">Hidden from app (either reason)</option>
       </select></label>
       <label>Sort by<select id="f-sort">
         <option value="last_seen">Last seen</option>
@@ -361,7 +368,7 @@ ORDER BY n DESC</textarea>
         '<a class="ptitle" href="' + esc(r.job_posting_url) + '" target="_blank" rel="noopener">' +
           esc(r.position_name || "Untitled") + "</a>" +
         '<div class="pmeta">' +
-          (r.hidden ? '<span class="pill warn">hidden</span> ' : "") +
+          hiddenPill(r) +
           '<span class="pco">' + esc(r.company_name) + "</span>" +
           (r.location ? ' <span class="psep">\u00b7</span> ' + esc(r.location) : "") +
         "</div>" +
@@ -371,6 +378,27 @@ ORDER BY n DESC</textarea>
         "</div>" +
       "</li>";
     }).join("") + "</ul>";
+  }
+
+  // A bare "hidden" pill said nothing about whether the job is gone or merely old, which
+  // are wildly different things to a job seeker: a delisted posting cannot be applied to,
+  // while one outside the date window is still on the employer's board. Two reasons, two
+  // labels, two colours -- and the neutral one is not styled as a warning, because there
+  // is nothing wrong with it.
+  function hiddenPill(r) {
+    if (!r.hidden) return "";
+    if (r.hidden_reason === "outside_date_window") {
+      // No apostrophes in this string. The page is emitted from a template literal, so a
+      // backslash-escaped quote here becomes a raw apostrophe inside a single-quoted
+      // string in the browser, which is a syntax error that takes down the whole page
+      // script -- not just this pill.
+      return '<span class="pill info" title="Still listed by the employer, but the posting date is older than the freshness window. Still applyable.">still listed &middot; past date window</span> ';
+    }
+    if (r.hidden_reason === "delisted") {
+      return '<span class="pill warn" title="The ATS stopped listing this posting, so it is almost certainly gone.">delisted</span> ';
+    }
+    // Rows hidden before hidden_reason existed, if any survived the migration.
+    return '<span class="pill warn">hidden</span> ';
   }
 
   function money(r) {
@@ -384,9 +412,24 @@ ORDER BY n DESC</textarea>
     var params = new URLSearchParams(readFilters()).toString();
     document.getElementById("posting-out").innerHTML = '<p class="hint">Running&hellip;</p>';
     get("/db/search?" + params).then(function (data) {
+      // Break the hidden count down the same way the pills do, so the summary and the rows
+      // tell the same story rather than one saying "hidden" and the other "still listed".
+      var staleDated = 0, delisted = 0;
+      (data.rows || []).forEach(function (r) {
+        if (!r.hidden) return;
+        if (r.hidden_reason === "outside_date_window") staleDated += 1;
+        else delisted += 1;
+      });
+      var hiddenTotal = data.total - data.visible;
+      var breakdown = "";
+      if (hiddenTotal > 0 && (staleDated || delisted)) {
+        // Derived from the returned page, not the whole match set, so say so rather than
+        // implying these are totals.
+        breakdown = " (of those shown: " + staleDated + " still listed, " + delisted + " delisted)";
+      }
       document.getElementById("posting-count").textContent =
         (data.approximate ? "at least " : "") + data.total + " matched \u00b7 " + data.visible +
-        " visible, " + (data.total - data.visible) + " hidden \u00b7 showing " + data.shown;
+        " visible, " + hiddenTotal + " hidden" + breakdown + " \u00b7 showing " + data.shown;
       document.getElementById("posting-sqlout").textContent = data.sql;
       renderSortBar();
       document.getElementById("posting-out").innerHTML = postingList(data.rows);

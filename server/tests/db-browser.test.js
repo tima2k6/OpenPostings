@@ -6,6 +6,7 @@
 const assert = require("assert");
 
 const { rejectUnsafeQuery } = require("../services/db-browser.js");
+const { DB_BROWSER_PAGE } = require("../services/db-browser-page.js");
 
 function testWritesAreRefused() {
   for (const sql of [
@@ -78,6 +79,50 @@ function testEmptyIsRefused() {
   assert.ok(rejectUnsafeQuery(null));
 }
 
+// The whole browser page is emitted from a template literal that contains the page's own
+// JavaScript, so an escape that is valid in the outer literal can still be a syntax error
+// in the browser -- and because it is one script tag, that does not break one feature, it
+// breaks the entire page. Nothing about the file looks wrong when this happens, and no
+// server-side check catches it. Parsing what is actually served does.
+//
+// This is not hypothetical: writing `app\'s` inside a single-quoted string emitted a raw
+// apostrophe and took the page down.
+function testEmittedPageScriptParses() {
+  const scripts = [...DB_BROWSER_PAGE.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)].map((match) => match[1]);
+  assert.ok(scripts.length > 0, "the page must carry its script inline");
+
+  for (const [index, source] of scripts.entries()) {
+    assert.doesNotThrow(
+      // eslint-disable-next-line no-new-func
+      () => new Function(source),
+      `inline script #${index} in the served /db page is not parseable`
+    );
+  }
+}
+
+// The pill is the one thing on this page that reports why a posting is hidden, and the two
+// reasons mean opposite things to a job seeker: delisted is gone, outside_date_window is
+// still open. They must not render the same, and the still-open one must not be styled as
+// a warning.
+function testHiddenPillDistinguishesReasons() {
+  const match = DB_BROWSER_PAGE.match(/function hiddenPill\(r\) \{[\s\S]*?\n {2}\}/);
+  assert.ok(match, "hiddenPill must be present in the served page");
+  // eslint-disable-next-line no-new-func
+  const hiddenPill = new Function(`${match[0]}; return hiddenPill;`)();
+
+  assert.strictEqual(hiddenPill({ hidden: 0, hidden_reason: "" }), "", "a visible posting gets no pill");
+
+  const stale = hiddenPill({ hidden: 1, hidden_reason: "outside_date_window" });
+  assert.match(stale, /still listed/i, "a still-listed posting must say so, not just 'hidden'");
+  assert.ok(!/class="pill warn"/.test(stale), "a still-applyable posting must not be styled as a warning");
+
+  const delisted = hiddenPill({ hidden: 1, hidden_reason: "delisted" });
+  assert.match(delisted, /delisted/i);
+  assert.match(delisted, /class="pill warn"/, "a delisted posting is a warning -- it cannot be applied to");
+
+  assert.notStrictEqual(stale, delisted, "the two reasons must not render identically");
+}
+
 function main() {
   testWritesAreRefused();
   testSelectsAreAllowed();
@@ -85,6 +130,8 @@ function main() {
   testStatementStackingIsRefused();
   testFileReachingIsRefused();
   testEmptyIsRefused();
+  testEmittedPageScriptParses();
+  testHiddenPillDistinguishesReasons();
   console.log("db-browser tests passed");
 }
 
