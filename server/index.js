@@ -96,6 +96,7 @@ const { listPostingsWithFilters, setPostingIgnoredState, getCounts, getWideScanS
 const { getPostingFilterOptions } = require("./services/filter-options.js");
 const { extractDocumentText, getApplicantDocument, saveApplicantDocument, listApplicantDocuments, deleteApplicantDocument, checkConfiguredDocumentPaths, normalizeDocumentKind, MAX_DOCUMENT_KEY_LENGTH, APPLICANT_DOCUMENT_KINDS } = require("./services/applicant-documents.js");
 const { ensureApplicationAnswersTable, listApplicationAnswers, setApplicationAnswers, clearApplicationAnswer } = require("./services/application-answers.js");
+const { ensureErrorLogTable, recordError, listErrors, acknowledgeErrors } = require("./services/error-log.js");
 const { getDb, setDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
 
 const cors = require("cors");
@@ -608,6 +609,7 @@ async function initDb() {
   await ensureApplicationsTable();
   await ensureBlockedCompaniesTable();
   await ensureApplicationAnswersTable();
+  await ensureErrorLogTable();
   await ensureSyncServiceSettingsTable();
   await loadSyncServiceSettingsIntoRuntime();
   await ensureCompaniesTableSchema();
@@ -1807,6 +1809,28 @@ function createServer() {
     }
   });
 
+  // Failures worth telling the user about, newest first. The app polls the unacknowledged
+  // count so a lost application cannot pass unnoticed the way the Amazon ones did.
+  app.get("/errors", async (req, res) => {
+    try {
+      res.json(await listErrors({
+        limit: parseNonNegativeInteger(req.query.limit) || 50,
+        include_acknowledged: normalizeBoolean(req.query.include_acknowledged, false)
+      }));
+    } catch (error) {
+      res.status(500).json({ error: String(error?.message || error) });
+    }
+  });
+
+  // Dismiss without deleting: the record is the point, the notice is not.
+  app.post("/errors/acknowledge", async (req, res) => {
+    try {
+      res.json({ ok: true, ...(await acknowledgeErrors(req.body?.ids)) });
+    } catch (error) {
+      res.status(400).json({ ok: false, error: String(error?.message || error) });
+    }
+  });
+
   // The answers application forms ask for. Seeded with the standard questions at empty
   // values; an empty value means "still to ask the user", never "fill this in yourself".
   app.get("/settings/application-answers", async (_req, res) => {
@@ -2038,6 +2062,19 @@ function createServer() {
         item
       });
     } catch (error) {
+      // Same reasoning as the MCP path: by the time this is called the application has
+      // usually already been sent, so a failure here loses a fact about the real world
+      // rather than just failing a request.
+      await recordError({
+        source: "api",
+        operation: "POST /applications",
+        message: `Application could not be logged: ${String(error?.message || error)}`,
+        context: {
+          company_name: req.body?.company_name,
+          position_name: req.body?.position_name,
+          job_posting_url: req.body?.job_posting_url
+        }
+      });
       res.status(400).json({
         ok: false,
         error: String(error?.message || error)

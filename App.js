@@ -25,7 +25,9 @@ import {
   createApplication,
   deleteApplication,
   fetchApplicantDocuments,
+  acknowledgeErrors,
   fetchApplicationAnswers,
+  fetchErrors,
   fetchApplications,
   fetchBlockedCompanies,
   fetchMcpCandidates,
@@ -1408,6 +1410,10 @@ export default function App() {
   const [applications, setApplications] = useState([]);
   const [applicationsLoading, setApplicationsLoading] = useState(false);
   const [applicationsNotice, setApplicationsNotice] = useState("");
+  // Failures the server recorded that cost the user something -- an application submitted
+  // but not logged, most of all. Polled alongside the applications list so a loss surfaces
+  // in the app rather than only in whatever the agent happened to say at the time.
+  const [systemErrors, setSystemErrors] = useState([]);
   const [savingApplicationIds, setSavingApplicationIds] = useState({});
   const [ignoringPostingIds, setIgnoringPostingIds] = useState({});
   const [blockingCompanyNames, setBlockingCompanyNames] = useState({});
@@ -1816,10 +1822,31 @@ export default function App() {
     }
   }, []);
 
+  const loadSystemErrors = useCallback(async () => {
+    try {
+      const response = await fetchErrors(false);
+      setSystemErrors(Array.isArray(response?.items) ? response.items : []);
+    } catch {
+      // A server too old or too broken to report errors must not itself break the page.
+      setSystemErrors([]);
+    }
+  }, []);
+
+  const handleDismissSystemErrors = useCallback(async () => {
+    const ids = systemErrors.map((item) => item.id).filter(Boolean);
+    setSystemErrors([]);
+    try {
+      await acknowledgeErrors(ids);
+    } catch {
+      // Dismissal is cosmetic; the rows stay in the database either way.
+    }
+  }, [systemErrors]);
+
   const handleOpenApplicationsPage = useCallback(() => {
     setActivePage(PAGE_KEYS.APPLICATIONS);
     setDrawerOpen(false);
     loadApplications({ silent: false });
+    loadSystemErrors();
   }, [loadApplications]);
 
   const loadStatus = useCallback(async () => {
@@ -3247,6 +3274,41 @@ export default function App() {
           Track jobs you applied to. Entries added from Postings are marked as manual applications.
         </Text>
 
+        {/* Applications that were submitted but could not be recorded. This is the whole
+            point of the error log: the failure used to exist only as a line in an agent
+            reply, so submissions went untracked with nothing in the app to say so. Each
+            entry carries what it needs to be re-entered by hand. */}
+        {systemErrors.length > 0 ? (
+          <View style={styles.errorBanner}>
+            <Text style={styles.errorBannerTitle}>
+              {systemErrors.length === 1
+                ? "1 problem needs your attention"
+                : `${systemErrors.length} problems need your attention`}
+            </Text>
+            {systemErrors.slice(0, 5).map((item) => {
+              const context = item?.context && typeof item.context === "object" ? item.context : {};
+              const subject = [context.company_name, context.position_name].filter(Boolean).join(" — ");
+              return (
+                <View key={item.id} style={styles.errorBannerRow}>
+                  <Text style={styles.errorBannerText}>
+                    {sanitizeDisplayText(item.message, "Something failed.")}
+                  </Text>
+                  {subject ? <Text style={styles.errorBannerMeta}>{subject}</Text> : null}
+                  {context.job_posting_url ? (
+                    <Text style={styles.errorBannerMeta}>{String(context.job_posting_url)}</Text>
+                  ) : null}
+                </View>
+              );
+            })}
+            {systemErrors.length > 5 ? (
+              <Text style={styles.errorBannerMeta}>{`and ${systemErrors.length - 5} more`}</Text>
+            ) : null}
+            <Pressable onPress={handleDismissSystemErrors} style={styles.errorBannerButton}>
+              <Text style={styles.errorBannerButtonText}>Dismiss</Text>
+            </Pressable>
+          </View>
+        ) : null}
+
         {applicationsNotice ? <Text style={styles.settingsNotice}>{applicationsNotice}</Text> : null}
         {applicationsLoading ? <ActivityIndicator size="small" style={styles.settingsLoader} /> : null}
 
@@ -4636,6 +4698,28 @@ const styles = StyleSheet.create({
     color: "#0b6e4f",
     fontSize: 12
   },
+  errorBanner: {
+    borderWidth: 1,
+    borderColor: "#e0b4b0",
+    backgroundColor: "#fdf0ef",
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 12
+  },
+  errorBannerTitle: { fontWeight: "700", color: "#8a2b22", marginBottom: 6 },
+  errorBannerRow: { marginBottom: 8 },
+  errorBannerText: { color: "#8a2b22", fontSize: 13 },
+  errorBannerMeta: { color: "#a4564d", fontSize: 12 },
+  errorBannerButton: {
+    alignSelf: "flex-start",
+    marginTop: 4,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#c98b84"
+  },
+  errorBannerButtonText: { color: "#8a2b22", fontWeight: "600", fontSize: 13 },
   empty: {
     textAlign: "center",
     marginTop: 20,

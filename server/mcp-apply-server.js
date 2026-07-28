@@ -40,6 +40,7 @@ const {
   enrichPostingsWithApplicationState
 } = require("./services/postings.js");
 const { listApplications } = require("./services/applications.js");
+const { ensureErrorLogTable, recordError } = require("./services/error-log.js");
 const {
   ensureApplicationAnswersTable,
   getApplicationAnswerSummary,
@@ -314,6 +315,7 @@ async function openDatabase() {
   // Seeds the standard screening questions so get_application_answers can report what is
   // still unanswered even on a database the API server has not started against yet.
   await ensureApplicationAnswersTable();
+  await ensureErrorLogTable();
 }
 
 // An explicitly passed filter replaces the saved preference; an empty one falls back to it,
@@ -1191,6 +1193,35 @@ async function main() {
       }
     },
     async (args) => {
+      // Wrapped as a whole, not around the insert alone. Once commit is requested the
+      // application has generally already been sent to the employer, so *every* way this
+      // handler can fail past that point loses a real fact -- validation that rejects an
+      // unresolvable posting is as much a loss as a failed insert, and the first attempt at
+      // this only guarded the insert and so recorded nothing for exactly that case.
+      try {
+        return await recordApplicationResult(args);
+      } catch (error) {
+        if (normalizeBoolean(args?.commit, false)) {
+          await recordError({
+            source: "mcp",
+            operation: "record_application_result",
+            message: `Application may have been submitted but could not be logged: ${String(error?.message || error)}`,
+            // Enough to re-enter the application by hand from the notice alone.
+            context: {
+              company_name: args?.company_name || null,
+              position_name: args?.position_name || null,
+              job_posting_url: args?.job_posting_url || null,
+              status: args?.status || "applied"
+            }
+          });
+        }
+        throw error;
+      }
+    }
+  );
+
+  async function recordApplicationResult(args) {
+    {
       const mcpSettings = await getMcpSettings();
       ensureMcpAgentEnabled(mcpSettings);
       const commit = normalizeBoolean(args?.commit, false);
@@ -1244,6 +1275,11 @@ async function main() {
         throw new Error("Final approval is required. Set approved_by_user=true to commit.");
       }
 
+      // The submission has already happened by the time this runs -- the agent filled the
+      // form and the employer accepted it. If the write fails, the fact is only recoverable
+      // from whatever the agent happens to say next, which is how a set of Amazon
+      // applications went unrecorded with nothing but a sentence in a chat log to show for
+      // it. Record the failure durably first, then rethrow so the caller still sees it.
       const application = await createApplicationFromAgent({
         company_name: companyName,
         position_name: positionName,
@@ -1258,7 +1294,7 @@ async function main() {
         application
       });
     }
-  );
+  }
 
   const transport = new StdioServerTransport();
   await mcpServer.connect(transport);

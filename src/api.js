@@ -280,6 +280,17 @@ export function uploadApplicantDocument(payload) {
   });
 }
 
+export function fetchErrors(includeAcknowledged = false) {
+  return request(`/errors?limit=50&include_acknowledged=${includeAcknowledged ? "1" : "0"}`);
+}
+
+export function acknowledgeErrors(ids) {
+  return request("/errors/acknowledge", {
+    method: "POST",
+    body: JSON.stringify({ ids: Array.isArray(ids) ? ids : [] })
+  });
+}
+
 export function fetchApplicationAnswers() {
   return request("/settings/application-answers");
 }
