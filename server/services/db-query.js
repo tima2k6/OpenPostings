@@ -22,7 +22,9 @@ const {
   parsePostingLocation,
   parseLocationsJson,
   parseLocationAnyTerm,
-  locationEntryMatches
+  locationEntryMatches,
+  parseCityFilters,
+  rowMatchesCityFilters
 } = require("../helpers/parse-location.js");
 
 const MAX_ROWS = 1000;
@@ -137,6 +139,25 @@ function buildQuery(input = {}) {
     }
     clauses.push(`(locations_json IS NULL OR ${parts.join(" OR ")})`);
   }
+  // Cities are their own filter, ANDed with location_any rather than folded into it: they
+  // are separate boxes on the page and separate arguments on the tools, and the page states
+  // that each box narrows further. Same "City|ST" values the dropdowns emit.
+  const cityTerms = parseCityFilters(input.cities);
+  if (cityTerms.length) {
+    const cityParts = [];
+    for (const term of cityTerms) {
+      const longestWord = term.city.split(" ").sort((a, b) => b.length - a.length)[0] || term.city;
+      const pattern = `%${escapeLike(longestWord)}%`;
+      cityParts.push(`LOWER(COALESCE(city, '')) LIKE ? ESCAPE '\\'`);
+      params.push(pattern);
+      cityParts.push(`LOWER(COALESCE(locations_json, '')) LIKE ? ESCAPE '\\'`);
+      params.push(pattern);
+      cityParts.push(`LOWER(COALESCE(location, '')) LIKE ? ESCAPE '\\'`);
+      params.push(pattern);
+    }
+    clauses.push(`(locations_json IS NULL OR ${cityParts.join(" OR ")})`);
+  }
+
   if (locationNone.length) clauses.push(noneOf("location", locationNone, params));
 
   // Structured, so "remote" never has to be a location term again -- as a substring it
@@ -244,7 +265,7 @@ function buildQuery(input = {}) {
     `ORDER BY ${sortColumn} ${direction}, id DESC\n` +
     `LIMIT ${limit}`;
 
-  return { sql, params, where, clauses, limit, stateCodes, countryFilters, regionFilters, atsFilters, locationAnyTerms };
+  return { sql, params, where, clauses, limit, stateCodes, countryFilters, regionFilters, atsFilters, locationAnyTerms, cityTerms };
 }
 
 // True when the SQL predicate is only a superset of what the caller asked for, so the counts
@@ -255,14 +276,15 @@ function needsRefinePass(built) {
     built.countryFilters.length > 0 ||
     built.regionFilters.length > 0 ||
     built.atsFilters.length > 0 ||
-    built.locationAnyTerms.length > 0
+    built.locationAnyTerms.length > 0 ||
+    built.cityTerms.length > 0
   );
 }
 
 async function runQuery(input = {}) {
   const db = await getReadOnlyDb();
   const built = buildQuery(input);
-  const { where, limit, stateCodes, countryFilters, regionFilters, atsFilters, locationAnyTerms } = built;
+  const { where, limit, stateCodes, countryFilters, regionFilters, atsFilters, locationAnyTerms, cityTerms } = built;
   const params = built.params.slice();
 
   const readable = built.sql.replace(/\?/g, () => {
@@ -330,6 +352,8 @@ async function runQuery(input = {}) {
         continue;
       }
     }
+    // ANDed with the block above, not merged into it.
+    if (cityTerms.length && !rowMatchesCityFilters(entries, cityTerms)) continue;
     if (regionFilters.length && !rowMatchesLocationFilters(location, [], [], [], regionFilters)) continue;
     if (atsFilters.length && !atsFilters.includes(String(inferAtsFromJobPostingUrl(row.job_posting_url) || "").toLowerCase())) continue;
     matched.push({ ...row, location: row.location || location });

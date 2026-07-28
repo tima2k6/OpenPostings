@@ -365,6 +365,7 @@ async function findCandidates(options = {}) {
     include_ignored: normalizeBoolean(options.include_ignored, false),
     include_dead: normalizeBoolean(options.include_dead, false),
     include_stale_dated: normalizeBoolean(options.include_stale_dated, false),
+    cities: normalizeStringArray(options.cities),
     // Descriptions are the bulk of the payload, and an agent that only needs to rank titles
     // and open URLs does not want them in its context. Opt in per call.
     include_descriptions: normalizeBoolean(options.include_descriptions, false)
@@ -674,7 +675,7 @@ async function main() {
     "find_posting_candidates",
     {
       description:
-        "Find postings to apply to, using the same filter engine as the app's job list. Any filter left empty falls back to the saved MCP preference for it; pass use_settings=false to ignore saved preferences entirely. Applied, ignored and dead postings are excluded by default (include_dead=true to see verified-gone ones). Postings hidden only because their posting date is older than the freshness window are excluded too but remain applyable -- include_stale_dated=true brings them back, and rows carry hidden_reason so you can tell them from delisted ones. Pay ranges keep postings with no published pay figure -- pay_unknown_count reports how many -- unless include_unknown_pay=false. Rows carry location_conflict, which flags a posting whose description restricts hiring to fewer places than its header lists. Job descriptions are omitted unless include_descriptions=true. Call get_filter_options for the valid values of the list filters.",
+        "Find postings to apply to, using the same filter engine as the app's job list. Any filter left empty falls back to the saved MCP preference for it; pass use_settings=false to ignore saved preferences entirely. Applied, ignored and dead postings are excluded by default (include_dead=true to see verified-gone ones). Postings hidden only because their posting date is older than the freshness window are excluded too but remain applyable -- include_stale_dated=true brings them back, and rows carry hidden_reason so you can tell them from delisted ones. Pay ranges keep postings with no published pay figure -- pay_unknown_count reports how many -- unless include_unknown_pay=false. Rows carry location_conflict, which flags a posting whose description restricts hiring to fewer places than its header lists. Job descriptions are omitted unless include_descriptions=true. Use cities for city-level targeting: values are City|ST (get_filter_options lists them per state, busiest first) and they match parsed locations, so Kent|WA cannot return Kent in England or anything in Kentucky. Call get_filter_options for the valid values of the list filters.",
       inputSchema: {
         search: z.string().optional(),
         ats: z
@@ -698,6 +699,7 @@ async function main() {
         include_ignored: z.boolean().optional(),
         include_dead: z.boolean().optional(),
         include_stale_dated: z.boolean().optional(),
+        cities: z.array(z.string()).optional(),
         include_descriptions: z.boolean().optional(),
         use_settings: z.boolean().optional(),
         limit: z.number().int().positive().max(MAX_CANDIDATE_LIMIT).optional(),

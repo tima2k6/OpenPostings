@@ -125,6 +125,7 @@ export function fetchPostings(search = "", limit = 500, offset = 0, filters = {}
   const educationLevels = Array.isArray(filters?.education_levels) ? filters.education_levels.filter(Boolean) : [];
   const states = Array.isArray(filters?.states) ? filters.states.filter(Boolean) : [];
   const counties = Array.isArray(filters?.counties) ? filters.counties.filter(Boolean) : [];
+  const cities = Array.isArray(filters?.cities) ? filters.cities.filter(Boolean) : [];
   const countries = Array.isArray(filters?.countries) ? filters.countries.filter(Boolean) : [];
   const regions = Array.isArray(filters?.regions) ? filters.regions.filter(Boolean) : [];
   const remoteValues = Array.isArray(filters?.remote)
@@ -164,6 +165,9 @@ export function fetchPostings(search = "", limit = 500, offset = 0, filters = {}
   }
   if (counties.length > 0) {
     params.set("counties", counties.join(","));
+  }
+  if (cities.length > 0) {
+    params.set("cities", cities.join(","));
   }
   if (countries.length > 0) {
     params.set("countries", countries.join(","));
@@ -374,6 +378,9 @@ export function fetchMcpCandidates(filters = {}) {
   }
   if (Array.isArray(filters?.counties) && filters.counties.length > 0) {
     params.set("counties", filters.counties.filter(Boolean).join(","));
+  }
+  if (Array.isArray(filters.cities) && filters.cities.length > 0) {
+    params.set("cities", filters.cities.filter(Boolean).join(","));
   }
   if (Array.isArray(filters?.countries) && filters.countries.length > 0) {
     params.set("countries", filters.countries.filter(Boolean).join(","));

@@ -5,6 +5,7 @@ const { normalizeCompensationType, normalizeCompensationPayPeriod, normalizeEduc
 const { normalizePayFilterNumber, normalizeBoolean, parseNonNegativeInteger, nowEpochSeconds, parsePostingDateToEpochSeconds, getPostingFreshnessWindowSeconds } = require("../helpers/normalize-numbers");
 const { inferAshbyLocationFromDescription } = require("../ats/ashby/service.js");
 const { getDb, setDb, getPostingLocationByJobUrl } = require("../services/runtime-context")
+const { parseCityFilters, rowMatchesCityFilters, parseLocationsJson, parsePostingLocation } = require("../helpers/parse-location")
 
 const DEFAULT_COUNTRY_FILTER_OPTIONS = buildDefaultCountryFilterOptions();
 let postingLocationGeoFilterOptionsCache = {
@@ -464,6 +465,8 @@ async function listPostingsWithFilters(options = {}) {
   // freshness window. They are hidden, but unlike delisted ones they can still be applied
   // to, so this is opt-in rather than lumped in with "hidden".
   const includeStaleDated = normalizeBoolean(options?.include_stale_dated, false);
+  // "Seattle|WA" from the dropdowns, "Seattle, WA" from a text box; both land here.
+  const cityFilters = parseCityFilters(options?.cities);
   const visibilityPredicate = includeStaleDated
     ? "(hidden = 0 OR hidden_reason = 'outside_date_window')"
     : "hidden = 0";
@@ -482,6 +485,10 @@ async function listPostingsWithFilters(options = {}) {
     countyFilters.length > 0 ||
     countryFilters.length > 0 ||
     regionFilters.length > 0 ||
+    // Without this a city filter is accepted, stored, and then silently ignored: the
+    // no-filter branch skips the JS predicate entirely, so the query returned the whole
+    // unfiltered listing while looking like it had filtered.
+    cityFilters.length > 0 ||
     !(remoteFilters.length === 1 && remoteFilters[0] === "all");
 
   const needsWideScan = Boolean(search) || hasStructuredFilters;
@@ -492,7 +499,7 @@ async function listPostingsWithFilters(options = {}) {
     if (includeApplied && includeIgnored) {
       rows = await db.all(
         `
-          SELECT id, company_name, position_name, job_posting_url, posting_date, location, status, location_conflict, requires_account, hidden, hidden_reason, job_description, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
+          SELECT id, company_name, position_name, job_posting_url, posting_date, location, locations_json, status, location_conflict, requires_account, hidden, hidden_reason, job_description, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
           FROM Postings
           WHERE ${visibilityPredicate}
             AND last_seen_epoch >= ?
@@ -510,7 +517,7 @@ async function listPostingsWithFilters(options = {}) {
     } else {
       rows = await db.all(
         `
-          SELECT p.id, p.company_name, p.position_name, p.job_posting_url, p.posting_date, p.location, p.status, p.location_conflict, p.requires_account, p.hidden, p.hidden_reason, p.job_description, p.compensation_type, p.education_levels, p.pay_min, p.pay_max, p.pay_currency, p.pay_period, p.pay_raw, p.first_seen_epoch, p.last_seen_epoch
+          SELECT p.id, p.company_name, p.position_name, p.job_posting_url, p.posting_date, p.location, p.locations_json, p.status, p.location_conflict, p.requires_account, p.hidden, p.hidden_reason, p.job_description, p.compensation_type, p.education_levels, p.pay_min, p.pay_max, p.pay_currency, p.pay_period, p.pay_raw, p.first_seen_epoch, p.last_seen_epoch
           FROM Postings p
           LEFT JOIN posting_application_state s
             ON s.job_posting_url = p.job_posting_url
@@ -557,7 +564,7 @@ async function listPostingsWithFilters(options = {}) {
     });
     rows = await db.all(
       `
-        SELECT id, company_name, position_name, job_posting_url, posting_date, location, status, location_conflict, requires_account, hidden, hidden_reason, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
+        SELECT id, company_name, position_name, job_posting_url, posting_date, location, locations_json, status, location_conflict, requires_account, hidden, hidden_reason, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
         FROM Postings
         WHERE hidden = 0
           AND last_seen_epoch >= ?
@@ -756,6 +763,17 @@ async function listPostingsWithFilters(options = {}) {
         regionFilters
       );
       if (!matchesLocation) return false;
+
+      // Cities match against parsed location entries rather than the raw text, and every
+      // part of a filter has to hold on one entry -- so "Kent, WA" cannot be answered by a
+      // posting listing Kent, England alongside somewhere in Washington. Rows written
+      // before the parsed columns existed are parsed on the fly from the same text.
+      if (cityFilters.length > 0) {
+        const entries = row?.locations_json
+          ? parseLocationsJson(row.locations_json)
+          : parsePostingLocation(String(row?.location || "")).locations;
+        if (!rowMatchesCityFilters(entries, cityFilters)) return false;
+      }
 
       const matchesRemote = rowMatchesRemoteFilter(row?.location, remoteFilters);
       if (!matchesRemote) return false;

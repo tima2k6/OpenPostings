@@ -17,7 +17,13 @@ const { openDatabase } = require("../db/open-database.js");
 const { setDb, setPostingLocationByJobUrl } = require("../services/runtime-context.js");
 const { createCanonicalPostingsTable, upsertPostingsBatch } = require("../services/sync-runtime.js");
 const { runQuery } = require("../services/db-query.js");
-const { parsePostingLocation, parseLocationAnyTerm, locationEntryMatches } = require("../helpers/parse-location.js");
+const {
+  parsePostingLocation,
+  parseLocationAnyTerm,
+  locationEntryMatches,
+  parseCityFilters,
+  rowMatchesCityFilters
+} = require("../helpers/parse-location.js");
 
 const NOW = Math.floor(Date.now() / 1000);
 
@@ -126,8 +132,42 @@ async function testQueryFilters() {
   assert.deepStrictEqual(remoteUs.rows.map((row) => row.job_posting_url), ["https://x/rem"]);
 }
 
+// City filters as the dropdowns emit them. "City|ST" exists because a bare city name is
+// not a filter anyone can trust -- Kent is in Washington, England and Kentucky, and the
+// whole point is that picking one of them excludes the others.
+function testCityFilters() {
+  const filters = parseCityFilters(["Kent|WA", "Kent|OH", "Kent|WA"]);
+  assert.strictEqual(filters.length, 2, "duplicates collapse but different states must not");
+  assert.deepStrictEqual(filters.map((f) => f.stateCode).sort(), ["OH", "WA"]);
+
+  const kentWa = parsePostingLocation("Kent, WA").locations;
+  const kentOh = parsePostingLocation("Kent, OH").locations;
+  const kentTx = parsePostingLocation("Kent, TX").locations;
+  const kentUk = parsePostingLocation("Sittingbourne, Kent, Kent Science Park").locations;
+
+  assert.ok(rowMatchesCityFilters(kentWa, filters));
+  assert.ok(rowMatchesCityFilters(kentOh, filters));
+  assert.ok(!rowMatchesCityFilters(kentTx, filters), "a state not asked for must not match");
+  assert.ok(!rowMatchesCityFilters(kentUk, filters), "Kent in England is not Kent, WA");
+
+  // A multi-location posting must satisfy the filter on one entry, not across two.
+  const mixed = parsePostingLocation("Kent, England; Seattle, WA").locations;
+  assert.ok(
+    !rowMatchesCityFilters(mixed, parseCityFilters(["Kent|WA"])),
+    "a Kent somewhere and a WA somewhere is not a Kent in WA"
+  );
+
+  // The comma form a text box produces is accepted too.
+  assert.ok(rowMatchesCityFilters(kentWa, parseCityFilters(["Kent, WA"])));
+  // No filters means no constraint.
+  assert.ok(rowMatchesCityFilters(kentTx, parseCityFilters([])));
+  // A row with no parsed location cannot satisfy a city filter.
+  assert.ok(!rowMatchesCityFilters([], parseCityFilters(["Kent|WA"])));
+}
+
 async function main() {
   testParsing();
+  testCityFilters();
   testTermMatching();
   await testQueryFilters();
   console.log("structured-location tests passed");

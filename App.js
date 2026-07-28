@@ -1397,7 +1397,8 @@ export default function App() {
     regions: [],
     countries: [],
     states: [],
-    counties: []
+    counties: [],
+    cities: []
   });
   const [postingFilterOptionsLoading, setPostingFilterOptionsLoading] = useState(false);
   const [postingsFilterPanelOpen, setPostingsFilterPanelOpen] = useState(false);
@@ -1619,6 +1620,14 @@ export default function App() {
     if (selectedStates.length === 0) return postingFilterOptions.counties || [];
     return (postingFilterOptions.counties || []).filter((county) => selectedStates.includes(county?.state));
   }, [postingFilterOptions.counties, postingsFilters.states]);
+  // Cities are scoped to the selected states for the same reason counties are: there are
+  // thousands, and an unscoped list is not a control anyone can use. Values are "City|ST",
+  // so they carry their own state and stay unambiguous once selected.
+  const visibleCityOptions = useMemo(() => {
+    const selectedStates = postingsFilters.states || [];
+    if (selectedStates.length === 0) return [];
+    return (postingFilterOptions.cities || []).filter((city) => selectedStates.includes(city?.state));
+  }, [postingFilterOptions.cities, postingsFilters.states]);
   const visibleMcpCountryOptions = useMemo(() => {
     const selectedRegions = mcpSettings.preferred_regions || [];
     if (selectedRegions.length === 0) return postingFilterOptions.countries || [];
@@ -2591,11 +2600,20 @@ export default function App() {
         const [stateCode] = String(countyValue || "").split("|");
         return !stateCode || nextStateValues.includes(stateCode);
       });
+      // Cities are "City|ST", so the state is the second segment -- counties are "ST|County"
+      // and put it first. Dropping a state must drop the cities that came with it, or the
+      // filter keeps narrowing on a city no longer offered anywhere in the UI.
+      const nextCities = (prev.cities || []).filter((cityValue) => {
+        const parts = String(cityValue || "").split("|");
+        const stateCode = parts.length > 1 ? parts[1] : "";
+        return !stateCode || nextStateValues.includes(stateCode);
+      });
 
       return {
         ...prev,
         states: nextStateValues,
-        counties: nextCounties
+        counties: nextCounties,
+        cities: nextCities
       };
     });
   }, []);
@@ -2615,6 +2633,21 @@ export default function App() {
     });
   }, []);
 
+  const toggleCityFilter = useCallback((value) => {
+    setPostingsFilters((prev) => {
+      const next = new Set(prev.cities || []);
+      if (next.has(value)) {
+        next.delete(value);
+      } else {
+        next.add(value);
+      }
+      return {
+        ...prev,
+        cities: Array.from(next)
+      };
+    });
+  }, []);
+
   const clearAllPostingFilters = useCallback(() => {
     setPostingsFilters({
       ats: "all",
@@ -2623,6 +2656,7 @@ export default function App() {
       countries: [],
       states: [],
       counties: [],
+      cities: [],
       remote: ["all"],
       hide_no_date: false,
       sort_by: "recent"
@@ -3095,6 +3129,20 @@ export default function App() {
                     }))
                   }
                   emptyText="No counties match selected states."
+                />
+
+                <MultiSelectDropdown
+                  label="Cities"
+                  options={visibleCityOptions}
+                  selectedValues={postingsFilters.cities}
+                  onToggleValue={toggleCityFilter}
+                  onClear={() =>
+                    setPostingsFilters((prev) => ({
+                      ...prev,
+                      cities: []
+                    }))
+                  }
+                  emptyText="Pick a state first — cities are listed per state."
                 />
               </>
             )}

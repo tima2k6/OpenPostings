@@ -5,6 +5,8 @@
 // that cannot see the valid industry keys, county values or country codes has to guess
 // them, and a guessed key does not fail loudly -- it silently matches nothing, which reads
 // as "no jobs match your preferences".
+const CITY_OPTIONS_PER_STATE = 60;
+
 const { getDb } = require("./runtime-context.js");
 const { normalizeSyncEnabledAts, ATS_FILTER_OPTION_ITEMS } = require("../helpers/normalize-ats.js");
 const {
@@ -144,8 +146,45 @@ async function getPostingFilterOptions(options = {}) {
     ];
   }
 
+  // Cities come from the parsed city/state_region columns rather than from location text,
+  // so the values offered are the ones the filters can actually match. Scoped per state and
+  // capped: there are ~38,000 distinct city/state pairs, which is not a dropdown, but the
+  // busiest few dozen in each state cover real job markets. Anything outside that is still
+  // reachable through the free-text city box, which takes "City, ST" directly.
+  let cities = [];
+  try {
+    const cityRows = await db.all(
+      `SELECT city, state_region, n FROM (
+         SELECT city,
+                state_region,
+                COUNT(*) AS n,
+                ROW_NUMBER() OVER (PARTITION BY state_region ORDER BY COUNT(*) DESC) AS rank
+         FROM Postings
+         WHERE hidden = 0
+           AND city IS NOT NULL AND TRIM(city) <> ''
+           AND state_region IS NOT NULL AND TRIM(state_region) <> ''
+         GROUP BY city, state_region
+       )
+       WHERE rank <= ?
+       ORDER BY state_region, n DESC;`,
+      [CITY_OPTIONS_PER_STATE]
+    );
+    cities = cityRows.map((row) => ({
+      // Same "Value|ST" shape counties use, because a bare city name is ambiguous.
+      value: `${row.city}|${row.state_region}`,
+      label: `${row.city}, ${row.state_region}`,
+      city: row.city,
+      state: row.state_region,
+      count: Number(row.n || 0)
+    }));
+  } catch {
+    // A database without the parsed columns yet simply offers no cities.
+    cities = [];
+  }
+
   return {
     ats,
+    cities,
     sort_options: POSTING_SORT_OPTION_ITEMS.map((item) => ({ ...item })),
     industries,
     compensation_types: COMPENSATION_TYPE_OPTION_ITEMS,

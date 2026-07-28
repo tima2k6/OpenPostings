@@ -16,6 +16,7 @@ const { getReadOnlyDb } = require("./db-browser.js");
 const { buildQuery, needsRefinePass } = require("./db-query.js");
 const { rowMatchesLocationFilters, STATE_CODE_TO_NAME } = require("../helpers/description-filters.js");
 const { inferPostingLocationFromJobUrl, inferAtsFromJobPostingUrl } = require("../helpers/normalize-ats.js");
+const { parseLocationsJson, parsePostingLocation } = require("../helpers/parse-location.js");
 
 // Sized against measured scan cost, not guessed: 200,000 rows resolve in ~1.2s, and the
 // superset a state filter produces before the real matcher runs is far larger than the set
@@ -82,12 +83,12 @@ async function computeFacets(input = {}) {
       scanned: 0,
       needs_narrowing: true,
       all_states: ALL_STATES,
-      facets: { states: [], companies: [], title_words: [], ats: [] }
+      facets: { states: [], cities: [], companies: [], title_words: [], ats: [] }
     };
   }
 
   const sql =
-    `SELECT company_name, position_name, location, hidden, pay_min, pay_max, job_posting_url\n` +
+    `SELECT company_name, position_name, location, locations_json, hidden, pay_min, pay_max, job_posting_url\n` +
     `FROM Postings\n${built.where}\nLIMIT ${FACET_CANDIDATE_CAP}`;
   const rows = await db.all(sql, built.params);
 
@@ -105,6 +106,7 @@ async function computeFacets(input = {}) {
   const byCompany = new Map();
   const byWord = new Map();
   const byAts = new Map();
+  const byCity = new Map();
   let visible = 0;
   let withPay = 0;
   let matched = 0;
@@ -155,6 +157,15 @@ async function computeFacets(input = {}) {
       String(row.location || "").trim() || inferPostingLocationFromJobUrl(row.job_posting_url) || "";
     for (const code of statesFor(location)) tally(byState, code);
 
+    // Cities from the parsed entries, keyed "City|ST" so the value can be handed straight
+    // back as a filter. Unqualified cities are skipped: "Kent" on its own is not a filter
+    // anyone can act on.
+    const entries = row.locations_json ? parseLocationsJson(row.locations_json) : parsePostingLocation(location).locations;
+    for (const entry of entries) {
+      if (!entry.city || !entry.state_region) continue;
+      tally(byCity, entry.city + "|" + entry.state_region);
+    }
+
     for (const word of new Set(titleWords(row.position_name))) tally(byWord, word);
   }
 
@@ -171,6 +182,7 @@ async function computeFacets(input = {}) {
     with_pay: withPay,
     facets: {
       states: top(byState),
+      cities: top(byCity),
       companies: top(byCompany),
       title_words: top(byWord),
       ats: top(byAts)

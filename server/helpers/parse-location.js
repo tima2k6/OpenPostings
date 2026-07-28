@@ -360,7 +360,46 @@ function locationEntryMatches(entry, terms, stateCodes, countryCodes) {
   return true;
 }
 
+
+// City filters, as the app, the /db page and the MCP tools all express them. The wire form
+// is "City|ST" -- the same shape counties already use -- because a bare city name is not a
+// filter anyone can trust: Kent is in Washington, England and (as Kentucky) a state name,
+// and Bellevue is in Washington, Nebraska, Ohio and South Africa. A city with no state is
+// still accepted, since a user typing one into a free-text box means the obvious thing,
+// but it matches every city of that name.
+function parseCityFilters(values) {
+  const list = Array.isArray(values) ? values : String(values || "").split(",");
+  const terms = [];
+  const seen = new Set();
+  for (const raw of list) {
+    const text = String(raw || "").trim();
+    if (!text) continue;
+    // "Seattle|WA" from a dropdown, "Seattle, WA" from a text box.
+    const term = parseLocationAnyTerm(text.replace(/\|/g, ", "));
+    if (!term || !term.city) continue;
+    // parseLocationAnyTerm returns stateCode/countryCode, not the row-shaped field names.
+    // Getting this wrong collapsed Kent|WA and Kent|OH onto the same key and silently
+    // dropped the second filter.
+    const key = `${term.city}|${term.stateCode || ""}|${term.countryCode || ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    terms.push(term);
+  }
+  return terms;
+}
+
+// True when any one parsed location entry satisfies any one city filter. Same-entry, for
+// the reason the rest of this file exists: a posting listing "Kent, England / Seattle, WA"
+// must not answer a search for Kent, WA just because both halves appear somewhere in it.
+function rowMatchesCityFilters(entries, cityTerms) {
+  if (!Array.isArray(cityTerms) || cityTerms.length === 0) return true;
+  if (!Array.isArray(entries) || entries.length === 0) return false;
+  return entries.some((entry) => locationEntryMatches(entry, cityTerms, [], []));
+}
+
 module.exports = {
+  parseCityFilters,
+  rowMatchesCityFilters,
   parsePostingLocation,
   parseLocationGroup,
   serializeLocationsJson,

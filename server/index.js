@@ -2072,6 +2072,7 @@ function createServer() {
       education_levels: parseCsvParam(req.query.education_levels),
       states: parseCsvParam(req.query.states),
       counties: parseCsvParam(req.query.counties),
+      cities: parseCsvParam(req.query.cities),
       countries: parseCsvParam(req.query.countries),
       regions: parseCsvParam(req.query.regions),
       remote: req.query.remote,

@@ -196,7 +196,8 @@ const DB_BROWSER_PAGE = `<!doctype html>
       <label>State <b>(exact, comma-separated)</b><input id="f-states" placeholder="WA, OR"></label>
       <label>Country <b>(exact)</b><input id="f-countries" placeholder="US, Canada"></label>
       <label>Region <b>(exact)</b><input id="f-regions" placeholder="AMER, EMEA, APAC"></label>
-      <label>City <b>any</b><input id="f-loc-any" placeholder="Seattle, Kent, WA"></label>
+      <label>City <b>(City|ST, comma-separated)</b><input id="f-cities" placeholder="Seattle|WA, Kent|WA"></label>
+      <label>Location text <b>any</b><input id="f-loc-any" placeholder="downtown, campus"></label>
       <label>Location <b>none</b><input id="f-loc-none" placeholder="DC, remote"></label>
       <label>Pay at most<input id="f-pay-max" type="number" placeholder=""></label>
       <label>Still listed within (days)<input id="f-seen" type="number" placeholder="5"></label>
@@ -335,7 +336,7 @@ ORDER BY n DESC</textarea>
     "f-desc-any": "description_any", "f-desc-none": "description_none",
     "f-company-any": "company_any", "f-company-none": "company_none",
     "f-states": "states", "f-countries": "countries", "f-regions": "regions",
-    "f-loc-any": "location_any", "f-loc-none": "location_none",
+    "f-loc-any": "location_any", "f-loc-none": "location_none", "f-cities": "cities",
     "f-pay-min": "pay_min", "f-pay-max": "pay_max",
     "f-seen": "seen_days", "f-found": "found_days",
     "f-ats": "ats", "f-vis": "visibility", "f-sort": "sort", "f-dir": "dir", "f-limit": "limit"
@@ -556,17 +557,18 @@ ORDER BY n DESC</textarea>
 
   var FACET_TARGET = {
     states: { id: "f-states", replace: false },
+    cities: { id: "f-cities", replace: false },
     title_words: { id: "f-title-all", replace: false },
     companies: { id: "f-company-any", replace: true },
     ats: { id: "f-ats", replace: true }
   };
-  var FACET_LABEL = { states: "State", title_words: "Title contains", companies: "Company", ats: "ATS" };
+  var FACET_LABEL = { states: "State", cities: "City", title_words: "Title contains", companies: "Company", ats: "ATS" };
 
   var FILTER_LABEL = {
     title_any: "Title any", title_all: "Title has", title_none: "Title not",
     description_any: "Description", description_none: "Description not",
     company_any: "Company", company_none: "Company not",
-    states: "State", countries: "Country", regions: "Region",
+    states: "State", cities: "City", countries: "Country", regions: "Region",
     location_any: "Location", location_none: "Location not",
     ats: "ATS", pay_min: "Pay \u2265", pay_max: "Pay \u2264",
     seen_days: "Seen \u2264 d", found_days: "Found \u2264 d", visibility: "Show"
