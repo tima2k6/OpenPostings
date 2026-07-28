@@ -123,6 +123,44 @@ function testHiddenPillDistinguishesReasons() {
   assert.notStrictEqual(stale, delisted, "the two reasons must not render identically");
 }
 
+// The page is one inline script driving markup in the same string, wired entirely by
+// getElementById. Moving a control between panels, renaming a field, or deleting one leaves
+// the script reaching for an element that no longer exists -- which throws during setup and
+// blanks the whole page, with nothing on the server to notice. There is no DOM here to
+// render in, so the reachability is checked statically instead.
+function testEveryScriptReferenceResolves() {
+  const markup = DB_BROWSER_PAGE.split("<script>")[0];
+  const script = DB_BROWSER_PAGE.match(/<script>([\s\S]*)<\/script>/)[1];
+
+  const ids = new Set([...markup.matchAll(/id="([a-zA-Z0-9_-]+)"/g)].map((match) => match[1]));
+  const referenced = new Set([...script.matchAll(/getElementById\("([a-zA-Z0-9_-]+)"\)/g)].map((match) => match[1]));
+  // Tab and panel ids are built by concatenation at runtime, so they never appear as
+  // literals in a getElementById call and cannot be checked this way.
+  const builtAtRuntime = new Set([
+    "tab-companies", "tab-postings", "tab-sql",
+    "panel-companies", "panel-postings", "panel-sql"
+  ]);
+
+  const missing = [...referenced].filter((id) => !ids.has(id) && !builtAtRuntime.has(id));
+  assert.deepStrictEqual(missing, [], `script reaches for elements that do not exist: ${missing.join(", ")}`);
+
+  // The filter maps are the other place an id can go stale without anything complaining.
+  const mapped = [...script.matchAll(/"(f-[a-z-]+)":/g)].map((match) => match[1]);
+  assert.ok(mapped.length > 0, "the filter map must be present");
+  const unmapped = mapped.filter((id) => !ids.has(id));
+  assert.deepStrictEqual(unmapped, [], `filter map points at missing elements: ${unmapped.join(", ")}`);
+}
+
+// Postings is the tab this page exists for; opening on Companies cost a click every visit.
+function testPostingsIsTheDefaultTab() {
+  assert.match(DB_BROWSER_PAGE, /id="tab-postings" aria-selected="true"/, "Postings must be the selected tab");
+  assert.match(DB_BROWSER_PAGE, /id="panel-companies" hidden/, "Companies must start hidden");
+  assert.ok(
+    !/id="panel-postings" hidden/.test(DB_BROWSER_PAGE),
+    "the Postings panel must start visible"
+  );
+}
+
 function main() {
   testWritesAreRefused();
   testSelectsAreAllowed();
@@ -132,6 +170,8 @@ function main() {
   testEmptyIsRefused();
   testEmittedPageScriptParses();
   testHiddenPillDistinguishesReasons();
+  testEveryScriptReferenceResolves();
+  testPostingsIsTheDefaultTab();
   console.log("db-browser tests passed");
 }
 

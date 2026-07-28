@@ -88,6 +88,22 @@ const DB_BROWSER_PAGE = `<!doctype html>
            justify-content: center; gap: 2px; white-space: nowrap; }
   .ppay { font-size: 13px; font-weight: 600; }
   .page { font-size: 11px; color: #7b8794; }
+  /* The always-visible controls. State first and widest-of-the-narrow, because it is the
+     filter that gets set before anything else on nearly every search. */
+  .quickbar { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 8px; }
+  .quickbar label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #52606d; }
+  @media (prefers-color-scheme: dark) { .quickbar label { color: #9fb0c4; } }
+  .quickbar input, .quickbar select { font: inherit; padding: 8px 10px; border: 1px solid #c6ceda;
+    border-radius: 8px; background: #fff; color: inherit; }
+  @media (prefers-color-scheme: dark) { .quickbar input, .quickbar select { background: #18202a; border-color: #2d3947; } }
+  .quickbar .qb-grow { flex: 1 1 240px; }
+  .quickbar .qb-grow input { width: 100%; }
+  .quickbar .qb-state select { min-width: 120px; }
+  .quickbar button.go { padding: 9px 20px; }
+  .quickflags { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;
+                font-size: 12px; color: #52606d; }
+  @media (prefers-color-scheme: dark) { .quickflags { color: #9fb0c4; } }
+  .quickflags label { display: inline-flex; gap: 5px; align-items: center; cursor: pointer; }
   .adv { margin-bottom: 10px; }
   .adv > summary { cursor: pointer; font-size: 12px; font-weight: 600; color: #52606d;
                    padding: 6px 0; list-style-position: inside; }
@@ -120,12 +136,12 @@ const DB_BROWSER_PAGE = `<!doctype html>
   <span class="muted" id="dbmeta">read-only</span>
 </header>
 <nav>
-  <button id="tab-companies" aria-selected="true">Companies</button>
-  <button id="tab-postings" aria-selected="false">Postings</button>
+  <button id="tab-postings" aria-selected="true">Postings</button>
+  <button id="tab-companies" aria-selected="false">Companies</button>
   <button id="tab-sql" aria-selected="false">SQL</button>
 </nav>
 <main>
-  <section id="panel-companies">
+  <section id="panel-companies" hidden>
     <div class="row">
       <input type="search" id="company-q" placeholder="Company name or URL, e.g. booking">
       <button class="go" id="company-go">Search</button>
@@ -134,32 +150,57 @@ const DB_BROWSER_PAGE = `<!doctype html>
     <div id="company-out"></div>
   </section>
 
-  <section id="panel-postings" hidden>
+  <section id="panel-postings">
+    <!-- The controls that get touched on almost every search, kept out of the collapsed
+         panel. State in particular was previously only reachable through a facet dropdown
+         that reset after each run, so narrowing to one state meant re-picking it every
+         time. -->
+    <div class="quickbar">
+      <label class="qb-state">State
+        <select id="f-states-pick"><option value="">— any —</option></select>
+      </label>
+      <label class="qb-grow">Title has any of
+        <input id="f-title-any" placeholder="manager, director, head of">
+      </label>
+      <label>Pay at least
+        <input id="f-pay-min" type="number" placeholder="140000">
+      </label>
+      <label>Show
+        <select id="f-vis">
+          <option value="open">Still applyable</option>
+          <option value="visible">Visible in app</option>
+          <option value="all">All rows</option>
+          <option value="stale_dated">Still listed, past date window</option>
+          <option value="delisted">Delisted by the employer</option>
+          <option value="hidden">Hidden from app (either reason)</option>
+        </select>
+      </label>
+      <button class="go" id="posting-go">Search</button>
+    </div>
+    <div class="quickflags">
+      <label><input type="checkbox" id="f-remote"> Remote only</label>
+      <label><input type="checkbox" id="f-haspay"> Has a pay figure</label>
+      <label><input type="checkbox" id="f-nopay"> Hide unknown pay</label>
+      <span class="hint" id="quick-hint"></span>
+    </div>
+
     <details class="adv">
-      <summary>Filters (edit by hand)</summary>
+      <summary>More filters</summary>
     <div class="grid">
-      <label>Title has <b>any</b> of<input id="f-title-any" placeholder="manager, director, head of"></label>
       <label>Title has <b>all</b> of<input id="f-title-all" placeholder="operations"></label>
       <label>Title has <b>none</b> of<input id="f-title-none" placeholder="assistant, shift, intern"></label>
+      <label>Description has <b>any</b><input id="f-desc-any" placeholder="p&amp;l, multi-site"></label>
+      <label>Description has <b>none</b><input id="f-desc-none" placeholder="commission only"></label>
       <label>Company <b>any</b><input id="f-company-any" placeholder="hilton, marriott"></label>
       <label>Company <b>none</b><input id="f-company-none" placeholder="staffing, temp"></label>
-      <label>State <b>(exact)</b><input id="f-states" placeholder="WA, OR"></label>
+      <label>State <b>(exact, comma-separated)</b><input id="f-states" placeholder="WA, OR"></label>
       <label>Country <b>(exact)</b><input id="f-countries" placeholder="US, Canada"></label>
       <label>Region <b>(exact)</b><input id="f-regions" placeholder="AMER, EMEA, APAC"></label>
-      <label>Location text <b>any</b><input id="f-loc-any" placeholder="Seattle, Bellevue"></label>
+      <label>City <b>any</b><input id="f-loc-any" placeholder="Seattle, Kent, WA"></label>
       <label>Location <b>none</b><input id="f-loc-none" placeholder="DC, remote"></label>
-      <label>Pay at least<input id="f-pay-min" type="number" placeholder="140000"></label>
       <label>Pay at most<input id="f-pay-max" type="number" placeholder=""></label>
       <label>Still listed within (days)<input id="f-seen" type="number" placeholder="5"></label>
       <label>First found within (days)<input id="f-found" type="number" placeholder=""></label>
-      <label>Show<select id="f-vis">
-        <option value="all">All rows</option>
-        <option value="visible">Visible in app</option>
-        <option value="open">Still applyable (visible + past date window)</option>
-        <option value="stale_dated">Still listed, past date window</option>
-        <option value="delisted">Delisted by the employer</option>
-        <option value="hidden">Hidden from app (either reason)</option>
-      </select></label>
       <label>Sort by<select id="f-sort">
         <option value="last_seen">Last seen</option>
         <option value="first_seen">First found</option>
@@ -174,9 +215,8 @@ const DB_BROWSER_PAGE = `<!doctype html>
       <label>Max rows<input id="f-limit" type="number" value="200"></label>
     </div>
     </details>
-    <p class="hint">Terms are comma-separated. Within a box they are OR-ed; each box is AND-ed with the others &mdash; so <em>any</em>=manager,director with <em>none</em>=assistant gives (manager OR director) AND NOT assistant. Only <b>All rows</b> shows postings the app is currently hiding. <b>State</b>, <b>Country</b> and <b>Region</b> use the same location matching the app's own filters use &mdash; "WA" will not match Warwick or Sweetwater the way a location-text search does, nor Perth in Western Australia. State accepts a code or a full name; <b>Country</b> takes a code or name ("US", "Canada") and <b>Region</b> one of AMER, EMEA, APAC.</p>
+    <p class="hint">Terms are comma-separated. Within a box they are OR-ed; each box is AND-ed with the others &mdash; so <em>any</em>=manager,director with <em>none</em>=assistant gives (manager OR director) AND NOT assistant. <b>Still applyable</b> covers postings the app shows plus ones it hides only for being past the date window; those are still on the employer&rsquo;s board. <b>State</b>, <b>Country</b>, <b>Region</b> and <b>City</b> match parsed locations, not raw text &mdash; "WA" will not match Warwick, and "Kent, WA" will not match Kent in England or Kentucky. <b>Description</b> boxes scan the stored job text, which only postings that have been fetched will have, and are much slower than the title filters.</p>
     <div class="row">
-      <button class="go" id="posting-go">Run</button>
       <button id="posting-clear">Clear</button>
       <button id="posting-save">Save this query</button>
       <button id="posting-sql">Show SQL</button>
@@ -218,20 +258,26 @@ ORDER BY n DESC</textarea>
 <script>
 (function () {
   var TABS = ["companies", "postings", "sql"];
+  var TAB_KEY_LOCAL = "openpostings.db.tab";
   function show(name) {
     TABS.forEach(function (t) {
       document.getElementById("tab-" + t).setAttribute("aria-selected", String(t === name));
       document.getElementById("panel-" + t).hidden = t !== name;
     });
+    try { localStorage.setItem(TAB_KEY_LOCAL, name); } catch (e) {}
   }
-  // Opening the Postings tab used to show an empty form: the facets that make it useful
-  // only appeared after clicking Run, which reads as "the feature is not there". The first
-  // visit runs the current (empty) filter set so the breakdown is on screen immediately.
+  // Postings is the tab this page is actually used for, so it opens there and its results
+  // are already on screen. Companies used to be the default, which meant a click before
+  // every session, and the postings form only populated after a Run -- an empty form reads
+  // as a missing feature.
   var ranPostings = false;
+  var loadedCompanies = false;
   TABS.forEach(function (t) {
     document.getElementById("tab-" + t).addEventListener("click", function () {
       show(t);
       if (t === "postings" && !ranPostings) { ranPostings = true; run(); }
+      // Companies is no longer loaded on boot; fetch it the first time it is opened.
+      if (t === "companies" && !loadedCompanies) { loadedCompanies = true; loadCompanies(); }
     });
   });
 
@@ -286,6 +332,7 @@ ORDER BY n DESC</textarea>
 
   var FIELDS = {
     "f-title-any": "title_any", "f-title-all": "title_all", "f-title-none": "title_none",
+    "f-desc-any": "description_any", "f-desc-none": "description_none",
     "f-company-any": "company_any", "f-company-none": "company_none",
     "f-states": "states", "f-countries": "countries", "f-regions": "regions",
     "f-loc-any": "location_any", "f-loc-none": "location_none",
@@ -293,6 +340,9 @@ ORDER BY n DESC</textarea>
     "f-seen": "seen_days", "f-found": "found_days",
     "f-ats": "ats", "f-vis": "visibility", "f-sort": "sort", "f-dir": "dir", "f-limit": "limit"
   };
+  // Checkboxes send "1" when ticked and nothing at all when not, because the query layer
+  // treats an absent parameter as "no opinion" and an empty string as a value.
+  var FLAGS = { "f-remote": "remote_only", "f-haspay": "has_pay" };
 
   function readFilters() {
     var out = {};
@@ -300,12 +350,57 @@ ORDER BY n DESC</textarea>
       var v = document.getElementById(id).value;
       if (v !== "" && v !== null) out[FIELDS[id]] = v;
     });
+    Object.keys(FLAGS).forEach(function (id) {
+      if (document.getElementById(id).checked) out[FLAGS[id]] = "1";
+    });
+    // Inverted on purpose: unknown-pay rows are kept by default (most postings publish no
+    // figure), so the box the user ticks is the one that removes them.
+    if (document.getElementById("f-nopay").checked) out.include_unknown_pay = "0";
     return out;
   }
   function writeFilters(state) {
     Object.keys(FIELDS).forEach(function (id) {
       document.getElementById(id).value = state[FIELDS[id]] === undefined ? "" : state[FIELDS[id]];
     });
+    Object.keys(FLAGS).forEach(function (id) {
+      document.getElementById(id).checked = String(state[FLAGS[id]] || "") === "1";
+    });
+    document.getElementById("f-nopay").checked = String(state.include_unknown_pay || "") === "0";
+    // The quick-bar state picker and the comma-separated advanced box are two views of the
+    // same filter; keep the picker showing the value only when it can represent it.
+    var states = String(state.states || "");
+    var pick = document.getElementById("f-states-pick");
+    if (pick) pick.value = states.indexOf(",") === -1 ? states.trim() : "";
+  }
+
+  // Filters survive a reload. Without this every visit started blank, so narrowing to a
+  // state meant re-picking it before every single search -- which is most of what made the
+  // page tedious. The URL carries the same state so a query can be bookmarked or sent to
+  // someone, and the browser back button steps through searches.
+  var STORE_KEY = "openpostings.db.filters";
+
+  function persist() {
+    var state = readFilters();
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) {}
+    try {
+      var qs = new URLSearchParams(state).toString();
+      history.replaceState(null, "", qs ? "?" + qs : location.pathname);
+    } catch (e) {}
+  }
+
+  function restore() {
+    // The URL wins: a link someone opened is a deliberate request for that exact query,
+    // while localStorage is only what this browser happened to do last.
+    var fromUrl = {};
+    var hasUrl = false;
+    try {
+      new URLSearchParams(location.search).forEach(function (v, k) { fromUrl[k] = v; hasUrl = true; });
+    } catch (e) {}
+    if (hasUrl) { writeFilters(fromUrl); return; }
+    try {
+      var saved = JSON.parse(localStorage.getItem(STORE_KEY) || "null");
+      if (saved && typeof saved === "object") writeFilters(saved);
+    } catch (e) {}
   }
   // Mirrors SORTABLE in server/services/db-query.js. Clicking the active field flips the
   // direction, which is the behaviour a column header would have had before the table was
@@ -357,6 +452,18 @@ ORDER BY n DESC</textarea>
     return Math.floor(secs / 86400) + "d";
   }
 
+  // How old the posting itself is, which is what a job seeker judges -- distinct from
+  // last_seen_epoch, which only says when the sync last looked at it.
+  function postedAgo(value) {
+    if (!value) return "";
+    var t = Date.parse(value);
+    if (!t) return "";
+    var days = Math.floor((Date.now() - t) / 86400000);
+    if (days < 1) return "today";
+    if (days < 30) return days + "d";
+    return Math.floor(days / 30) + "mo";
+  }
+
   // A list rather than a table: nine nowrap columns guaranteed horizontal scrolling, and
   // two of them were full ISO timestamps. Each posting is one block that reflows, so the
   // same markup reads on a phone and on a desktop.
@@ -374,7 +481,8 @@ ORDER BY n DESC</textarea>
         "</div>" +
         '<div class="pside">' +
           (pay ? '<span class="ppay">' + esc(pay) + "</span>" : "") +
-          '<span class="page" title="last seen">' + ago(r.last_seen_epoch) + "</span>" +
+          '<span class="page" title="posted / last seen by sync">' +
+            (postedAgo(r.posting_date) || "\u2014") + " posted \u00b7 seen " + ago(r.last_seen_epoch) + "</span>" +
         "</div>" +
       "</li>";
     }).join("") + "</ul>";
@@ -456,6 +564,7 @@ ORDER BY n DESC</textarea>
 
   var FILTER_LABEL = {
     title_any: "Title any", title_all: "Title has", title_none: "Title not",
+    description_any: "Description", description_none: "Description not",
     company_any: "Company", company_none: "Company not",
     states: "State", countries: "Country", regions: "Region",
     location_any: "Location", location_none: "Location not",
@@ -467,6 +576,12 @@ ORDER BY n DESC</textarea>
   // as the selection being lost. This shows what is actually applied, and is the place to
   // remove one -- it also handles fields holding several values, which a single select
   // cannot represent.
+  var VIS_LABEL = {
+    open: "still applyable", visible: "visible in app", all: "all rows",
+    stale_dated: "still listed, past date window", delisted: "delisted",
+    hidden: "hidden from app"
+  };
+
   function renderActiveFilters() {
     var state = readFilters();
     var bar = document.getElementById("active-filters");
@@ -475,8 +590,9 @@ ORDER BY n DESC</textarea>
       var raw = state[key];
       if (!raw || key === "visibility" && raw === "all") return;
       String(raw).split(",").map(function (t) { return t.trim(); }).filter(Boolean).forEach(function (term) {
+        var shown = key === "visibility" ? (VIS_LABEL[term] || term) : term;
         parts.push('<button class="afchip" data-key="' + key + '" data-term="' + esc(term) + '">' +
-          FILTER_LABEL[key] + ": <b>" + esc(term) + "</b> &times;</button>");
+          FILTER_LABEL[key] + ": <b>" + esc(shown) + "</b> &times;</button>");
       });
     });
     bar.innerHTML = parts.length
@@ -563,6 +679,7 @@ ORDER BY n DESC</textarea>
   // a guaranteed-identical answer, and re-rendering the dropdowns made it look as though
   // the selection had been wiped.
   function run(resultsOnly) {
+    persist();
     loadPostings();
     renderActiveFilters();
     if (!resultsOnly) loadFacets();
@@ -646,8 +763,46 @@ ORDER BY n DESC</textarea>
     b.addEventListener("click", function () { document.getElementById("sql").value = b.getAttribute("data-sql"); runSql(); });
   });
 
-  loadCompanies();
+  // The quick-bar state picker writes through to the same field the advanced box uses, so
+  // the two never disagree. Populated from the fixed state list rather than from counts,
+  // because it has to be usable before anything has been narrowed.
+  function populateStatePicker() {
+    get("/db/facets?limit=1").then(function (data) {
+      var pick = document.getElementById("f-states-pick");
+      var current = String(document.getElementById("f-states").value || "").trim();
+      pick.innerHTML = '<option value="">— any —</option>' +
+        (data.all_states || []).map(function (st) {
+          return '<option value="' + esc(st.value) + '">' + esc(st.value) + "</option>";
+        }).join("");
+      if (current.indexOf(",") === -1) pick.value = current;
+    }).catch(function () {});
+  }
+  document.getElementById("f-states-pick").addEventListener("change", function () {
+    document.getElementById("f-states").value = this.value;
+    run();
+  });
+  // Ticking a box is an explicit request; no reason to make it also require a Run click.
+  ["f-remote", "f-haspay", "f-nopay"].forEach(function (id) {
+    document.getElementById(id).addEventListener("change", function () { run(); });
+  });
+  document.getElementById("f-vis").addEventListener("change", function () { run(); });
+
+  // Back/forward should replay searches rather than leaving the form and the results
+  // describing different queries.
+  window.addEventListener("popstate", function () { restore(); run(); });
+
+  restore();
+  populateStatePicker();
   loadSaved();
+
+  var startTab = "postings";
+  try {
+    var remembered = localStorage.getItem(TAB_KEY_LOCAL);
+    if (TABS.indexOf(remembered) !== -1) startTab = remembered;
+  } catch (e) {}
+  show(startTab);
+  if (startTab === "postings") { ranPostings = true; run(); }
+  else if (startTab === "companies") { loadedCompanies = true; loadCompanies(); }
 })();
 </script>
 </body>
