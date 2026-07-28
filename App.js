@@ -1014,9 +1014,6 @@ function createDefaultMcpSettings() {
   return {
     enabled: false,
     preferred_agent_name: "OpenPostings Agent",
-    agent_login_email: "",
-    agent_login_password: "",
-    mfa_login_email: "",
     mfa_login_notes: "",
     dry_run_only: true,
     require_final_approval: true,
@@ -1035,14 +1032,10 @@ function createDefaultMcpSettings() {
 function toFormMcpSettings(value) {
   const defaults = createDefaultMcpSettings();
   const source = value && typeof value === "object" ? value : {};
-  const agentLoginEmail = String(source.agent_login_email || "");
   return {
     ...defaults,
     enabled: Boolean(source.enabled),
     preferred_agent_name: String(source.preferred_agent_name || defaults.preferred_agent_name),
-    agent_login_email: agentLoginEmail,
-    agent_login_password: String(source.agent_login_password || ""),
-    mfa_login_email: agentLoginEmail,
     mfa_login_notes: String(source.mfa_login_notes || ""),
     dry_run_only: source.dry_run_only === undefined ? defaults.dry_run_only : Boolean(source.dry_run_only),
     require_final_approval:
@@ -1071,13 +1064,9 @@ function toApiMcpSettings(value) {
   const source = value && typeof value === "object" ? value : {};
   const parsedMax = Number.parseInt(String(source.max_applications_per_run || "").trim(), 10);
   const maxApplications = Number.isFinite(parsedMax) && parsedMax > 0 ? parsedMax : 10;
-  const agentLoginEmail = String(source.agent_login_email || "").trim();
   return {
     enabled: Boolean(source.enabled),
     preferred_agent_name: String(source.preferred_agent_name || "").trim() || "OpenPostings Agent",
-    agent_login_email: agentLoginEmail,
-    agent_login_password: String(source.agent_login_password || ""),
-    mfa_login_email: agentLoginEmail,
     mfa_login_notes: String(source.mfa_login_notes || "").trim(),
     dry_run_only: Boolean(source.dry_run_only),
     require_final_approval: Boolean(source.require_final_approval),
@@ -3738,41 +3727,10 @@ export default function App() {
           />
         </View>
 
-        <View style={styles.formGroup}>
-          <Text style={styles.fieldLabel}>Agent login email</Text>
-          <TextInput
-            style={styles.textField}
-            value={mcpSettings.agent_login_email}
-            onChangeText={(value) =>
-              setMcpSettings((prev) => ({
-                ...prev,
-                agent_login_email: value,
-                mfa_login_email: value
-              }))
-            }
-            placeholder="agent-login@example.com"
-            keyboardType="email-address"
-            autoCapitalize="none"
-          />
-        </View>
-
-        <View style={styles.formGroup}>
-          <Text style={styles.fieldLabel}>Agent login password</Text>
-          <TextInput
-            style={styles.textField}
-            value={mcpSettings.agent_login_password}
-            onChangeText={(value) =>
-              setMcpSettings((prev) => ({
-                ...prev,
-                agent_login_password: value
-              }))
-            }
-            placeholder="Enter agent inbox password"
-            autoCapitalize="none"
-            autoCorrect={false}
-            secureTextEntry
-          />
-        </View>
+        {/* The agent login email and password fields that used to sit here are gone. The
+            agent prepares applications and stops at the authentication boundary; it does
+            not create accounts or sign in as you, so there is no credential for it to
+            hold. */}
 
         <View style={styles.formGroup}>
           <Text style={styles.fieldLabel}>MFA/login notes</Text>

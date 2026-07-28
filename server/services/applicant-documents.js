@@ -15,7 +15,14 @@ const zlib = require("zlib");
 const { decodeHtmlEntities } = require("../helpers/normalize-strings.js");
 const { getDb } = require("./runtime-context.js");
 
+// Documents are an open-ended map now, not a fixed pair. A career change means keeping
+// several tailored resumes -- "resume_hospitality" against the 13 years already served,
+// "resume_ops" against the roles being moved toward -- and drafting each application from
+// whichever one fits the target. These two remain as the conventional keys so existing
+// callers and the settings UI keep working; any slug is accepted.
 const APPLICANT_DOCUMENT_KINDS = Object.freeze(["resume", "projects_portfolio"]);
+const DEFAULT_DOCUMENT_KEY = "resume";
+const MAX_DOCUMENT_KEY_LENGTH = 48;
 
 const MAX_DOCUMENT_BYTES = 20 * 1024 * 1024;
 const MAX_TEXT_CHARS = 200000;
@@ -209,16 +216,19 @@ async function extractDocumentText(filePath) {
   }
 }
 
+// Any slug is a valid key; the shape is constrained only so keys stay usable as tool
+// arguments and cannot smuggle SQL or whitespace.
 function normalizeDocumentKind(value) {
-  const kind = String(value || "").trim().toLowerCase();
-  return APPLICANT_DOCUMENT_KINDS.includes(kind) ? kind : "";
+  const kind = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (!kind || kind.length > MAX_DOCUMENT_KEY_LENGTH) return "";
+  return /^[a-z][a-z0-9_]*$/.test(kind) ? kind : "";
 }
 
 async function ensureApplicantDocumentsTable() {
   const db = getDb();
   await db.exec(`
     CREATE TABLE IF NOT EXISTS applicant_documents (
-      kind TEXT NOT NULL PRIMARY KEY CHECK (kind IN ('resume', 'projects_portfolio')),
+      kind TEXT NOT NULL PRIMARY KEY,
       file_name TEXT NOT NULL,
       format TEXT NOT NULL,
       content BLOB NOT NULL,
@@ -226,19 +236,143 @@ async function ensureApplicantDocumentsTable() {
       chars INTEGER NOT NULL DEFAULT 0,
       truncated INTEGER NOT NULL DEFAULT 0,
       pages INTEGER,
+      label TEXT NOT NULL DEFAULT '',
       uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
+
+  const columns = await db.all(`PRAGMA table_info('applicant_documents');`);
+  const columnNames = new Set(columns.map((column) => String(column?.name || "")));
+  if (!columnNames.has("label")) {
+    await db.exec(`ALTER TABLE applicant_documents ADD COLUMN label TEXT NOT NULL DEFAULT '';`);
+  }
+
+  // Older databases pinned `kind` to exactly ('resume','projects_portfolio') with a CHECK
+  // constraint, which no ALTER can remove -- so any additional resume variant failed to
+  // insert. Rebuild the table when that constraint is still present, carrying the rows
+  // over.
+  const tableSql = String(
+    (await db.get(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'applicant_documents';`))?.sql || ""
+  );
+  if (/CHECK\s*\(\s*kind\s+IN/i.test(tableSql)) {
+    await db.exec("BEGIN TRANSACTION;");
+    try {
+      await db.exec(`
+        CREATE TABLE applicant_documents_migrated (
+          kind TEXT NOT NULL PRIMARY KEY,
+          file_name TEXT NOT NULL,
+          format TEXT NOT NULL,
+          content BLOB NOT NULL,
+          extracted_text TEXT NOT NULL,
+          chars INTEGER NOT NULL DEFAULT 0,
+          truncated INTEGER NOT NULL DEFAULT 0,
+          pages INTEGER,
+          label TEXT NOT NULL DEFAULT '',
+          uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO applicant_documents_migrated
+          (kind, file_name, format, content, extracted_text, chars, truncated, pages, label, uploaded_at)
+        SELECT kind, file_name, format, content, extracted_text, chars, truncated, pages, '', uploaded_at
+        FROM applicant_documents;
+        DROP TABLE applicant_documents;
+        ALTER TABLE applicant_documents_migrated RENAME TO applicant_documents;
+      `);
+      await db.exec("COMMIT;");
+    } catch (error) {
+      await db.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+}
+
+// Keys and metadata only -- never the text or the bytes. This is what a caller reads to
+// find out which documents exist before asking for one.
+async function listApplicantDocuments() {
+  await ensureApplicantDocumentsTable();
+  const db = getDb();
+  const rows = await db.all(
+    `SELECT kind, file_name, format, chars, truncated, pages, label, uploaded_at
+     FROM applicant_documents
+     ORDER BY kind;`
+  );
+  return rows.map((row) => ({
+    key: String(row.kind || ""),
+    label: String(row.label || ""),
+    file_name: String(row.file_name || ""),
+    format: String(row.format || ""),
+    chars: Number(row.chars || 0),
+    truncated: Boolean(Number(row.truncated || 0)),
+    pages: row.pages === null || row.pages === undefined ? null : Number(row.pages),
+    uploaded_at: String(row.uploaded_at || "")
+  }));
+}
+
+async function deleteApplicantDocument(kind) {
+  const normalizedKind = normalizeDocumentKind(kind);
+  if (!normalizedKind) throw new Error("A document key is required.");
+  await ensureApplicantDocumentsTable();
+  const db = getDb();
+  const result = await db.run(`DELETE FROM applicant_documents WHERE kind = ?;`, [normalizedKind]);
+  return { key: normalizedKind, deleted: Number(result?.changes || 0) > 0 };
+}
+
+// Readability of the file paths configured in PersonalInformation, resolved once at
+// startup and surfaced in get_applicant_context. Previously an unreadable path -- a
+// Windows "M:\..." path on a Linux server, say -- only announced itself as an ENOENT in
+// the middle of drafting an application.
+async function checkConfiguredDocumentPaths() {
+  const { getPersonalInformation } = require("./personal-info.js");
+  let personalInformation = null;
+  try {
+    personalInformation = await getPersonalInformation();
+  } catch {
+    return [];
+  }
+
+  const configured = [
+    { key: "resume", file_path: personalInformation?.resume_file_path },
+    { key: "projects_portfolio", file_path: personalInformation?.projects_portfolio_file_path },
+    { key: "certifications_folder", file_path: personalInformation?.certifications_folder_path }
+  ];
+
+  const uploaded = new Set((await listApplicantDocuments()).map((document) => document.key));
+
+  return configured
+    .filter((entry) => String(entry.file_path || "").trim())
+    .map((entry) => {
+      const filePath = String(entry.file_path).trim();
+      let readable = false;
+      let error = "";
+      try {
+        fs.accessSync(filePath, fs.constants.R_OK);
+        readable = true;
+      } catch (accessError) {
+        error = String(accessError?.code || accessError?.message || accessError);
+      }
+      return {
+        key: entry.key,
+        file_path: filePath,
+        readable,
+        // An unreadable path stops mattering once the document itself is in the database.
+        uploaded: uploaded.has(entry.key),
+        error: readable
+          ? ""
+          : `${error}. This path belongs to the machine running the server. Upload the document via POST /settings/applicant-documents to make it available everywhere.`
+      };
+    });
 }
 
 // Extraction runs at upload time, not read time: a bad file fails in the caller's face
 // while they can still do something about it, and every later get_resume is a plain read.
 // The original bytes are kept alongside the text so the file itself can be served back to
 // whichever machine is filling in an application form.
-async function saveApplicantDocument({ kind, file_name, content }) {
+async function saveApplicantDocument({ kind, file_name, content, label }) {
   const normalizedKind = normalizeDocumentKind(kind);
   if (!normalizedKind) {
-    throw new Error(`kind must be one of: ${APPLICANT_DOCUMENT_KINDS.join(", ")}`);
+    throw new Error(
+      "kind must be a slug: lowercase letters, digits and underscores, starting with a letter " +
+        `(for example 'resume', 'resume_hospitality', 'portfolio'), at most ${MAX_DOCUMENT_KEY_LENGTH} characters.`
+    );
   }
   if (!Buffer.isBuffer(content) || content.length === 0) {
     throw new Error("content must be a non-empty buffer.");
@@ -257,8 +391,8 @@ async function saveApplicantDocument({ kind, file_name, content }) {
   const db = getDb();
   await db.run(
     `
-      INSERT INTO applicant_documents (kind, file_name, format, content, extracted_text, chars, truncated, pages, uploaded_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      INSERT INTO applicant_documents (kind, file_name, format, content, extracted_text, chars, truncated, pages, label, uploaded_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(kind) DO UPDATE SET
         file_name = excluded.file_name,
         format = excluded.format,
@@ -267,6 +401,7 @@ async function saveApplicantDocument({ kind, file_name, content }) {
         chars = excluded.chars,
         truncated = excluded.truncated,
         pages = excluded.pages,
+        label = excluded.label,
         uploaded_at = datetime('now');
     `,
     [
@@ -277,12 +412,15 @@ async function saveApplicantDocument({ kind, file_name, content }) {
       extracted.text,
       extracted.chars,
       extracted.truncated ? 1 : 0,
-      extracted.pages ?? null
+      extracted.pages ?? null,
+      String(label || "").trim()
     ]
   );
 
   return {
     kind: normalizedKind,
+    key: normalizedKind,
+    label: String(label || "").trim(),
     file_name: fileName,
     format: extracted.format,
     bytes: content.length,
@@ -300,7 +438,7 @@ async function getApplicantDocument(kind, { includeContent = false } = {}) {
   const db = getDb();
   const row = await db.get(
     `
-      SELECT kind, file_name, format, ${includeContent ? "content," : ""} extracted_text, chars, truncated, pages, uploaded_at
+      SELECT kind, file_name, format, ${includeContent ? "content," : ""} extracted_text, chars, truncated, pages, label, uploaded_at
       FROM applicant_documents
       WHERE kind = ?
       LIMIT 1;
@@ -311,6 +449,8 @@ async function getApplicantDocument(kind, { includeContent = false } = {}) {
 
   return {
     kind: row.kind,
+    key: row.kind,
+    label: String(row.label || ""),
     file_name: String(row.file_name || ""),
     format: String(row.format || ""),
     text: String(row.extracted_text || ""),
@@ -328,9 +468,14 @@ module.exports = {
   ensureApplicantDocumentsTable,
   saveApplicantDocument,
   getApplicantDocument,
+  listApplicantDocuments,
+  deleteApplicantDocument,
+  checkConfiguredDocumentPaths,
   normalizeDocumentKind,
   readZipEntry,
   APPLICANT_DOCUMENT_KINDS,
+  DEFAULT_DOCUMENT_KEY,
+  MAX_DOCUMENT_KEY_LENGTH,
   MAX_TEXT_CHARS,
   MAX_PDF_PAGES,
   MAX_DOCUMENT_BYTES

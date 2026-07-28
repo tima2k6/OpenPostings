@@ -18,6 +18,12 @@ const {
   STATE_CODE_TO_NAME
 } = require("../helpers/description-filters.js");
 const { inferPostingLocationFromJobUrl, inferAtsFromJobPostingUrl } = require("../helpers/normalize-ats.js");
+const {
+  parsePostingLocation,
+  parseLocationsJson,
+  parseLocationAnyTerm,
+  locationEntryMatches
+} = require("../helpers/parse-location.js");
 
 const MAX_ROWS = 1000;
 // Must stay equal to FACET_CANDIDATE_CAP in db-facets.js. Both paths refine the same SQL
@@ -35,6 +41,20 @@ const SORTABLE = new Map([
   ["pay", "COALESCE(pay_max, pay_min, 0)"],
   ["posted", "posting_date"]
 ]);
+
+// Shared string contract with /db/search, so the value arrives as text. Anything except an
+// explicit "no" means the default: unknown pay stays in.
+function parseIncludeUnknownPay(value) {
+  if (value === false) return false;
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return !["0", "false", "no"].includes(normalized);
+}
+
+function parseBooleanFlag(value) {
+  if (value === true) return true;
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return ["1", "true", "yes"].includes(normalized);
+}
 
 function splitTerms(value) {
   return String(value || "")
@@ -78,25 +98,74 @@ function buildQuery(input = {}) {
   const companyNone = splitTerms(input.company_none);
   const locationAny = splitTerms(input.location_any);
   const locationNone = splitTerms(input.location_none);
+  const descriptionAny = splitTerms(input.description_any);
+  const descriptionNone = splitTerms(input.description_none);
 
   if (titleAny.length) clauses.push(anyOf("position_name", titleAny, params));
   for (const term of titleAll) clauses.push(anyOf("position_name", [term], params));
   if (titleNone.length) clauses.push(noneOf("position_name", titleNone, params));
   if (companyAny.length) clauses.push(anyOf("company_name", companyAny, params));
   if (companyNone.length) clauses.push(noneOf("company_name", companyNone, params));
-  if (locationAny.length) clauses.push(anyOf("location", locationAny, params));
+
+  // Searching the body text finds roles a title filter structurally cannot: "Manager,
+  // Local Markets Growth" never matches an operations-leadership title guess, but its
+  // description does. These scan the description column, which is the largest in the
+  // database, so they are much slower than the title filters -- narrow with another
+  // clause where possible, or use similar_to for ranked retrieval over the same text.
+  // Rows with no stored description simply cannot match.
+  if (descriptionAny.length) clauses.push(anyOf("job_description", descriptionAny, params));
+  if (descriptionNone.length) clauses.push(noneOf("job_description", descriptionNone, params));
+
+  // location_any names cities, not substrings: "kent" used to LIKE-match Shepherdsville
+  // Kentucky and Kent, England, and "bellevue" matched a Philadelphia hotel named The
+  // Bellevue. Terms are parsed ("Kent" / "Kent, WA" / "Kent, WA, US") and decided against
+  // the structured location entries in the refine pass; SQL only narrows to a superset
+  // using the term's longest word. Unparsed rows are kept for the refine pass, which
+  // parses their raw or URL-inferred location on the fly.
+  const locationAnyTerms = locationAny.map((term) => parseLocationAnyTerm(term)).filter(Boolean);
+  if (locationAnyTerms.length) {
+    const parts = [];
+    for (const term of locationAnyTerms) {
+      const longestWord = term.city.split(" ").sort((a, b) => b.length - a.length)[0] || term.city;
+      const pattern = `%${escapeLike(longestWord)}%`;
+      parts.push(`LOWER(COALESCE(city, '')) LIKE ? ESCAPE '\\'`);
+      params.push(pattern);
+      parts.push(`LOWER(COALESCE(locations_json, '')) LIKE ? ESCAPE '\\'`);
+      params.push(pattern);
+      parts.push(`LOWER(COALESCE(location, '')) LIKE ? ESCAPE '\\'`);
+      params.push(pattern);
+    }
+    clauses.push(`(locations_json IS NULL OR ${parts.join(" OR ")})`);
+  }
   if (locationNone.length) clauses.push(noneOf("location", locationNone, params));
 
-  // Pay is stored on only a small fraction of rows, so a range filter silently means
-  // "and has a pay figure at all". Callers opt in knowingly.
+  // Structured, so "remote" never has to be a location term again -- as a substring it
+  // matched Remote Egypt, Mumbai Remote and EMEA Remote.
+  if (parseBooleanFlag(input.remote_only)) clauses.push("(is_remote = 1)");
+
+  // Pay is stored on only a small fraction of rows. A range filter that treated a missing
+  // figure as zero silently deleted whole employers -- every DoorDash row carries null pay,
+  // so pay_min=120000 removed the company from the results rather than the rows it knew
+  // were below the bar. Unknown pay therefore passes the range filter by default; callers
+  // that only want confirmed figures pass include_unknown_pay=0 (or has_pay).
+  const includeUnknownPay = parseIncludeUnknownPay(input.include_unknown_pay);
+  const unknownPayClause = "(pay_min IS NULL AND pay_max IS NULL)";
   const payMin = Number(input.pay_min);
   if (Number.isFinite(payMin) && payMin > 0) {
-    clauses.push("(COALESCE(pay_max, pay_min, 0) >= ?)");
+    clauses.push(
+      includeUnknownPay
+        ? `(${unknownPayClause} OR COALESCE(pay_max, pay_min, 0) >= ?)`
+        : "(COALESCE(pay_max, pay_min, 0) >= ?)"
+    );
     params.push(payMin);
   }
   const payMax = Number(input.pay_max);
   if (Number.isFinite(payMax) && payMax > 0) {
-    clauses.push("(COALESCE(pay_min, pay_max, 0) <= ?)");
+    clauses.push(
+      includeUnknownPay
+        ? `(${unknownPayClause} OR COALESCE(pay_min, pay_max, 0) <= ?)`
+        : "(COALESCE(pay_min, pay_max, 0) <= ?)"
+    );
     params.push(payMax);
   }
 
@@ -160,13 +229,14 @@ function buildQuery(input = {}) {
   const where = clauses.length ? `WHERE ${clauses.join("\n  AND ")}` : "";
   const sql =
     `SELECT id, company_name, position_name, location, posting_date,\n` +
+    `       city, state_region, country, is_remote, locations_json,\n` +
     `       pay_min, pay_max, pay_currency, pay_period, hidden,\n` +
     `       first_seen_epoch, last_seen_epoch, job_posting_url\n` +
     `FROM Postings\n${where}\n` +
     `ORDER BY ${sortColumn} ${direction}, id DESC\n` +
     `LIMIT ${limit}`;
 
-  return { sql, params, where, clauses, limit, stateCodes, countryFilters, regionFilters, atsFilters };
+  return { sql, params, where, clauses, limit, stateCodes, countryFilters, regionFilters, atsFilters, locationAnyTerms };
 }
 
 // True when the SQL predicate is only a superset of what the caller asked for, so the counts
@@ -176,14 +246,15 @@ function needsRefinePass(built) {
     built.stateCodes.length > 0 ||
     built.countryFilters.length > 0 ||
     built.regionFilters.length > 0 ||
-    built.atsFilters.length > 0
+    built.atsFilters.length > 0 ||
+    built.locationAnyTerms.length > 0
   );
 }
 
 async function runQuery(input = {}) {
   const db = await getReadOnlyDb();
   const built = buildQuery(input);
-  const { where, limit, stateCodes, countryFilters, regionFilters, atsFilters } = built;
+  const { where, limit, stateCodes, countryFilters, regionFilters, atsFilters, locationAnyTerms } = built;
   const params = built.params.slice();
 
   const readable = built.sql.replace(/\?/g, () => {
@@ -196,7 +267,9 @@ async function runQuery(input = {}) {
   if (!needsRefinePass(built)) {
     const rows = await db.all(built.sql, params);
     const totals = await db.get(
-      `SELECT COUNT(*) AS total, SUM(CASE WHEN hidden = 0 THEN 1 ELSE 0 END) AS visible
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN hidden = 0 THEN 1 ELSE 0 END) AS visible,
+              SUM(CASE WHEN pay_min IS NULL AND pay_max IS NULL THEN 1 ELSE 0 END) AS pay_unknown
        FROM Postings ${where};`,
       params
     );
@@ -204,6 +277,9 @@ async function runQuery(input = {}) {
       rows,
       total: Number(totals?.total || 0),
       visible: Number(totals?.visible || 0),
+      // How many of the matches carry no pay data at all -- the rows a pay filter can only
+      // keep or drop blindly. Lets a caller judge how much a pay_min actually filtered.
+      pay_unknown_count: Number(totals?.pay_unknown || 0),
       shown: rows.length,
       limit,
       approximate: false,
@@ -217,20 +293,47 @@ async function runQuery(input = {}) {
     .replace(/LIMIT \d+$/, `LIMIT ${STATE_CANDIDATE_CAP}`);
   const candidates = await db.all(candidateSql, params);
 
+  const countryCodes = countryFilters.map((filter) => String(filter?.value || "").trim().toUpperCase()).filter(Boolean);
   const matched = [];
   for (const row of candidates) {
     const location =
       String(row.location || "").trim() || inferPostingLocationFromJobUrl(row.job_posting_url) || "";
-    if (!rowMatchesLocationFilters(location, stateCodes, [], countryFilters, regionFilters)) continue;
+
+    // Structured first: rows carry their parsed location entries, and every geographic
+    // constraint has to hold on a single entry -- which is what stops "Kent, England /
+    // Nashville, TN" answering for city=Kent + state=WA. Rows written before the parsed
+    // columns existed are parsed on the fly from the same text the display uses.
+    const hasParsedColumns = row.locations_json !== null && row.locations_json !== undefined;
+    const entries = hasParsedColumns
+      ? parseLocationsJson(row.locations_json)
+      : parsePostingLocation(location).locations;
+
+    if (locationAnyTerms.length || stateCodes.length || countryCodes.length) {
+      if (entries.length > 0) {
+        if (!entries.some((entry) => locationEntryMatches(entry, locationAnyTerms, stateCodes, countryCodes))) {
+          continue;
+        }
+      } else if (locationAnyTerms.length) {
+        // A city filter cannot match a posting whose location names no city.
+        continue;
+      } else if (!rowMatchesLocationFilters(location, stateCodes, [], countryFilters, [])) {
+        // No parsed entries (blank location): the legacy matcher keeps its "no location
+        // means URL-inference decides" behavior for state and country.
+        continue;
+      }
+    }
+    if (regionFilters.length && !rowMatchesLocationFilters(location, [], [], [], regionFilters)) continue;
     if (atsFilters.length && !atsFilters.includes(String(inferAtsFromJobPostingUrl(row.job_posting_url) || "").toLowerCase())) continue;
     matched.push({ ...row, location: row.location || location });
   }
 
   const visible = matched.filter((row) => Number(row.hidden) === 0).length;
+  const payUnknown = matched.filter((row) => row.pay_min === null && row.pay_max === null).length;
   return {
     rows: matched.slice(0, limit),
     total: matched.length,
     visible,
+    pay_unknown_count: payUnknown,
     shown: Math.min(matched.length, limit),
     limit,
     // True when the superset filled the candidate cap, so counts are a floor not a total.

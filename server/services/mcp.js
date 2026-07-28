@@ -15,9 +15,6 @@ async function getMcpSettings() {
         id,
         enabled,
         preferred_agent_name,
-        agent_login_email,
-        agent_login_password,
-        mfa_login_email,
         mfa_login_notes,
         dry_run_only,
         require_final_approval,
@@ -40,9 +37,6 @@ async function getMcpSettings() {
     ...MCP_SETTINGS_DEFAULTS,
     enabled: Boolean(Number(row?.enabled || 0)),
     preferred_agent_name: row?.preferred_agent_name,
-    agent_login_email: row?.agent_login_email,
-    agent_login_password: row?.agent_login_password,
-    mfa_login_email: row?.mfa_login_email,
     mfa_login_notes: row?.mfa_login_notes,
     dry_run_only: Boolean(Number(row?.dry_run_only ?? 1)),
     require_final_approval: Boolean(Number(row?.require_final_approval ?? 1)),
@@ -69,9 +63,6 @@ async function upsertMcpSettings(input) {
         id,
         enabled,
         preferred_agent_name,
-        agent_login_email,
-        agent_login_password,
-        mfa_login_email,
         mfa_login_notes,
         dry_run_only,
         require_final_approval,
@@ -85,13 +76,10 @@ async function upsertMcpSettings(input) {
         preferred_counties,
         instructions_for_agent,
         updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(id) DO UPDATE SET
         enabled = excluded.enabled,
         preferred_agent_name = excluded.preferred_agent_name,
-        agent_login_email = excluded.agent_login_email,
-        agent_login_password = excluded.agent_login_password,
-        mfa_login_email = excluded.mfa_login_email,
         mfa_login_notes = excluded.mfa_login_notes,
         dry_run_only = excluded.dry_run_only,
         require_final_approval = excluded.require_final_approval,
@@ -110,9 +98,6 @@ async function upsertMcpSettings(input) {
       1,
       normalized.enabled ? 1 : 0,
       normalized.preferred_agent_name,
-      normalized.agent_login_email,
-      normalized.agent_login_password,
-      normalized.mfa_login_email,
       normalized.mfa_login_notes,
       normalized.dry_run_only ? 1 : 0,
       normalized.require_final_approval ? 1 : 0,
@@ -147,29 +132,38 @@ function buildMcpRunbook(settings, personalInformation, candidates) {
   return {
     preferred_agent_name: preferredAgent,
     summary:
-      "Shortlist, screen, then apply: filter postings down, read each survivor's stored description before opening a browser, and submit only when allowed by settings and credentials.",
+      "Shortlist, screen, prepare -- then hand back. Filter postings down, read each survivor's stored description against the resume, assemble everything the application needs, and stop at the point where the application asks for an account, a sign-in or a captcha. The user completes those steps themselves.",
     steps: [
       "Read applicantee information and MCP settings from this payload.",
-      "Read the actual resume once with get_resume; it is the ground truth the profile fields summarize.",
-      "Shortlist with find_posting_candidates (saved preferences) or query_postings (include/exclude terms, pay floor, recency).",
-      "Screen each shortlisted posting with get_posting_details and weigh its description against the resume before opening anything in a browser.",
+      "List the stored documents with get_resume (no argument), then read the variant that fits the roles being targeted; it is the ground truth the profile fields summarize.",
+      "Shortlist with find_posting_candidates (saved preferences) or query_postings (include/exclude terms, pay floor, recency). Use find_similar_postings to surface roles whose responsibilities match the resume even when the title would never have been guessed.",
+      "Screen each shortlisted posting with get_posting_details and weigh its description against the resume before opening anything in a browser. Check location_conflict: when true, the description restricts hiring to fewer places than the header lists, and hiring_locations holds the ones that count.",
       "Call ignore_posting for postings that are not a fit, so no later run resurfaces them.",
-      "For each posting worth applying to, open job_posting_url and fill the application from applicantee information. Keep applicant email separate from agent login email.",
-      "If an account or MFA is required, use agent_login_email + agent_login_password for account creation and sign-in flows.",
-      "Use the same agent_login_email for MFA/approval flows when required.",
-      "Draft a job-specific cover letter aligned to the posting requirements and applicant background.",
+      "For each posting worth applying to, draft the cover letter with draft_cover_letter (pass document=<key> to write from the matching resume variant) and assemble the answers the form will need from applicantee information.",
+      "Open job_posting_url and fill in what can be filled from the applicant's own details.",
+      "Stop at the authentication boundary. If the application requires creating an account, signing in, solving a captcha, or entering payment or government-identification details, do not attempt it: report what is prepared, name the posting and what the form is asking for, and let the user finish. requires_account on a posting flags this in advance where it was detected at scrape time.",
       "If dry_run_only is true, stop before final submit and return a dry-run result.",
-      "When application is submitted, call record_application_result with commit=true; consult list_applications when unsure whether a posting was already handled."
+      "When the user confirms an application was submitted, call record_application_result with commit=true; consult list_applications when unsure whether a posting was already handled."
     ],
     guardrails: {
       dry_run_only: Boolean(settings?.dry_run_only),
-      require_final_approval: Boolean(settings?.require_final_approval)
+      require_final_approval: Boolean(settings?.require_final_approval),
+      // The agent prepares applications; it does not authenticate as the user. Most target
+      // ATS platforms gate submission behind account creation plus a captcha anyway
+      // (Greenhouse and Workday both want a candidate account, iCIMS instances sit behind
+      // hCaptcha), so an agent holding credentials bought very little and stored a
+      // reusable password in a plaintext settings row to do it.
+      never_authenticate_as_user: true,
+      hand_off_at: [
+        "account creation",
+        "sign-in",
+        "captcha",
+        "multi-factor approval",
+        "payment or government identification details"
+      ]
     },
     applicant_display_name: applicantFullName || "Applicant",
     applicant_email: String(personalInformation?.email || "").trim(),
-    agent_login_email: String(settings?.agent_login_email || "").trim(),
-    agent_login_password: String(settings?.agent_login_password || ""),
-    mfa_login_email: String(settings?.agent_login_email || "").trim(),
     mfa_login_notes: String(settings?.mfa_login_notes || "").trim(),
     custom_instructions: String(settings?.instructions_for_agent || "").trim(),
     candidate_count: Array.isArray(candidates) ? candidates.length : 0

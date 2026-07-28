@@ -1684,7 +1684,8 @@ function rowMatchesCompensationRangeFilter(
   rowPayPeriod,
   selectedPayMin,
   selectedPayMax,
-  selectedPayPeriods
+  selectedPayPeriods,
+  includeUnknownPay = false
 ) {
   const payPeriods = Array.isArray(selectedPayPeriods) ? selectedPayPeriods.filter(Boolean) : [];
   const hasRangeFilter = Number.isFinite(selectedPayMin) || Number.isFinite(selectedPayMax);
@@ -1705,7 +1706,10 @@ function rowMatchesCompensationRangeFilter(
 
   const rowLower = normalizedRowPayMin !== null ? normalizedRowPayMin : normalizedRowPayMax;
   const rowUpper = normalizedRowPayMax !== null ? normalizedRowPayMax : normalizedRowPayMin;
-  if (rowLower === null || rowUpper === null) return false;
+  // A row with no pay figure cannot be compared against the range. Dropping it treats
+  // "unknown" as "zero" and deletes every employer that never publishes pay, so the caller
+  // chooses: keep unknowns (the default for searches) or demand a confirmed figure.
+  if (rowLower === null || rowUpper === null) return includeUnknownPay;
 
   if (Number.isFinite(selectedPayMin) && rowUpper < selectedPayMin) return false;
   if (Number.isFinite(selectedPayMax) && rowLower > selectedPayMax) return false;
@@ -1839,6 +1843,12 @@ module.exports = {
   rowMatchesCompensationRangeFilter,
   rowMatchesLocationFilters,
   rowMatchesRemoteFilter,
+  hasStateLikeMatch,
+  splitLocationIntoGroups,
+  classifyLocationWorkMode,
+  STATE_NAME_TO_CODE,
+  COUNTRY_ALIAS_TO_CODE,
+  COUNTRY_BY_CODE,
   formatCompensationTypeLabel,
   formatCompensationPayPeriodLabel,
   formatEducationLevelLabel,

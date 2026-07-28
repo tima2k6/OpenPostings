@@ -33,6 +33,8 @@ async function getReadOnlyDb() {
     driver: sqlite3.Database,
     mode: sqlite3.OPEN_READONLY
   });
+  // Reads can still hit SQLITE_BUSY around checkpoints; wait rather than fail.
+  await readOnlyDb.exec("PRAGMA busy_timeout = 15000;");
   return readOnlyDb;
 }
 

@@ -32,12 +32,15 @@ function testSelectsAreAllowed() {
   }
 }
 
-// A read-only connection cannot stop a SELECT from reading credentials, so this is the
-// only thing standing between the settings tables and anything that can reach the host.
+// A read-only connection cannot stop a SELECT from reading personal information, so this
+// is the only thing standing between the settings tables and anything that can reach the
+// host. McpSettings no longer stores credentials, but PersonalInformation still holds the
+// applicant's address, phone number and demographic answers, and applicant_documents holds
+// the resume itself.
 function testSensitiveTablesAreRefused() {
   for (const sql of [
     "SELECT * FROM McpSettings",
-    "select agent_login_password from mcpsettings",
+    "select instructions_for_agent from mcpsettings",
     "SELECT * FROM PersonalInformation",
     "SELECT p.id FROM Postings p JOIN McpSettings m ON 1=1"
   ]) {

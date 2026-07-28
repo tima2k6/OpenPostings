@@ -187,22 +187,34 @@ async function testPayRangeBoundaries() {
       { url: "https://x/none" }
     ],
     async () => {
+      // Unknown pay (no figure, or zeros) stays in by default: a pay filter must drop rows
+      // known to be out of range, not employers that never publish a figure.
       // rowUpper falls back to pay_min, so min-only sits at exactly 100000.
       const atBoundary = await listPostingsWithFilters({ pay_min: 100000 });
       assert.deepStrictEqual(
         urlsOf(atBoundary),
-        ["https://x/both", "https://x/min-only"],
-        "boundary must be inclusive and one-sided rows must not be lost"
+        ["https://x/both", "https://x/min-only", "https://x/none", "https://x/zero"],
+        "boundary must be inclusive, one-sided rows must not be lost, unknown pay stays in"
       );
+      assert.strictEqual(atBoundary.pay_unknown_count, 2, "unknown-pay rows must be counted");
 
-      const aboveBoundary = await listPostingsWithFilters({ pay_min: 100001 });
+      // include_unknown_pay=false is the old strict behavior: confirmed figures only.
+      const strictAtBoundary = await listPostingsWithFilters({ pay_min: 100000, include_unknown_pay: false });
+      assert.deepStrictEqual(
+        urlsOf(strictAtBoundary),
+        ["https://x/both", "https://x/min-only"],
+        "strict mode must demand a confirmed figure"
+      );
+      assert.strictEqual(strictAtBoundary.pay_unknown_count, 0);
+
+      const aboveBoundary = await listPostingsWithFilters({ pay_min: 100001, include_unknown_pay: false });
       assert.deepStrictEqual(urlsOf(aboveBoundary), ["https://x/both"]);
 
       // rowLower falls back to pay_max for the max-only row.
-      const capped = await listPostingsWithFilters({ pay_max: 80000 });
+      const capped = await listPostingsWithFilters({ pay_max: 80000, include_unknown_pay: false });
       assert.deepStrictEqual(urlsOf(capped), ["https://x/max-only"]);
 
-      const banded = await listPostingsWithFilters({ pay_min: 85000, pay_max: 95000 });
+      const banded = await listPostingsWithFilters({ pay_min: 85000, pay_max: 95000, include_unknown_pay: false });
       assert.deepStrictEqual(urlsOf(banded), ["https://x/both"]);
     }
   );
