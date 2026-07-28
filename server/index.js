@@ -75,7 +75,7 @@ const { parseTaleoCompany } = require("./ats/taleonet/service.js");
 
 
 // import helpers
-const { nowEpochSeconds, parseNonNegativeInteger, normalizeBoolean, normalizePayFilterNumber } = require("./helpers/normalize-numbers.js");
+const { nowEpochSeconds, parseNonNegativeInteger, normalizeBoolean, normalizePayFilterNumber, getPostingFreshnessWindowSeconds } = require("./helpers/normalize-numbers.js");
 const { inferAtsFromJobPostingUrl, normalizeAtsFilterValue, ATS_FILTER_OPTIONS, ATS_FILTER_OPTION_ITEMS } = require("./helpers/normalize-ats.js");
 const { parseCsvParam, normalizeStringArray, normalizeSourceUrlString, APPLICATION_STATUS_OPTIONS } = require("./helpers/normalize-strings.js");
 const { normalizeRemoteFilter } = require("./helpers/description-filters.js");
@@ -776,6 +776,24 @@ async function ensurePostingsTable() {
   // so the UI can flag applications that need a manual sign-in.
   if (!existingColumns.has("requires_account")) {
     await db.exec(`ALTER TABLE Postings ADD COLUMN requires_account INTEGER;`);
+  }
+
+  // Why a posting is hidden, not just that it is. Two unrelated pruners set hidden = 1:
+  // one for postings the ATS has stopped listing ('delisted'), one for postings whose
+  // posting_date falls outside the freshness window ('outside_date_window'). The second
+  // kind is still live and still applyable -- a DoorDash role open 22 days reads exactly
+  // like one that was taken down -- and with a single boolean there was no way to ask for
+  // one and not the other. Empty means visible.
+  if (!existingColumns.has("hidden_reason")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN hidden_reason TEXT NOT NULL DEFAULT '';`);
+    // Existing hidden rows predate the column. last_seen_epoch is what distinguishes the
+    // two: a row the sync has seen recently was hidden for its date, not for going away.
+    await db.run(
+      `UPDATE Postings
+       SET hidden_reason = CASE WHEN last_seen_epoch >= ? THEN 'outside_date_window' ELSE 'delisted' END
+       WHERE hidden = 1 AND hidden_reason = '';`,
+      [nowEpochSeconds() - getPostingFreshnessWindowSeconds()]
+    );
   }
 
   await db.exec(`

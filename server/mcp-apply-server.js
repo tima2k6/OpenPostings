@@ -234,7 +234,8 @@ async function ensureTables() {
       ["description_fetched_at", "ALTER TABLE Postings ADD COLUMN description_fetched_at INTEGER;"],
       ["status", "ALTER TABLE Postings ADD COLUMN status TEXT NOT NULL DEFAULT 'unverified';"],
       ["dead_since_epoch", "ALTER TABLE Postings ADD COLUMN dead_since_epoch INTEGER;"],
-      ["requires_account", "ALTER TABLE Postings ADD COLUMN requires_account INTEGER;"]
+      ["requires_account", "ALTER TABLE Postings ADD COLUMN requires_account INTEGER;"],
+      ["hidden_reason", "ALTER TABLE Postings ADD COLUMN hidden_reason TEXT NOT NULL DEFAULT '';"]
     ];
     for (const [columnName, ddl] of postingsMigrations) {
       if (!postingsColumnNames.has(columnName)) await db.exec(ddl);
@@ -363,6 +364,7 @@ async function findCandidates(options = {}) {
     include_applied: normalizeBoolean(options.include_applied, false),
     include_ignored: normalizeBoolean(options.include_ignored, false),
     include_dead: normalizeBoolean(options.include_dead, false),
+    include_stale_dated: normalizeBoolean(options.include_stale_dated, false),
     // Descriptions are the bulk of the payload, and an agent that only needs to rank titles
     // and open URLs does not want them in its context. Opt in per call.
     include_descriptions: normalizeBoolean(options.include_descriptions, false)
@@ -672,7 +674,7 @@ async function main() {
     "find_posting_candidates",
     {
       description:
-        "Find postings to apply to, using the same filter engine as the app's job list. Any filter left empty falls back to the saved MCP preference for it; pass use_settings=false to ignore saved preferences entirely. Applied, ignored and dead postings are excluded by default (include_dead=true to see verified-gone ones). Pay ranges keep postings with no published pay figure -- pay_unknown_count reports how many -- unless include_unknown_pay=false. Rows carry location_conflict, which flags a posting whose description restricts hiring to fewer places than its header lists. Job descriptions are omitted unless include_descriptions=true. Call get_filter_options for the valid values of the list filters.",
+        "Find postings to apply to, using the same filter engine as the app's job list. Any filter left empty falls back to the saved MCP preference for it; pass use_settings=false to ignore saved preferences entirely. Applied, ignored and dead postings are excluded by default (include_dead=true to see verified-gone ones). Postings hidden only because their posting date is older than the freshness window are excluded too but remain applyable -- include_stale_dated=true brings them back, and rows carry hidden_reason so you can tell them from delisted ones. Pay ranges keep postings with no published pay figure -- pay_unknown_count reports how many -- unless include_unknown_pay=false. Rows carry location_conflict, which flags a posting whose description restricts hiring to fewer places than its header lists. Job descriptions are omitted unless include_descriptions=true. Call get_filter_options for the valid values of the list filters.",
       inputSchema: {
         search: z.string().optional(),
         ats: z
@@ -695,6 +697,7 @@ async function main() {
         include_applied: z.boolean().optional(),
         include_ignored: z.boolean().optional(),
         include_dead: z.boolean().optional(),
+        include_stale_dated: z.boolean().optional(),
         include_descriptions: z.boolean().optional(),
         use_settings: z.boolean().optional(),
         limit: z.number().int().positive().max(MAX_CANDIDATE_LIMIT).optional(),
@@ -711,7 +714,7 @@ async function main() {
     "query_postings",
     {
       description:
-        "Precision query over the raw Postings table, for questions find_posting_candidates cannot phrase: each *_any group ORs its terms, groups AND together, and *_none excludes -- so '(manager OR director) AND NOT (assistant OR shift), in WA, over 140k, still listed within 3 days' is one call. Title and company terms are substring matches. location_any terms name cities and match the posting's parsed locations, optionally qualified as 'City, ST' or 'City, ST, US' -- 'Kent, WA' cannot match Kent, England or Kentucky. Use remote_only=true for remote roles rather than a location term. Unlike find_posting_candidates this ignores saved preferences and the app's freshness window, and can see hidden postings via visibility. Most rows carry no pay figure, so pay_min/pay_max keep unknown-pay rows by default (pay_unknown_count reports how many); pass include_unknown_pay=false or has_pay=true to demand a confirmed figure. Rows carry applied/ignored flags but no descriptions; screen the shortlist with get_posting_details. When approximate=true the counts are a floor, not a total.",
+        "Precision query over the raw Postings table, for questions find_posting_candidates cannot phrase: each *_any group ORs its terms, groups AND together, and *_none excludes -- so '(manager OR director) AND NOT (assistant OR shift), in WA, over 140k, still listed within 3 days' is one call. Title and company terms are substring matches. location_any terms name cities and match the posting's parsed locations, optionally qualified as 'City, ST' or 'City, ST, US' -- 'Kent, WA' cannot match Kent, England or Kentucky. Use remote_only=true for remote roles rather than a location term. Unlike find_posting_candidates this ignores saved preferences and the app's freshness window, and can see hidden postings via visibility -- and visibility distinguishes why a posting is hidden: 'stale_dated' is still listed by the employer but older than the freshness window (so still applyable), 'delisted' means the ATS stopped listing it, and 'open' returns both visible and stale-dated. Most rows carry no pay figure, so pay_min/pay_max keep unknown-pay rows by default (pay_unknown_count reports how many); pass include_unknown_pay=false or has_pay=true to demand a confirmed figure. Rows carry applied/ignored flags but no descriptions; screen the shortlist with get_posting_details. When approximate=true the counts are a floor, not a total.",
       inputSchema: {
         title_any: z.array(z.string()).optional(),
         title_all: z.array(z.string()).optional(),
@@ -733,7 +736,7 @@ async function main() {
         has_pay: z.boolean().optional(),
         seen_days: z.number().positive().optional(),
         found_days: z.number().positive().optional(),
-        visibility: z.enum(["visible", "hidden", "all"]).optional(),
+        visibility: z.enum(["visible", "hidden", "all", "open", "stale_dated", "delisted"]).optional(),
         sort: z.enum(MCP_QUERY_SORT_VALUES).optional(),
         dir: z.enum(["asc", "desc"]).optional(),
         limit: z.number().int().positive().max(MAX_ROWS).optional()

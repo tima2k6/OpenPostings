@@ -212,8 +212,16 @@ function buildQuery(input = {}) {
     clauses.push(`(location IS NULL OR TRIM(location) = '' OR ${parts.join(" OR ")})`);
   }
 
+  // visibility=stale_dated is the one worth having: postings the employer is still
+  // listing, hidden only because their posting_date fell outside the freshness window.
+  // Under a bare hidden flag those were indistinguishable from postings that had been
+  // taken down, so asking for "still open, just old" was not expressible.
   if (input.visibility === "visible") clauses.push("hidden = 0");
   if (input.visibility === "hidden") clauses.push("hidden = 1");
+  if (input.visibility === "stale_dated") clauses.push("(hidden = 1 AND hidden_reason = 'outside_date_window')");
+  if (input.visibility === "delisted") clauses.push("(hidden = 1 AND hidden_reason = 'delisted')");
+  // Everything still applyable: currently listed, plus the merely-old.
+  if (input.visibility === "open") clauses.push("(hidden = 0 OR hidden_reason = 'outside_date_window')");
 
   if (input.has_pay === "1") clauses.push("(COALESCE(pay_max, pay_min, 0) > 0)");
 
@@ -230,7 +238,7 @@ function buildQuery(input = {}) {
   const sql =
     `SELECT id, company_name, position_name, location, posting_date,\n` +
     `       city, state_region, country, is_remote, locations_json,\n` +
-    `       pay_min, pay_max, pay_currency, pay_period, hidden,\n` +
+    `       pay_min, pay_max, pay_currency, pay_period, hidden, hidden_reason,\n` +
     `       first_seen_epoch, last_seen_epoch, job_posting_url\n` +
     `FROM Postings\n${where}\n` +
     `ORDER BY ${sortColumn} ${direction}, id DESC\n` +

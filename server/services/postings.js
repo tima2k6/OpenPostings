@@ -240,7 +240,7 @@ async function readDistinctStoredLocations() {
       `
         SELECT DISTINCT location
         FROM Postings
-        WHERE hidden = 0
+        WHERE ${visibilityPredicate}
           AND last_seen_epoch >= ?
           AND location IS NOT NULL
           AND TRIM(location) <> '';
@@ -460,6 +460,16 @@ async function listPostingsWithFilters(options = {}) {
   // of candidate lists unless explicitly asked for. 'unverified' rows are still shown --
   // most rows have never been fetched, and absence of proof is not proof of death.
   const includeDead = normalizeBoolean(options?.include_dead, false);
+  // Postings the employer is still listing but whose posting_date fell outside the
+  // freshness window. They are hidden, but unlike delisted ones they can still be applied
+  // to, so this is opt-in rather than lumped in with "hidden".
+  const includeStaleDated = normalizeBoolean(options?.include_stale_dated, false);
+  const visibilityPredicate = includeStaleDated
+    ? "(hidden = 0 OR hidden_reason = 'outside_date_window')"
+    : "hidden = 0";
+  const visibilityPredicateAliased = includeStaleDated
+    ? "(p.hidden = 0 OR p.hidden_reason = 'outside_date_window')"
+    : "p.hidden = 0";
   const hasStructuredFilters =
     atsFilters.length > 0 ||
     industryKeys.length > 0 ||
@@ -482,9 +492,9 @@ async function listPostingsWithFilters(options = {}) {
     if (includeApplied && includeIgnored) {
       rows = await db.all(
         `
-          SELECT id, company_name, position_name, job_posting_url, posting_date, location, status, location_conflict, requires_account, job_description, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
+          SELECT id, company_name, position_name, job_posting_url, posting_date, location, status, location_conflict, requires_account, hidden, hidden_reason, job_description, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
           FROM Postings
-          WHERE hidden = 0
+          WHERE ${visibilityPredicate}
             AND last_seen_epoch >= ?
             AND (? = 0 OR (posting_date IS NOT NULL AND TRIM(posting_date) <> ''))
             AND NOT EXISTS (
@@ -500,7 +510,7 @@ async function listPostingsWithFilters(options = {}) {
     } else {
       rows = await db.all(
         `
-          SELECT p.id, p.company_name, p.position_name, p.job_posting_url, p.posting_date, p.location, p.status, p.location_conflict, p.requires_account, p.job_description, p.compensation_type, p.education_levels, p.pay_min, p.pay_max, p.pay_currency, p.pay_period, p.pay_raw, p.first_seen_epoch, p.last_seen_epoch
+          SELECT p.id, p.company_name, p.position_name, p.job_posting_url, p.posting_date, p.location, p.status, p.location_conflict, p.requires_account, p.hidden, p.hidden_reason, p.job_description, p.compensation_type, p.education_levels, p.pay_min, p.pay_max, p.pay_currency, p.pay_period, p.pay_raw, p.first_seen_epoch, p.last_seen_epoch
           FROM Postings p
           LEFT JOIN posting_application_state s
             ON s.job_posting_url = p.job_posting_url
@@ -509,7 +519,7 @@ async function listPostingsWithFilters(options = {}) {
               OR
               (${includeIgnored ? 0 : 1} = 1 AND COALESCE(s.ignored, 0) = 1)
             )
-          WHERE p.hidden = 0
+          WHERE ${visibilityPredicateAliased}
             AND p.last_seen_epoch >= ?
             AND (? = 0 OR (p.posting_date IS NOT NULL AND TRIM(p.posting_date) <> ''))
             AND NOT EXISTS (
@@ -547,7 +557,7 @@ async function listPostingsWithFilters(options = {}) {
     });
     rows = await db.all(
       `
-        SELECT id, company_name, position_name, job_posting_url, posting_date, location, status, location_conflict, requires_account, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
+        SELECT id, company_name, position_name, job_posting_url, posting_date, location, status, location_conflict, requires_account, hidden, hidden_reason, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
         FROM Postings
         WHERE hidden = 0
           AND last_seen_epoch >= ?
@@ -659,6 +669,11 @@ async function listPostingsWithFilters(options = {}) {
       posting_date: postingDate || null,
       job_description: normalizedJobDescription,
       status: String(row?.status || "unverified"),
+      hidden: Boolean(Number(row?.hidden || 0)),
+      // '' when visible; 'delisted' when the ATS stopped listing it; 'outside_date_window'
+      // when it is still listed but older than the freshness window -- the latter is still
+      // applyable, which is the whole reason the two are told apart.
+      hidden_reason: String(row?.hidden_reason || ""),
       // True when the description restricts hiring to fewer places than the header lists,
       // so a candidate does not shortlist a city the employer will not hire into.
       location_conflict: Boolean(Number(row?.location_conflict || 0)),
@@ -793,6 +808,7 @@ async function listPostingsWithFilters(options = {}) {
       pay_min: payMinFilter,
       pay_max: payMaxFilter,
       include_unknown_pay: includeUnknownPay,
+      include_stale_dated: includeStaleDated,
       education_levels: educationLevels,
       states: stateCodes,
       counties: countyFilters.map((filter) =>
@@ -887,7 +903,7 @@ async function getPostingsByUrls(jobPostingUrls) {
       SELECT id, company_name, position_name, job_posting_url, posting_date, location,
              city, state_region, country, is_remote, locations_json,
              hiring_locations_json, location_conflict, status, dead_since_epoch,
-             requires_account, description_fetched_at,
+             requires_account, description_fetched_at, hidden_reason,
              job_description, compensation_type, education_levels, pay_min, pay_max,
              pay_currency, pay_period, pay_raw, hidden, first_seen_epoch, last_seen_epoch
       FROM Postings
@@ -921,6 +937,7 @@ async function getPostingsByUrls(jobPostingUrls) {
           ? null
           : Boolean(Number(row?.requires_account)),
       status: String(row?.status || "unverified"),
+      hidden_reason: String(row?.hidden_reason || ""),
       education_levels: parseEducationLevels(row?.education_levels),
       job_description: normalizeJobDescription(row?.job_description, ats),
       pay_currency: normalizeCompensationCurrencyCode(row?.pay_currency),

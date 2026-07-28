@@ -1263,7 +1263,8 @@ async function upsertPostingsBatch(postings, seenEpoch) {
             -- guard, which silently discarded the whole update for any hidden row: once
             -- pruned, a posting could never be revived even while it was still live.
             hidden = 0,
-            hidden_at_epoch = NULL;
+            hidden_at_epoch = NULL,
+            hidden_reason = '';
         `,
         [
           companyName,
@@ -1333,6 +1334,9 @@ async function pruneExpiredPostings(referenceEpoch = nowEpochSeconds()) {
       SET
         hidden = 1,
         hidden_at_epoch = COALESCE(hidden_at_epoch, ?),
+        -- The ATS has stopped listing this. Distinct from a posting that is still listed
+        -- but older than the date window; only this kind is genuinely gone.
+        hidden_reason = 'delisted',
         job_description = NULL
       WHERE hidden = 0
         AND last_seen_epoch < ?;
@@ -1422,6 +1426,10 @@ async function prunePostingsOutsideDateWindow(referenceEpoch = nowEpochSeconds()
           SET
             hidden = 1,
             hidden_at_epoch = COALESCE(hidden_at_epoch, ?),
+            -- Still listed by the employer, just older than the freshness window. These
+            -- remain applyable, which is why they are worth telling apart from delisted
+            -- ones rather than both being a bare hidden = 1.
+            hidden_reason = 'outside_date_window',
             job_description = NULL
           WHERE hidden = 0
             AND id IN (${placeholders});
@@ -1493,7 +1501,8 @@ async function createCanonicalPostingsTable() {
       description_fetched_at INTEGER,
       status TEXT NOT NULL DEFAULT 'unverified',
       dead_since_epoch INTEGER,
-      requires_account INTEGER
+      requires_account INTEGER,
+      hidden_reason TEXT NOT NULL DEFAULT ''
     );
 
     CREATE INDEX IF NOT EXISTS idx_postings_company_name
