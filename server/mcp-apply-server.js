@@ -40,6 +40,11 @@ const {
 } = require("./services/postings.js");
 const { listApplications } = require("./services/applications.js");
 const {
+  ensureApplicationAnswersTable,
+  getApplicationAnswerSummary,
+  setApplicationAnswer
+} = require("./services/application-answers.js");
+const {
   extractDocumentText,
   getApplicantDocument,
   listApplicantDocuments,
@@ -255,6 +260,9 @@ async function openDatabase() {
   // default window instead of the one configured for this instance.
   await ensureSyncServiceSettingsTable();
   await loadSyncServiceSettingsIntoRuntime();
+  // Seeds the standard screening questions so get_application_answers can report what is
+  // still unanswered even on a database the API server has not started against yet.
+  await ensureApplicationAnswersTable();
 }
 
 // An explicitly passed filter replaces the saved preference; an empty one falls back to it,
@@ -602,11 +610,20 @@ async function main() {
       ensureMcpAgentEnabled(mcpSettings);
       const documents = await listApplicantDocuments();
       const configuredPaths = await checkConfiguredDocumentPaths();
+      const answers = await getApplicationAnswerSummary();
       return asToolResult({
         personal_information: personalInformation,
         mcp_settings: mcpSettings,
         documents,
         document_keys: documents.map((document) => document.key),
+        // Which form questions are already answered and which still need asking. Read in
+        // full with get_application_answers before filling anything in.
+        application_answers: {
+          answered_count: answers.answered_count,
+          unanswered_count: answers.unanswered_count,
+          unanswered: answers.unanswered,
+          contract: answers.contract
+        },
         // Only the entries that are actually a problem: a path that cannot be read and
         // whose document has not been uploaded either.
         unreadable_documents: configuredPaths.filter((entry) => !entry.readable && !entry.uploaded),
@@ -789,6 +806,47 @@ async function main() {
         items,
         missing: requested.filter((url) => !foundUrls.has(url))
       });
+    }
+  );
+
+  mcpServer.registerTool(
+    "get_application_answers",
+    {
+      description:
+        "The applicant's stored answers to the questions application forms ask -- work authorization, sponsorship, salary expectation, notice period, relocation, and the rest. Read this before filling any form. Questions come back split into `answers` (stored, safe to use as written) and `unanswered` (empty). An unanswered question must be put to the user and its answer recorded with set_application_answer; it must never be inferred from the resume, guessed from the posting, carried over from a similar application, or left as a plausible-looking placeholder. A wrong answer here is submitted under the applicant's name and cannot be retracted."
+    },
+    async () => {
+      const mcpSettings = await getMcpSettings();
+      ensureMcpAgentEnabled(mcpSettings);
+      return asToolResult(await getApplicationAnswerSummary());
+    }
+  );
+
+  mcpServer.registerTool(
+    "set_application_answer",
+    {
+      description:
+        "Record an answer the user has explicitly given, so the next application does not have to ask again. Only for values the user actually stated in conversation or confirmed -- this is a memory of what they said, not a place to persist an inference. If you did not hear it from them, ask instead of writing. Use the key from get_application_answers where one fits; a new slug creates a custom question.",
+      inputSchema: {
+        key: z.string(),
+        value: z.string(),
+        notes: z.string().optional(),
+        label: z.string().optional(),
+        category: z.string().optional()
+      }
+    },
+    async (args) => {
+      const mcpSettings = await getMcpSettings();
+      ensureMcpAgentEnabled(mcpSettings);
+      return asToolResult(
+        await setApplicationAnswer({
+          key: args?.key,
+          value: args?.value,
+          notes: args?.notes,
+          label: args?.label,
+          category: args?.category
+        })
+      );
     }
   );
 

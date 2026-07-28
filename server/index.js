@@ -93,6 +93,7 @@ const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getS
 const { listPostingsWithFilters, setPostingIgnoredState, getCounts, getWideScanStats } = require("./services/postings.js");
 const { getPostingFilterOptions } = require("./services/filter-options.js");
 const { extractDocumentText, getApplicantDocument, saveApplicantDocument, listApplicantDocuments, deleteApplicantDocument, checkConfiguredDocumentPaths, normalizeDocumentKind, MAX_DOCUMENT_KEY_LENGTH, APPLICANT_DOCUMENT_KINDS } = require("./services/applicant-documents.js");
+const { ensureApplicationAnswersTable, listApplicationAnswers, setApplicationAnswers, clearApplicationAnswer } = require("./services/application-answers.js");
 const { getDb, setDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
 
 const cors = require("cors");
@@ -604,6 +605,7 @@ async function initDb() {
   await ensurePersonalInformationTable();
   await ensureApplicationsTable();
   await ensureBlockedCompaniesTable();
+  await ensureApplicationAnswersTable();
   await ensureSyncServiceSettingsTable();
   await loadSyncServiceSettingsIntoRuntime();
   await ensureCompaniesTableSchema();
@@ -1725,6 +1727,34 @@ function createServer() {
         content
       });
       res.json({ ok: true, ...saved });
+    } catch (error) {
+      res.status(400).json({ ok: false, error: String(error?.message || error) });
+    }
+  });
+
+  // The answers application forms ask for. Seeded with the standard questions at empty
+  // values; an empty value means "still to ask the user", never "fill this in yourself".
+  app.get("/settings/application-answers", async (_req, res) => {
+    try {
+      res.json({ ok: true, items: await listApplicationAnswers() });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: String(error?.message || error) });
+    }
+  });
+
+  // Accepts one {key, value, ...} or {items: [...]} for a bulk fill.
+  app.put("/settings/application-answers", async (req, res) => {
+    try {
+      const items = Array.isArray(req.body?.items) ? req.body.items : [req.body];
+      res.json({ ok: true, saved: await setApplicationAnswers(items) });
+    } catch (error) {
+      res.status(400).json({ ok: false, error: String(error?.message || error) });
+    }
+  });
+
+  app.delete("/settings/application-answers/:key", async (req, res) => {
+    try {
+      res.json({ ok: true, ...(await clearApplicationAnswer(req.params.key)) });
     } catch (error) {
       res.status(400).json({ ok: false, error: String(error?.message || error) });
     }

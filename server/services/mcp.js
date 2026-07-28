@@ -139,8 +139,9 @@ function buildMcpRunbook(settings, personalInformation, candidates) {
       "Shortlist with find_posting_candidates (saved preferences) or query_postings (include/exclude terms, pay floor, recency). Use find_similar_postings to surface roles whose responsibilities match the resume even when the title would never have been guessed.",
       "Screen each shortlisted posting with get_posting_details and weigh its description against the resume before opening anything in a browser. Check location_conflict: when true, the description restricts hiring to fewer places than the header lists, and hiring_locations holds the ones that count.",
       "Call ignore_posting for postings that are not a fit, so no later run resurfaces them.",
-      "For each posting worth applying to, draft the cover letter with draft_cover_letter (pass document=<key> to write from the matching resume variant) and assemble the answers the form will need from applicantee information.",
-      "Open job_posting_url and fill in what can be filled from the applicant's own details.",
+      "For each posting worth applying to, draft the cover letter with draft_cover_letter (pass document=<key> to write from the matching resume variant).",
+      "Call get_application_answers before touching a form. Anything it lists as unanswered -- work authorization, salary expectation, notice period and the rest -- must be asked of the user, never inferred from the resume or the posting and never left as a plausible placeholder. Record what they tell you with set_application_answer so the next application does not ask again.",
+      "Open job_posting_url and fill in what can be filled from the applicant's own details and their stored answers.",
       "Stop at the authentication boundary. If the application requires creating an account, signing in, solving a captcha, or entering payment or government-identification details, do not attempt it: report what is prepared, name the posting and what the form is asking for, and let the user finish. requires_account on a posting flags this in advance where it was detected at scrape time.",
       "If dry_run_only is true, stop before final submit and return a dry-run result.",
       "When the user confirms an application was submitted, call record_application_result with commit=true; consult list_applications when unsure whether a posting was already handled."
@@ -154,6 +155,9 @@ function buildMcpRunbook(settings, personalInformation, candidates) {
       // hCaptcha), so an agent holding credentials bought very little and stored a
       // reusable password in a plaintext settings row to do it.
       never_authenticate_as_user: true,
+      // A fabricated screening answer is submitted under the applicant's name and cannot
+      // be retracted, so a missing one is always a question for the user.
+      never_invent_application_answers: true,
       hand_off_at: [
         "account creation",
         "sign-in",

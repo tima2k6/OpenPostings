@@ -19,6 +19,7 @@
     "test:backend:location-filter": "node server/tests/location-state-filter.test.js",
     "test:backend:mcp-candidate-filters": "node server/tests/mcp-candidate-filters.test.js",
     "test:backend:applicant-documents": "node server/tests/applicant-documents.test.js",
+    "test:backend:application-answers": "node server/tests/application-answers.test.js",
     "test:filter-normalize": "node server/tests/filter-normalize.test.js",
     "test:backend:api-request-errors": "node server/tests/api-request-errors.test.js",
     "test:backend:db-browser": "node server/tests/db-browser.test.js",
