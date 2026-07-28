@@ -63,7 +63,7 @@ function escapeLikeTerm(term) {
 // narrow silently loses postings. Only filters that can be proven superset-safe against a
 // stored column are included; ats, industry, location and remote all match on values
 // derived at read time (inferred from the URL, joined from companies) and are left to JS.
-function buildCandidatePrefilter({ searchTerms, payMinFilter, payMaxFilter, payPeriods, stateCodes }) {
+function buildCandidatePrefilter({ searchTerms, payMinFilter, payMaxFilter, payPeriods, stateCodes, includeUnknownPay = true }) {
   const clauses = [];
   const params = [];
 
@@ -85,22 +85,30 @@ function buildCandidatePrefilter({ searchTerms, payMinFilter, payMaxFilter, payP
     params.push(pattern, pattern, pattern);
   }
 
-  // Mirrors rowMatchesCompensationRangeFilter. A row with no usable pay figure fails that
-  // filter outright once a range is set, and only 4% of stored rows carry one, so this is
-  // where the branch sheds the most work.
+  // Mirrors rowMatchesCompensationRangeFilter, including its treatment of unknown pay:
+  // when unknowns are kept (the default), a row with no figure must survive the prefilter
+  // too, otherwise the SQL narrows below what JS would keep and postings vanish silently.
+  // When unknowns are excluded, only ~4% of rows carry a figure, so this is where the
+  // branch sheds the most work.
   const hasRangeFilter = Number.isFinite(payMinFilter) || Number.isFinite(payMaxFilter);
   if (hasRangeFilter) {
-    clauses.push(`AND (COALESCE(pay_min, 0) > 0 OR COALESCE(pay_max, 0) > 0)`);
+    const knownPayClauses = [`(COALESCE(pay_min, 0) > 0 OR COALESCE(pay_max, 0) > 0)`];
     if (Number.isFinite(payMinFilter)) {
       // rowUpper >= selectedPayMin, where rowUpper falls back to pay_min.
-      clauses.push(`AND (CASE WHEN COALESCE(pay_max, 0) > 0 THEN pay_max ELSE pay_min END) >= ?`);
+      knownPayClauses.push(`(CASE WHEN COALESCE(pay_max, 0) > 0 THEN pay_max ELSE pay_min END) >= ?`);
       params.push(payMinFilter);
     }
     if (Number.isFinite(payMaxFilter)) {
       // rowLower <= selectedPayMax, where rowLower falls back to pay_max.
-      clauses.push(`AND (CASE WHEN COALESCE(pay_min, 0) > 0 THEN pay_min ELSE pay_max END) <= ?`);
+      knownPayClauses.push(`(CASE WHEN COALESCE(pay_min, 0) > 0 THEN pay_min ELSE pay_max END) <= ?`);
       params.push(payMaxFilter);
     }
+    const knownPay = knownPayClauses.join("\n    AND ");
+    clauses.push(
+      includeUnknownPay
+        ? `AND ((COALESCE(pay_min, 0) <= 0 AND COALESCE(pay_max, 0) <= 0) OR (${knownPay}))`
+        : `AND (${knownPay})`
+    );
   }
 
   // rowMatchesLocationFilters ANDs the state test: when any state is selected, every row it
@@ -434,6 +442,9 @@ async function listPostingsWithFilters(options = {}) {
     .filter(Boolean);
   const payMinFilter = normalizePayFilterNumber(options?.pay_min);
   const payMaxFilter = normalizePayFilterNumber(options?.pay_max);
+  // Most rows carry no pay figure at all, so a pay range that dropped them excluded whole
+  // employers rather than out-of-range offers. Unknown pay stays in unless opted out.
+  const includeUnknownPay = normalizeBoolean(options?.include_unknown_pay, true);
   const educationLevels = normalizeEducationLevels(options?.education_levels);
   const stateCodes = normalizeStringArray(options?.states).map((state) => state.toUpperCase());
   const countyFilters = parseCountyFilters(normalizeStringArray(options?.counties));
@@ -445,6 +456,10 @@ async function listPostingsWithFilters(options = {}) {
   const includeIgnored = normalizeBoolean(options?.include_ignored, false);
   // Defaults true so existing callers, including the MCP tools, are unaffected.
   const includeDescriptions = normalizeBoolean(options?.include_descriptions, true);
+  // Postings verified gone (404, or a page that says the role is filled/closed) stay out
+  // of candidate lists unless explicitly asked for. 'unverified' rows are still shown --
+  // most rows have never been fetched, and absence of proof is not proof of death.
+  const includeDead = normalizeBoolean(options?.include_dead, false);
   const hasStructuredFilters =
     atsFilters.length > 0 ||
     industryKeys.length > 0 ||
@@ -467,7 +482,7 @@ async function listPostingsWithFilters(options = {}) {
     if (includeApplied && includeIgnored) {
       rows = await db.all(
         `
-          SELECT id, company_name, position_name, job_posting_url, posting_date, location, job_description, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
+          SELECT id, company_name, position_name, job_posting_url, posting_date, location, status, location_conflict, requires_account, job_description, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
           FROM Postings
           WHERE hidden = 0
             AND last_seen_epoch >= ?
@@ -485,7 +500,7 @@ async function listPostingsWithFilters(options = {}) {
     } else {
       rows = await db.all(
         `
-          SELECT p.id, p.company_name, p.position_name, p.job_posting_url, p.posting_date, p.location, p.job_description, p.compensation_type, p.education_levels, p.pay_min, p.pay_max, p.pay_currency, p.pay_period, p.pay_raw, p.first_seen_epoch, p.last_seen_epoch
+          SELECT p.id, p.company_name, p.position_name, p.job_posting_url, p.posting_date, p.location, p.status, p.location_conflict, p.requires_account, p.job_description, p.compensation_type, p.education_levels, p.pay_min, p.pay_max, p.pay_currency, p.pay_period, p.pay_raw, p.first_seen_epoch, p.last_seen_epoch
           FROM Postings p
           LEFT JOIN posting_application_state s
             ON s.job_posting_url = p.job_posting_url
@@ -527,11 +542,12 @@ async function listPostingsWithFilters(options = {}) {
       payMinFilter,
       payMaxFilter,
       payPeriods,
-      stateCodes
+      stateCodes,
+      includeUnknownPay
     });
     rows = await db.all(
       `
-        SELECT id, company_name, position_name, job_posting_url, posting_date, location, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
+        SELECT id, company_name, position_name, job_posting_url, posting_date, location, status, location_conflict, requires_account, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
         FROM Postings
         WHERE hidden = 0
           AND last_seen_epoch >= ?
@@ -642,6 +658,14 @@ async function listPostingsWithFilters(options = {}) {
       ...row,
       posting_date: postingDate || null,
       job_description: normalizedJobDescription,
+      status: String(row?.status || "unverified"),
+      // True when the description restricts hiring to fewer places than the header lists,
+      // so a candidate does not shortlist a city the employer will not hire into.
+      location_conflict: Boolean(Number(row?.location_conflict || 0)),
+      requires_account:
+        row?.requires_account === null || row?.requires_account === undefined
+          ? null
+          : Boolean(Number(row?.requires_account)),
       pay_currency: normalizeCompensationCurrencyCode(row?.pay_currency),
       pay_raw: String(row?.pay_raw || "").trim() || null
     };
@@ -701,7 +725,8 @@ async function listPostingsWithFilters(options = {}) {
         row?.pay_period,
         payMinFilter,
         payMaxFilter,
-        payPeriods
+        payPeriods,
+        includeUnknownPay
       );
       if (!matchesCompensationRange) return false;
 
@@ -745,10 +770,17 @@ async function listPostingsWithFilters(options = {}) {
   if (!includeIgnored) {
     items = items.filter((item) => !item.ignored);
   }
+  if (!includeDead) {
+    items = items.filter((item) => String(item?.status || "unverified") !== "dead");
+  }
 
   return {
     items,
     count: items.length,
+    // How many returned items carry no pay figure -- the rows the pay range kept blindly.
+    pay_unknown_count: items.filter(
+      (item) => !(Number(item?.pay_min) > 0) && !(Number(item?.pay_max) > 0)
+    ).length,
     limit,
     offset,
     filters: {
@@ -760,6 +792,7 @@ async function listPostingsWithFilters(options = {}) {
       pay_periods: payPeriods,
       pay_min: payMinFilter,
       pay_max: payMaxFilter,
+      include_unknown_pay: includeUnknownPay,
       education_levels: educationLevels,
       states: stateCodes,
       counties: countyFilters.map((filter) =>
@@ -852,6 +885,9 @@ async function getPostingsByUrls(jobPostingUrls) {
   const rows = await db.all(
     `
       SELECT id, company_name, position_name, job_posting_url, posting_date, location,
+             city, state_region, country, is_remote, locations_json,
+             hiring_locations_json, location_conflict, status, dead_since_epoch,
+             requires_account, description_fetched_at,
              job_description, compensation_type, education_levels, pay_min, pay_max,
              pay_currency, pay_period, pay_raw, hidden, first_seen_epoch, last_seen_epoch
       FROM Postings
@@ -862,10 +898,29 @@ async function getPostingsByUrls(jobPostingUrls) {
 
   const items = rows.map((row) => {
     const ats = inferAtsFromJobPostingUrl(row?.job_posting_url);
+    let locations = [];
+    let hiringLocations = [];
+    try {
+      locations = JSON.parse(row?.locations_json || "[]");
+      hiringLocations = JSON.parse(row?.hiring_locations_json || "[]");
+    } catch {}
     return {
       ...row,
       ats,
       location: String(row?.location || "").trim() || inferPostingLocationFromJobUrl(row?.job_posting_url) || "",
+      locations_json: undefined,
+      hiring_locations_json: undefined,
+      locations,
+      // Non-empty when the description restricts hiring to fewer places than the
+      // header lists; location_conflict is set when the two disagree.
+      hiring_locations: hiringLocations,
+      location_conflict: Boolean(Number(row?.location_conflict || 0)),
+      is_remote: Boolean(Number(row?.is_remote || 0)),
+      requires_account:
+        row?.requires_account === null || row?.requires_account === undefined
+          ? null
+          : Boolean(Number(row?.requires_account)),
+      status: String(row?.status || "unverified"),
       education_levels: parseEducationLevels(row?.education_levels),
       job_description: normalizeJobDescription(row?.job_description, ats),
       pay_currency: normalizeCompensationCurrencyCode(row?.pay_currency),

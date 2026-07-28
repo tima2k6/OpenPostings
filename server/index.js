@@ -92,7 +92,7 @@ const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable,
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
 const { listPostingsWithFilters, setPostingIgnoredState, getCounts, getWideScanStats } = require("./services/postings.js");
 const { getPostingFilterOptions } = require("./services/filter-options.js");
-const { extractDocumentText, getApplicantDocument, saveApplicantDocument, normalizeDocumentKind, APPLICANT_DOCUMENT_KINDS } = require("./services/applicant-documents.js");
+const { extractDocumentText, getApplicantDocument, saveApplicantDocument, listApplicantDocuments, deleteApplicantDocument, checkConfiguredDocumentPaths, normalizeDocumentKind, MAX_DOCUMENT_KEY_LENGTH, APPLICANT_DOCUMENT_KINDS } = require("./services/applicant-documents.js");
 const { getDb, setDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
 
 const cors = require("cors");
@@ -578,6 +578,12 @@ async function initDb() {
   const db = getDb();
 
   await db.exec(`
+    -- Other processes legitimately hold the write lock for moments at a time (the MCP
+    -- server's startup DDL, maintenance scripts). Without a timeout a locked write fails
+    -- instantly with SQLITE_BUSY, and the sync's storage-error handling once escalated
+    -- exactly that into dropping the Postings table. Wait instead.
+    PRAGMA busy_timeout = 30000;
+
     PRAGMA journal_mode = WAL;
 
     CREATE TABLE IF NOT EXISTS companies (
@@ -719,6 +725,55 @@ async function ensurePostingsTable() {
     await db.exec(`ALTER TABLE Postings ADD COLUMN pay_raw TEXT;`);
   }
 
+  // Structured location fields, parsed from the raw location string at ingest
+  // (helpers/parse-location.js). The raw string stays in `location` for display; these
+  // are what filters match against, so a Kent WA filter cannot match Kent, England.
+  if (!existingColumns.has("city")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN city TEXT;`);
+  }
+  if (!existingColumns.has("state_region")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN state_region TEXT;`);
+  }
+  if (!existingColumns.has("country")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN country TEXT;`);
+  }
+  if (!existingColumns.has("is_remote")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN is_remote INTEGER NOT NULL DEFAULT 0;`);
+  }
+  if (!existingColumns.has("locations_json")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN locations_json TEXT;`);
+  }
+
+  // Where the body of the description says hiring is restricted to a subset of the header
+  // locations, the subset lives here and location_conflict flags the disagreement.
+  if (!existingColumns.has("hiring_locations_json")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN hiring_locations_json TEXT;`);
+  }
+  if (!existingColumns.has("location_conflict")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN location_conflict INTEGER NOT NULL DEFAULT 0;`);
+  }
+
+  // When the description text was last fetched from the posting page, as opposed to
+  // arriving inline with the board listing.
+  if (!existingColumns.has("description_fetched_at")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN description_fetched_at INTEGER;`);
+  }
+
+  // Liveness: 'active' (verified reachable), 'dead' (404 or soft-404), 'unverified'
+  // (never checked). Dead postings are excluded from candidate lists by default.
+  if (!existingColumns.has("status")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN status TEXT NOT NULL DEFAULT 'unverified';`);
+  }
+  if (!existingColumns.has("dead_since_epoch")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN dead_since_epoch INTEGER;`);
+  }
+
+  // Whether the application flow demands a candidate account (NULL = not yet detected),
+  // so the UI can flag applications that need a manual sign-in.
+  if (!existingColumns.has("requires_account")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN requires_account INTEGER;`);
+  }
+
   await db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_postings_job_posting_url
       ON Postings(job_posting_url);
@@ -801,8 +856,6 @@ async function ensureApplicationsTable() {
       id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
       enabled INTEGER NOT NULL DEFAULT 0,
       preferred_agent_name TEXT NOT NULL DEFAULT 'OpenPostings Agent',
-      agent_login_email TEXT NOT NULL DEFAULT '',
-      agent_login_password TEXT NOT NULL DEFAULT '',
       mfa_login_email TEXT NOT NULL DEFAULT '',
       mfa_login_notes TEXT NOT NULL DEFAULT '',
       dry_run_only INTEGER NOT NULL DEFAULT 1,
@@ -827,7 +880,6 @@ async function ensureApplicationsTable() {
         id,
         enabled,
         preferred_agent_name,
-        agent_login_email,
         mfa_login_email,
         mfa_login_notes,
         dry_run_only,
@@ -841,7 +893,7 @@ async function ensureApplicationsTable() {
         preferred_states,
         preferred_counties,
         instructions_for_agent
-      ) VALUES (1, 0, ?, '', '', '', 1, 1, 10, '', 'all', '[]', '[]', '[]', '[]', '[]', '')
+      ) VALUES (1, 0, ?, '', '', 1, 1, 10, '', 'all', '[]', '[]', '[]', '[]', '[]', '')
       ON CONFLICT(id) DO NOTHING;
     `,
     [MCP_SETTINGS_DEFAULTS.preferred_agent_name]
@@ -875,11 +927,16 @@ async function ensureApplicationsTable() {
       ON posting_application_state(ignored);
   `);
 
-  if (!mcpSettingsColumnNames.has("agent_login_password")) {
-    await db.exec(`
-      ALTER TABLE McpSettings
-      ADD COLUMN agent_login_password TEXT NOT NULL DEFAULT '';
-    `);
+  // These columns used to hold the agent's login email and password in plaintext, handed
+  // to the agent so it could create accounts and sign in as the user. That capability is
+  // gone. SQLite before 3.35 cannot DROP COLUMN and the column may be NOT NULL, so the
+  // values are overwritten with empty strings here and simply never read again -- which
+  // also scrubs the secret from any database that already stored one.
+  if (mcpSettingsColumnNames.has("agent_login_password")) {
+    await db.run(`UPDATE McpSettings SET agent_login_password = '' WHERE agent_login_password <> '';`);
+  }
+  if (mcpSettingsColumnNames.has("agent_login_email")) {
+    await db.run(`UPDATE McpSettings SET agent_login_email = '' WHERE agent_login_email <> '';`);
   }
   if (!mcpSettingsColumnNames.has("preferred_regions")) {
     await db.exec(`
@@ -1071,6 +1128,44 @@ function createServer() {
       res.json({ items });
     } catch (error) {
       res.status(500).json({ error: String(error?.message || error) });
+    }
+  });
+
+  // Fetch posting pages for rows missing a description (or re-verify old fetches with
+  // refresh_all=true). Persists description, prose-parsed pay, liveness status,
+  // hiring-location restrictions and the requires-account flag.
+  app.post("/descriptions/backfill", async (req, res) => {
+    try {
+      const { runDescriptionBackfill } = require("./services/posting-page-fetcher.js");
+      res.json(
+        await runDescriptionBackfill({
+          limit: parseNonNegativeInteger(req.body?.limit) || 200,
+          concurrency: parseNonNegativeInteger(req.body?.concurrency) || 4,
+          refresh_all: normalizeBoolean(req.body?.refresh_all, false)
+        })
+      );
+    } catch (error) {
+      res.status(500).json({ error: String(error?.message || error) });
+    }
+  });
+
+  // Refreshes the FTS index behind similar_to. Incremental unless rebuild=true.
+  app.post("/semantic/reindex", async (req, res) => {
+    try {
+      const { rebuildSemanticIndex } = require("./services/semantic-search.js");
+      res.json(await rebuildSemanticIndex({ rebuild: normalizeBoolean(req.body?.rebuild, false) }));
+    } catch (error) {
+      res.status(500).json({ error: String(error?.message || error) });
+    }
+  });
+
+  // Relevance ranking over descriptions; see server/services/semantic-search.js.
+  app.post("/semantic/similar", async (req, res) => {
+    try {
+      const { findSimilarPostings } = require("./services/semantic-search.js");
+      res.json(await findSimilarPostings(req.body || {}));
+    } catch (error) {
+      res.status(400).json({ error: String(error?.message || error) });
     }
   });
 
@@ -1596,9 +1691,15 @@ function createServer() {
   // the agent being enabled -- the document belongs to profile setup, like the rest of
   // /settings, and uploading it before enabling the agent is the natural order.
   app.post("/settings/applicant-documents", async (req, res) => {
-    const kind = normalizeDocumentKind(req.body?.kind || "resume");
+    // Any slug is accepted, so several tailored resumes can coexist under their own keys.
+    const kind = normalizeDocumentKind(req.body?.kind || req.body?.key || "resume");
     if (!kind) {
-      return res.status(400).json({ ok: false, error: `kind must be one of: ${APPLICANT_DOCUMENT_KINDS.join(", ")}` });
+      return res.status(400).json({
+        ok: false,
+        error:
+          "kind must be a slug: lowercase letters, digits and underscores, starting with a letter " +
+          `(for example 'resume', 'resume_hospitality', 'portfolio'), at most ${MAX_DOCUMENT_KEY_LENGTH} characters.`
+      });
     }
 
     const contentBase64 = String(req.body?.content_base64 || "").trim();
@@ -1620,6 +1721,7 @@ function createServer() {
       const saved = await saveApplicantDocument({
         kind,
         file_name: req.body?.file_name,
+        label: req.body?.label,
         content
       });
       res.json({ ok: true, ...saved });
@@ -1629,15 +1731,25 @@ function createServer() {
   });
 
   app.get("/settings/applicant-documents", async (_req, res) => {
-    const items = [];
-    for (const kind of APPLICANT_DOCUMENT_KINDS) {
-      const stored = await getApplicantDocument(kind);
-      if (stored) {
-        const { text, ...meta } = stored;
-        items.push(meta);
-      }
+    try {
+      res.json({
+        ok: true,
+        items: await listApplicantDocuments(),
+        // Readability of the paths configured in personal information, so an unreachable
+        // one is visible here rather than only when an application is being drafted.
+        configured_paths: await checkConfiguredDocumentPaths()
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: String(error?.message || error) });
     }
-    res.json({ ok: true, items });
+  });
+
+  app.delete("/settings/applicant-documents/:kind", async (req, res) => {
+    try {
+      res.json({ ok: true, ...(await deleteApplicantDocument(req.params.kind)) });
+    } catch (error) {
+      res.status(400).json({ ok: false, error: String(error?.message || error) });
+    }
   });
 
   // Serves the original bytes back, so the machine driving a browser can attach the real

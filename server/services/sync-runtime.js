@@ -2,6 +2,7 @@ const { normalizeSyncEnabledAts, normalizeAtsFilterValue, inferPostingLocationFr
 const { getSyncPromise, setSyncPromise, getDb, setDb, getPostingLocationByJobUrl, setPostingLocationByJobUrl, getSyncEnabledAts, getSyncDownloadJobDescriptions, getAtsRequestQueueConcurrency } = require("./runtime-context.js");
 const { nowEpochSeconds, getPostingFreshnessWindowSeconds, shouldStorePostingByDate } = require("../helpers/normalize-numbers")
 const { normalizeCompensationType, serializeEducationLevels, normalizeCompensationCurrencyCode, normalizeCompensationPayPeriod } = require("../helpers/description-filters")
+const { parsePostingLocation, serializeLocationsJson } = require("../helpers/parse-location.js")
 
 const { collectPostingsForWorkdayCompany } = require("../ats/workday/service.js");
 const { collectPostingsForAshbyCompany } = require("../ats/ashby/service.js");
@@ -1107,6 +1108,24 @@ async function runAtsSyncInternal() {
       excluded_during_sync_by_posting_date: excludedByPostingDate,
       errors: errors.slice(0, 30)
     };
+
+    // Board listings rarely carry the job body, so after each pass a bounded batch of
+    // postings gets its own page fetched for the description (plus liveness, prose pay,
+    // and hiring-restriction detection). Fire-and-forget: description fetching must
+    // never extend the pass or fail it. Lazy require to keep module load order simple.
+    if (getSyncDownloadJobDescriptions()) {
+      const { runDescriptionBackfill } = require("./posting-page-fetcher.js");
+      runDescriptionBackfill({ limit: 300 })
+        .then((summary) => {
+          syncStatus.last_description_backfill = summary;
+          console.log(
+            `[OpenPostings API] description backfill: ${summary.updated} updated, ${summary.dead} dead, ${summary.failed} failed of ${summary.scanned}`
+          );
+        })
+        .catch((error) => {
+          console.error("[OpenPostings API] description backfill failed:", error);
+        });
+    }
   } catch (error) {
     if (syncGeneration === passGeneration) {
       syncStatus.last_error = String(error?.message || error);
@@ -1192,6 +1211,13 @@ async function upsertPostingsBatch(postings, seenEpoch) {
       const payCurrency = normalizeCompensationCurrencyCode(posting?.pay_currency);
       const payPeriod = normalizeCompensationPayPeriod(posting?.pay_period);
       const payRaw = String(posting?.pay_raw || "").trim() || null;
+      const locationValue = String(posting?.location || "").trim() || null;
+      // Workday and similar boards store no location; the display path infers one from the
+      // URL, so the structured parse works from the same fallback to stay consistent.
+      const parsedLocation = parsePostingLocation(
+        locationValue || inferPostingLocationFromJobUrl(jobPostingUrl) || ""
+      );
+      const locationsJson = serializeLocationsJson(parsedLocation.locations);
 
       await db.run(
         `
@@ -1201,6 +1227,11 @@ async function upsertPostingsBatch(postings, seenEpoch) {
             job_posting_url,
             posting_date,
             location,
+            city,
+            state_region,
+            country,
+            is_remote,
+            locations_json,
             job_description,
             compensation_type,
             education_levels,
@@ -1214,12 +1245,21 @@ async function upsertPostingsBatch(postings, seenEpoch) {
             hidden_at_epoch,
             last_seen_epoch
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)
           ON CONFLICT(job_posting_url) DO UPDATE SET
             company_name = excluded.company_name,
             position_name = excluded.position_name,
             posting_date = COALESCE(excluded.posting_date, Postings.posting_date),
             location = COALESCE(excluded.location, Postings.location),
+            -- The parsed fields follow the same rule as the raw string they were parsed
+            -- from: a sync pass that brought no location must not blank out what an
+            -- earlier pass parsed. When the stored location is itself empty, the incoming
+            -- parse (possibly URL-inferred) is still better than nothing.
+            city = CASE WHEN excluded.location IS NOT NULL OR Postings.location IS NULL THEN excluded.city ELSE Postings.city END,
+            state_region = CASE WHEN excluded.location IS NOT NULL OR Postings.location IS NULL THEN excluded.state_region ELSE Postings.state_region END,
+            country = CASE WHEN excluded.location IS NOT NULL OR Postings.location IS NULL THEN excluded.country ELSE Postings.country END,
+            is_remote = CASE WHEN excluded.location IS NOT NULL OR Postings.location IS NULL THEN excluded.is_remote ELSE Postings.is_remote END,
+            locations_json = CASE WHEN excluded.location IS NOT NULL OR Postings.location IS NULL THEN excluded.locations_json ELSE Postings.locations_json END,
             job_description = COALESCE(excluded.job_description, Postings.job_description),
             compensation_type = COALESCE(excluded.compensation_type, Postings.compensation_type),
             education_levels = COALESCE(excluded.education_levels, Postings.education_levels),
@@ -1242,7 +1282,12 @@ async function upsertPostingsBatch(postings, seenEpoch) {
           positionName,
           jobPostingUrl,
           postingDate,
-          String(posting?.location || "").trim() || null,
+          locationValue,
+          parsedLocation.city,
+          parsedLocation.state_region,
+          parsedLocation.country,
+          parsedLocation.is_remote,
+          locationsJson,
           jobDescription,
           compensationType,
           educationLevels,
@@ -1425,14 +1470,20 @@ async function getActiveJobPostingUrls() {
   return new Set(rows.map((row) => String(row?.job_posting_url || "")));
 }
 
+// Only genuine corruption justifies rebuilding the table, because the "recovery" is DROP
+// TABLE Postings -- every stored posting is destroyed and only re-accumulates as syncs
+// re-crawl the boards. SQLITE_BUSY and "database is locked" used to be in this list, and
+// they are the opposite of corruption: another healthy connection (the MCP server, a
+// backfill script, a second API instance) holding the write lock for a moment. Treating
+// contention as corruption meant any concurrent writer could wipe the table -- and did,
+// deleting 832k rows on 2026-07-27. Contention is handled by the busy_timeout set at
+// open; if it still surfaces, failing the batch and retrying next pass loses nothing.
 function isRecoverablePostingStorageError(error) {
   const message = String(error?.message || error || "");
   if (!message) return false;
   return (
     /SQLITE_CORRUPT/i.test(message) ||
-    /database disk image is malformed/i.test(message) ||
-    /SQLITE_BUSY/i.test(message) ||
-    /database is locked/i.test(message)
+    /database disk image is malformed/i.test(message)
   );
 }
 
@@ -1458,7 +1509,18 @@ async function createCanonicalPostingsTable() {
       first_seen_epoch INTEGER,
       last_seen_epoch INTEGER,
       hidden INTEGER NOT NULL DEFAULT 0,
-      hidden_at_epoch INTEGER
+      hidden_at_epoch INTEGER,
+      city TEXT,
+      state_region TEXT,
+      country TEXT,
+      is_remote INTEGER NOT NULL DEFAULT 0,
+      locations_json TEXT,
+      hiring_locations_json TEXT,
+      location_conflict INTEGER NOT NULL DEFAULT 0,
+      description_fetched_at INTEGER,
+      status TEXT NOT NULL DEFAULT 'unverified',
+      dead_since_epoch INTEGER,
+      requires_account INTEGER
     );
 
     CREATE INDEX IF NOT EXISTS idx_postings_company_name
@@ -1486,6 +1548,16 @@ async function createCanonicalPostingsTable() {
 
 async function rebuildPostingsTableStorage() {
   const db = getDb()
+  // Destroys every stored posting. Only reachable for confirmed on-disk corruption, and
+  // even then it deserves a loud trace in the log.
+  let rowCount = "unknown";
+  try {
+    const row = await db.get(`SELECT COUNT(*) AS c FROM Postings;`);
+    rowCount = String(row?.c);
+  } catch {}
+  console.error(
+    `[OpenPostings API] REBUILDING Postings table storage after corruption; dropping ${rowCount} rows`
+  );
   await db.exec(`DROP TABLE IF EXISTS Postings;`);
   await createCanonicalPostingsTable();
 }

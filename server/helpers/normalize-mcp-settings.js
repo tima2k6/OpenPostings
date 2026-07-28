@@ -3,12 +3,16 @@ const { normalizeBoolean, parseNonNegativeInteger } = require("./normalize-numbe
 const { parseRegionFilters, parseCountryFilters } = require("../helpers/description-filters")
 const MCP_REMOTE_OPTIONS = new Set(["all", "remote", "hybrid", "non_remote"]);
 
+// agent_login_email and agent_login_password used to live here and were handed to the
+// agent in plaintext so it could create accounts and sign in as the user. Both are gone:
+// an agent should not be authenticating as anyone, and the ATS platforms this applies to
+// gate submission behind account creation plus a captcha regardless, so the credentials
+// bought almost nothing while keeping a reusable password in a settings row. The runbook
+// now hands off at the authentication boundary. mfa_login_notes survives as free text --
+// it is a note to the user about how they handle approvals, not a secret.
 const MCP_SETTINGS_DEFAULTS = {
   enabled: false,
   preferred_agent_name: "OpenPostings Agent",
-  agent_login_email: "",
-  agent_login_password: "",
-  mfa_login_email: "",
   mfa_login_notes: "",
   dry_run_only: true,
   require_final_approval: true,
@@ -32,15 +36,13 @@ function normalizeMcpRemotePreference(value) {
 function normalizeMcpSettingsInput(value = {}) {
   /** @type {any} */
   const source = value && typeof value === "object" ? value : {};
-  const agentLoginEmail = String(source.agent_login_email ?? MCP_SETTINGS_DEFAULTS.agent_login_email).trim();
 
+  // Credential fields are dropped rather than passed through, so a stored row, a settings
+  // POST or a migration from an older database cannot reintroduce them downstream.
   return {
     enabled: normalizeBoolean(source.enabled, MCP_SETTINGS_DEFAULTS.enabled),
     preferred_agent_name: String(source.preferred_agent_name ?? MCP_SETTINGS_DEFAULTS.preferred_agent_name).trim() ||
       MCP_SETTINGS_DEFAULTS.preferred_agent_name,
-    agent_login_email: agentLoginEmail,
-    agent_login_password: String(source.agent_login_password ?? MCP_SETTINGS_DEFAULTS.agent_login_password),
-    mfa_login_email: agentLoginEmail,
     mfa_login_notes: String(source.mfa_login_notes ?? MCP_SETTINGS_DEFAULTS.mfa_login_notes).trim(),
     dry_run_only: normalizeBoolean(source.dry_run_only, MCP_SETTINGS_DEFAULTS.dry_run_only),
     require_final_approval: normalizeBoolean(

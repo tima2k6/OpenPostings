@@ -35,11 +35,17 @@ function parseDoverCompany(urlString) {
   };
 }
 
+// Dover's per-job page lives at /apply/<slug>/<jobId>/ -- the shape its own careers page
+// links to. This used to build /jobs/<slug>/<jobId>, which Dover's client-side router
+// does not serve: it renders "404 - Page Not Found" for every posting while still
+// answering the HTTP request with 200 and the SPA shell, so nothing server-side noticed.
+// Every Dover posting stored before this fix carries an unreachable URL and needs a
+// re-sync (or the migration in scripts/fix-dover-urls.js) to become applyable.
 function buildDoverJobPostingUrl(slug, jobId) {
   const cleanSlug = cleanDoverText(slug);
   const cleanJobId = cleanDoverText(jobId);
   if (!cleanSlug || !cleanJobId) return "";
-  return `https://app.dover.com/jobs/${encodeURIComponent(cleanSlug)}/${encodeURIComponent(cleanJobId)}`;
+  return `https://app.dover.com/apply/${encodeURIComponent(cleanSlug)}/${encodeURIComponent(cleanJobId)}/`;
 }
 
 function buildDoverLocationLabel(locations) {

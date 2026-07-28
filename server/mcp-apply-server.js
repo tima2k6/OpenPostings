@@ -39,7 +39,13 @@ const {
   enrichPostingsWithApplicationState
 } = require("./services/postings.js");
 const { listApplications } = require("./services/applications.js");
-const { extractDocumentText, getApplicantDocument } = require("./services/applicant-documents.js");
+const {
+  extractDocumentText,
+  getApplicantDocument,
+  listApplicantDocuments,
+  checkConfiguredDocumentPaths,
+  normalizeDocumentKind
+} = require("./services/applicant-documents.js");
 const { runQuery, SORTABLE, MAX_ROWS } = require("./services/db-query.js");
 const { getPostingFilterOptions } = require("./services/filter-options.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime } = require("./services/sync-settings.js");
@@ -96,8 +102,6 @@ async function ensureTables() {
       id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
       enabled INTEGER NOT NULL DEFAULT 0,
       preferred_agent_name TEXT NOT NULL DEFAULT 'OpenPostings Agent',
-      agent_login_email TEXT NOT NULL DEFAULT '',
-      agent_login_password TEXT NOT NULL DEFAULT '',
       mfa_login_email TEXT NOT NULL DEFAULT '',
       mfa_login_notes TEXT NOT NULL DEFAULT '',
       dry_run_only INTEGER NOT NULL DEFAULT 1,
@@ -140,7 +144,6 @@ async function ensureTables() {
       id,
       enabled,
       preferred_agent_name,
-      agent_login_email,
       mfa_login_email,
       mfa_login_notes,
       dry_run_only,
@@ -154,7 +157,7 @@ async function ensureTables() {
       preferred_states,
       preferred_counties,
       instructions_for_agent
-    ) VALUES (1, 0, 'OpenPostings Agent', '', '', '', 1, 1, 10, '', 'all', '[]', '[]', '[]', '[]', '[]', '')
+    ) VALUES (1, 0, 'OpenPostings Agent', '', '', 1, 1, 10, '', 'all', '[]', '[]', '[]', '[]', '[]', '')
     ON CONFLICT(id) DO NOTHING;
   `);
 
@@ -181,11 +184,16 @@ async function ensureTables() {
       ADD COLUMN ignored_by_label TEXT NOT NULL DEFAULT '';
     `);
   }
-  if (!mcpSettingsColumnNames.has("agent_login_password")) {
-    await db.exec(`
-      ALTER TABLE McpSettings
-      ADD COLUMN agent_login_password TEXT NOT NULL DEFAULT '';
-    `);
+  // These columns used to hold the agent's login email and password in plaintext, handed
+  // to the agent so it could create accounts and sign in as the user. That capability is
+  // gone. SQLite before 3.35 cannot DROP COLUMN and the column may be NOT NULL, so the
+  // values are overwritten with empty strings here and simply never read again -- which
+  // also scrubs the secret from any database that already stored one.
+  if (mcpSettingsColumnNames.has("agent_login_password")) {
+    await db.run(`UPDATE McpSettings SET agent_login_password = '' WHERE agent_login_password <> '';`);
+  }
+  if (mcpSettingsColumnNames.has("agent_login_email")) {
+    await db.run(`UPDATE McpSettings SET agent_login_email = '' WHERE agent_login_email <> '';`);
   }
   // Mirrors the migrations in the API server. Without them a database whose McpSettings table
   // predates these columns makes every settings read fail here, because the shared reader
@@ -201,6 +209,30 @@ async function ensureTables() {
       ALTER TABLE McpSettings
       ADD COLUMN preferred_countries TEXT NOT NULL DEFAULT '[]';
     `);
+  }
+
+  // The query tools read the structured location and liveness columns, so a database the
+  // API server has not upgraded yet must still gain them here or every query errors.
+  // Mirrors ensurePostingsTable in server/index.js.
+  const postingsColumns = await db.all(`PRAGMA table_info('Postings');`);
+  if (postingsColumns.length > 0) {
+    const postingsColumnNames = new Set(postingsColumns.map((column) => String(column?.name || "")));
+    const postingsMigrations = [
+      ["city", "ALTER TABLE Postings ADD COLUMN city TEXT;"],
+      ["state_region", "ALTER TABLE Postings ADD COLUMN state_region TEXT;"],
+      ["country", "ALTER TABLE Postings ADD COLUMN country TEXT;"],
+      ["is_remote", "ALTER TABLE Postings ADD COLUMN is_remote INTEGER NOT NULL DEFAULT 0;"],
+      ["locations_json", "ALTER TABLE Postings ADD COLUMN locations_json TEXT;"],
+      ["hiring_locations_json", "ALTER TABLE Postings ADD COLUMN hiring_locations_json TEXT;"],
+      ["location_conflict", "ALTER TABLE Postings ADD COLUMN location_conflict INTEGER NOT NULL DEFAULT 0;"],
+      ["description_fetched_at", "ALTER TABLE Postings ADD COLUMN description_fetched_at INTEGER;"],
+      ["status", "ALTER TABLE Postings ADD COLUMN status TEXT NOT NULL DEFAULT 'unverified';"],
+      ["dead_since_epoch", "ALTER TABLE Postings ADD COLUMN dead_since_epoch INTEGER;"],
+      ["requires_account", "ALTER TABLE Postings ADD COLUMN requires_account INTEGER;"]
+    ];
+    for (const [columnName, ddl] of postingsMigrations) {
+      if (!postingsColumnNames.has(columnName)) await db.exec(ddl);
+    }
   }
 }
 
@@ -250,14 +282,18 @@ function buildQueryPostingsInput(args) {
     title_none: joinTerms(args?.title_none),
     company_any: joinTerms(args?.company_any),
     company_none: joinTerms(args?.company_none),
+    description_any: joinTerms(args?.description_any),
+    description_none: joinTerms(args?.description_none),
     location_any: joinTerms(args?.location_any),
     location_none: joinTerms(args?.location_none),
+    remote_only: normalizeBoolean(args?.remote_only, false) ? "1" : "",
     ats: joinTerms(args?.ats),
     states: joinTerms(args?.states),
     countries: joinTerms(args?.countries),
     regions: joinTerms(args?.regions),
     pay_min: args?.pay_min,
     pay_max: args?.pay_max,
+    include_unknown_pay: normalizeBoolean(args?.include_unknown_pay, true) ? "1" : "0",
     has_pay: normalizeBoolean(args?.has_pay, false) ? "1" : "",
     seen_days: args?.seen_days,
     found_days: args?.found_days,
@@ -307,6 +343,7 @@ async function findCandidates(options = {}) {
     pay_periods: normalizeStringArray(options.pay_periods),
     pay_min: options.pay_min,
     pay_max: options.pay_max,
+    include_unknown_pay: normalizeBoolean(options.include_unknown_pay, true),
     education_levels: normalizeStringArray(options.education_levels),
     states: resolveListFilter(options.states, settings.preferred_states, useSettings),
     counties: resolveListFilter(options.counties, settings.preferred_counties, useSettings),
@@ -316,6 +353,7 @@ async function findCandidates(options = {}) {
     hide_no_date: normalizeBoolean(options.hide_no_date, false),
     include_applied: normalizeBoolean(options.include_applied, false),
     include_ignored: normalizeBoolean(options.include_ignored, false),
+    include_dead: normalizeBoolean(options.include_dead, false),
     // Descriptions are the bulk of the payload, and an agent that only needs to rank titles
     // and open URLs does not want them in its context. Opt in per call.
     include_descriptions: normalizeBoolean(options.include_descriptions, false)
@@ -325,6 +363,7 @@ async function findCandidates(options = {}) {
     filters: result.filters,
     settings_applied: useSettings,
     count: result.count,
+    pay_unknown_count: result.pay_unknown_count,
     limit: result.limit,
     offset: result.offset,
     // The page is cut to `limit` before applied and ignored postings are dropped, so a full
@@ -554,15 +593,23 @@ async function main() {
   mcpServer.registerTool(
     "get_applicant_context",
     {
-      description: "Read applicantee information and MCP settings used by the apply agent."
+      description:
+        "Read applicantee information, MCP settings and the run playbook. Also lists the stored documents and the state of any file paths configured for them, so an unreadable document is known up front rather than surfacing as an error part-way through drafting an application. Contains no credentials: the agent prepares applications and hands off at the authentication boundary."
     },
     async () => {
       const personalInformation = await getPersonalInformation();
       const mcpSettings = await getMcpSettings();
       ensureMcpAgentEnabled(mcpSettings);
+      const documents = await listApplicantDocuments();
+      const configuredPaths = await checkConfiguredDocumentPaths();
       return asToolResult({
         personal_information: personalInformation,
         mcp_settings: mcpSettings,
+        documents,
+        document_keys: documents.map((document) => document.key),
+        // Only the entries that are actually a problem: a path that cannot be read and
+        // whose document has not been uploaded either.
+        unreadable_documents: configuredPaths.filter((entry) => !entry.readable && !entry.uploaded),
         runbook: buildMcpRunbook(mcpSettings, personalInformation, [])
       });
     }
@@ -610,7 +657,7 @@ async function main() {
     "find_posting_candidates",
     {
       description:
-        "Find postings to apply to, using the same filter engine as the app's job list. Any filter left empty falls back to the saved MCP preference for it; pass use_settings=false to ignore saved preferences entirely. Applied and ignored postings are excluded by default. Job descriptions are omitted unless include_descriptions=true. Call get_filter_options for the valid values of the list filters.",
+        "Find postings to apply to, using the same filter engine as the app's job list. Any filter left empty falls back to the saved MCP preference for it; pass use_settings=false to ignore saved preferences entirely. Applied, ignored and dead postings are excluded by default (include_dead=true to see verified-gone ones). Pay ranges keep postings with no published pay figure -- pay_unknown_count reports how many -- unless include_unknown_pay=false. Rows carry location_conflict, which flags a posting whose description restricts hiring to fewer places than its header lists. Job descriptions are omitted unless include_descriptions=true. Call get_filter_options for the valid values of the list filters.",
       inputSchema: {
         search: z.string().optional(),
         ats: z
@@ -621,6 +668,7 @@ async function main() {
         pay_periods: z.array(z.enum(COMPENSATION_PAY_PERIODS)).optional(),
         pay_min: z.number().positive().optional(),
         pay_max: z.number().positive().optional(),
+        include_unknown_pay: z.boolean().optional(),
         education_levels: z.array(z.enum(EDUCATION_LEVELS)).optional(),
         states: z.array(z.string()).optional(),
         counties: z.array(z.string()).optional(),
@@ -631,6 +679,7 @@ async function main() {
         hide_no_date: z.boolean().optional(),
         include_applied: z.boolean().optional(),
         include_ignored: z.boolean().optional(),
+        include_dead: z.boolean().optional(),
         include_descriptions: z.boolean().optional(),
         use_settings: z.boolean().optional(),
         limit: z.number().int().positive().max(MAX_CANDIDATE_LIMIT).optional(),
@@ -647,21 +696,25 @@ async function main() {
     "query_postings",
     {
       description:
-        "Precision query over the raw Postings table, for questions find_posting_candidates cannot phrase: each *_any group ORs its terms, groups AND together, and *_none excludes -- so '(manager OR director) AND NOT (assistant OR shift), in WA, over 140k, still listed within 3 days' is one call. Terms are substring matches. Unlike find_posting_candidates this ignores saved preferences and the app's freshness window, and can see hidden postings via visibility. Rows carry applied/ignored flags but no descriptions; screen the shortlist with get_posting_details. When approximate=true the counts are a floor, not a total.",
+        "Precision query over the raw Postings table, for questions find_posting_candidates cannot phrase: each *_any group ORs its terms, groups AND together, and *_none excludes -- so '(manager OR director) AND NOT (assistant OR shift), in WA, over 140k, still listed within 3 days' is one call. Title and company terms are substring matches. location_any terms name cities and match the posting's parsed locations, optionally qualified as 'City, ST' or 'City, ST, US' -- 'Kent, WA' cannot match Kent, England or Kentucky. Use remote_only=true for remote roles rather than a location term. Unlike find_posting_candidates this ignores saved preferences and the app's freshness window, and can see hidden postings via visibility. Most rows carry no pay figure, so pay_min/pay_max keep unknown-pay rows by default (pay_unknown_count reports how many); pass include_unknown_pay=false or has_pay=true to demand a confirmed figure. Rows carry applied/ignored flags but no descriptions; screen the shortlist with get_posting_details. When approximate=true the counts are a floor, not a total.",
       inputSchema: {
         title_any: z.array(z.string()).optional(),
         title_all: z.array(z.string()).optional(),
         title_none: z.array(z.string()).optional(),
         company_any: z.array(z.string()).optional(),
         company_none: z.array(z.string()).optional(),
+        description_any: z.array(z.string()).optional(),
+        description_none: z.array(z.string()).optional(),
         location_any: z.array(z.string()).optional(),
         location_none: z.array(z.string()).optional(),
+        remote_only: z.boolean().optional(),
         ats: z.array(z.enum(MCP_ATS_FILTER_VALUES)).optional(),
         states: z.array(z.string()).optional(),
         countries: z.array(z.string()).optional(),
         regions: z.array(z.enum(MCP_REGION_FILTER_VALUES)).optional(),
         pay_min: z.number().positive().optional(),
         pay_max: z.number().positive().optional(),
+        include_unknown_pay: z.boolean().optional(),
         has_pay: z.boolean().optional(),
         seen_days: z.number().positive().optional(),
         found_days: z.number().positive().optional(),
@@ -680,6 +733,7 @@ async function main() {
         total: result.total,
         visible: result.visible,
         shown: result.shown,
+        pay_unknown_count: result.pay_unknown_count,
         limit: result.limit,
         approximate: result.approximate,
         sql: result.sql,
@@ -692,16 +746,42 @@ async function main() {
     "get_posting_details",
     {
       description:
-        "Everything stored about the named postings: full job description, pay fields, education levels, ATS, hidden flag, sync timestamps, and applied/ignored state. This is the screening step between shortlisting and opening a browser -- read the description against the applicant's background and decide fit before spending a browser session. URLs not in the database are returned in missing.",
+        "Everything stored about the named postings: full job description, pay fields, parsed locations, hiring-location restrictions (location_conflict flags a header/body disagreement), liveness status, requires_account, education levels, ATS, hidden flag, sync timestamps, and applied/ignored state. When a posting has no stored description it is fetched from the posting page on the spot and persisted (pass fetch_missing=false to skip the network). This is the screening step between shortlisting and opening a browser -- read the description against the applicant's background and decide fit before spending a browser session. URLs not in the database are returned in missing.",
       inputSchema: {
-        job_posting_urls: z.array(z.string()).min(1).max(20)
+        job_posting_urls: z.array(z.string()).min(1).max(20),
+        fetch_missing: z.boolean().optional()
       }
     },
     async (args) => {
       const mcpSettings = await getMcpSettings();
       ensureMcpAgentEnabled(mcpSettings);
       const requested = normalizeStringArray(args?.job_posting_urls);
-      const items = await getPostingsByUrls(requested);
+      let items = await getPostingsByUrls(requested);
+
+      // Screening needs the description, and most board listings never carried one. A
+      // shortlist call is exactly the moment the page is worth one fetch each; results
+      // are persisted so the cost is paid once.
+      if (normalizeBoolean(args?.fetch_missing, true)) {
+        const { refreshPostingFromPage } = require("./services/posting-page-fetcher.js");
+        const pending = items.filter(
+          (item) => !String(item?.job_description || "").trim() && item?.status !== "dead"
+        );
+        if (pending.length > 0) {
+          const rows = await Promise.all(
+            pending.map((item) =>
+              db.get(
+                `SELECT id, job_posting_url, locations_json, pay_min, pay_max
+                 FROM Postings WHERE id = ?;`,
+                [item.id]
+              )
+            )
+          );
+          await Promise.all(
+            rows.filter(Boolean).map((row) => refreshPostingFromPage(row).catch(() => null))
+          );
+          items = await getPostingsByUrls(requested);
+        }
+      }
       const foundUrls = new Set(items.map((item) => String(item?.job_posting_url || "").trim()));
 
       return asToolResult({
@@ -709,6 +789,37 @@ async function main() {
         items,
         missing: requested.filter((url) => !foundUrls.has(url))
       });
+    }
+  );
+
+  mcpServer.registerTool(
+    "find_similar_postings",
+    {
+      description:
+        "Rank postings by how closely their description matches a body of text -- a resume, a paragraph describing the work someone wants, or another posting. This is the tool for cross-industry discovery: keyword filters can only find titles you already guessed, so an operations leader searching operations-leadership titles never sees 'Manager, Local Markets Growth'. Pass text, or job_posting_url/posting_id to find roles like an existing one. Ranking is BM25 over the stored descriptions, so it matches on shared vocabulary weighted by rarity rather than on titles; only postings with a stored description can be returned, and relevance is higher-is-better.",
+      inputSchema: {
+        text: z.string().optional(),
+        job_posting_url: z.string().optional(),
+        posting_id: z.number().int().positive().optional(),
+        limit: z.number().int().positive().max(200).optional(),
+        include_dead: z.boolean().optional(),
+        include_hidden: z.boolean().optional()
+      }
+    },
+    async (args) => {
+      const mcpSettings = await getMcpSettings();
+      ensureMcpAgentEnabled(mcpSettings);
+      const { findSimilarPostings } = require("./services/semantic-search.js");
+      const result = await findSimilarPostings({
+        text: args?.text,
+        job_posting_url: args?.job_posting_url,
+        posting_id: args?.posting_id,
+        limit: args?.limit,
+        include_dead: normalizeBoolean(args?.include_dead, false),
+        include_hidden: normalizeBoolean(args?.include_hidden, false)
+      });
+      const rows = await enrichPostingsWithApplicationState(result.items);
+      return asToolResult({ ...result, items: rows });
     }
   );
 
@@ -751,26 +862,61 @@ async function main() {
     "get_resume",
     {
       description:
-        "The applicant's actual resume text. Read this once per run and weigh every posting description against it -- it is the ground truth that the profile fields summarize. Served from the copy uploaded into the database (POST /settings/applicant-documents), which works no matter where this server runs; falls back to the file path in personal information for same-machine installs. document='projects_portfolio' reads the portfolio document instead. If nothing is uploaded and the path fails, the error explains why and returns file_path so a client with its own file tools can read it directly.",
+        "The text of one of the applicant's stored documents. Read the relevant one once per run and weigh every posting description against it -- it is the ground truth that the profile fields summarize. Documents are an open-ended keyed set, so several tailored resumes can coexist (for example resume_hospitality and resume_ops) and each application can be drafted from the variant matching the target role. Call with no document key to list the available keys without returning any text. Served from the copy uploaded into the database (POST /settings/applicant-documents), which works no matter where this server runs; the conventional keys 'resume' and 'projects_portfolio' fall back to the file paths in personal information for same-machine installs.",
       inputSchema: {
-        document: z.enum(["resume", "projects_portfolio"]).optional()
+        document: z.string().optional()
       }
     },
     async (args) => {
       const mcpSettings = await getMcpSettings();
       ensureMcpAgentEnabled(mcpSettings);
-      const which = args?.document === "projects_portfolio" ? "projects_portfolio" : "resume";
+      const available = await listApplicantDocuments();
+
+      const requested = String(args?.document || "").trim();
+      if (!requested) {
+        return asToolResult({
+          ok: true,
+          documents: available,
+          document_keys: available.map((document) => document.key),
+          note:
+            available.length > 0
+              ? "Call again with document=<key> to read one. Text is omitted here on purpose."
+              : "No documents uploaded yet. Upload one via POST /settings/applicant-documents."
+        });
+      }
+
+      const which = normalizeDocumentKind(requested);
+      if (!which) {
+        return asToolResult({
+          ok: false,
+          error: `'${requested}' is not a valid document key.`,
+          document_keys: available.map((document) => document.key)
+        });
+      }
 
       const stored = await getApplicantDocument(which);
       if (stored) {
         return asToolResult({ document: which, source: "database", ok: true, ...stored });
       }
 
+      // Only the two conventional keys have a configured file-path fallback; a custom key
+      // exists solely as an upload.
       const personalInformation = await getPersonalInformation();
       const filePath =
         which === "projects_portfolio"
           ? personalInformation?.projects_portfolio_file_path
-          : personalInformation?.resume_file_path;
+          : which === "resume"
+            ? personalInformation?.resume_file_path
+            : "";
+
+      if (!filePath) {
+        return asToolResult({
+          ok: false,
+          document: which,
+          error: `No document is stored under the key '${which}'.`,
+          document_keys: available.map((document) => document.key)
+        });
+      }
 
       const result = await extractDocumentText(filePath);
       if (!result.ok) {
@@ -806,11 +952,13 @@ async function main() {
   mcpServer.registerTool(
     "draft_cover_letter",
     {
-      description: "Generate a cover letter draft for a posting using applicantee information.",
+      description:
+        "Generate a cover letter draft for a posting using applicantee information. Pass document=<key> to draft from a specific resume variant (see get_resume for the available keys) -- the document's text is returned alongside the draft as source_document so the letter can be written against the background that actually fits the target role, rather than a generic profile.",
       inputSchema: {
         company_name: z.string().optional(),
         position_name: z.string().optional(),
         job_posting_url: z.string().optional(),
+        document: z.string().optional(),
         instructions: z.string().optional()
       }
     },
@@ -836,6 +984,11 @@ async function main() {
         positionName = positionName || String(posting?.position_name || "").trim();
       }
 
+      // The draft is a template; the resume variant is what gives the caller the material
+      // to make it specific. Defaults to the conventional 'resume' key.
+      const documentKey = normalizeDocumentKind(args?.document || "resume");
+      const sourceDocument = documentKey ? await getApplicantDocument(documentKey) : null;
+
       const draft = buildCoverLetterDraft(
         personalInformation,
         {
@@ -852,6 +1005,18 @@ async function main() {
           position_name: positionName,
           job_posting_url: jobPostingUrl
         },
+        source_document: sourceDocument
+          ? {
+              key: sourceDocument.key,
+              label: sourceDocument.label,
+              file_name: sourceDocument.file_name,
+              chars: sourceDocument.chars,
+              text: sourceDocument.text
+            }
+          : null,
+        source_document_error: sourceDocument
+          ? ""
+          : `No document stored under key '${args?.document || "resume"}'. Call get_resume with no argument to list available keys.`,
         draft
       });
     }
