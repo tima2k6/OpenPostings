@@ -25,6 +25,7 @@ import {
   createApplication,
   deleteApplication,
   fetchApplicantDocuments,
+  fetchApplicationAnswers,
   fetchApplications,
   fetchBlockedCompanies,
   fetchMcpCandidates,
@@ -40,6 +41,7 @@ import {
   fetchSyncStatus,
   ignorePosting,
   migrateDatabaseSettings,
+  saveApplicationAnswers,
   saveMcpSettings,
   savePersonalInformation,
   saveSyncServiceSettings,
@@ -964,6 +966,19 @@ function toFormSyncServiceSettings(value) {
   };
 }
 
+// Grouping for the application-questions form. The server owns the category values; these
+// only decide display order and wording, and any category not listed here is skipped, so a
+// server that adds one is a UI change rather than a silent omission.
+const APPLICATION_ANSWER_CATEGORY_ORDER = ["eligibility", "compensation", "logistics", "background", "narrative", "other"];
+const APPLICATION_ANSWER_CATEGORY_LABELS = {
+  eligibility: "Work eligibility",
+  compensation: "Compensation",
+  logistics: "Availability and location",
+  background: "Background checks and history",
+  narrative: "Your story",
+  other: "Other"
+};
+
 const PERSONAL_INFORMATION_FIELDS = [
   { key: "first_name", label: "First Name", placeholder: "Jane", autoCapitalize: "words" },
   { key: "middle_name", label: "Middle Name", placeholder: "Alex", autoCapitalize: "words" },
@@ -1410,6 +1425,9 @@ export default function App() {
   const [applicantDocuments, setApplicantDocuments] = useState([]);
   const [documentUploading, setDocumentUploading] = useState("");
   const [documentNotice, setDocumentNotice] = useState("");
+  const [applicationAnswers, setApplicationAnswers] = useState([]);
+  const [answersSaving, setAnswersSaving] = useState(false);
+  const [answersNotice, setAnswersNotice] = useState("");
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsNotice, setSettingsNotice] = useState("");
@@ -1832,7 +1850,42 @@ export default function App() {
     } catch {
       setApplicantDocuments([]);
     }
+
+    // Same rule: a server that predates the answers table is not an error here, it just
+    // renders no questions.
+    try {
+      const answersResponse = await fetchApplicationAnswers();
+      setApplicationAnswers(Array.isArray(answersResponse?.items) ? answersResponse.items : []);
+    } catch {
+      setApplicationAnswers([]);
+    }
   }, []);
+
+  // Edits are held locally until Save, so filling in several answers is one round trip
+  // rather than one per keystroke.
+  const handleChangeApplicationAnswer = useCallback((key, field, value) => {
+    setApplicationAnswers((prev) =>
+      prev.map((item) => (item.key === key ? { ...item, [field]: value } : item))
+    );
+  }, []);
+
+  const handleSaveApplicationAnswers = useCallback(async () => {
+    setAnswersSaving(true);
+    setAnswersNotice("");
+    try {
+      const response = await saveApplicationAnswers(
+        applicationAnswers.map((item) => ({ key: item.key, value: item.value, notes: item.notes }))
+      );
+      const saved = Array.isArray(response?.saved) ? response.saved : [];
+      if (saved.length > 0) setApplicationAnswers(saved);
+      const answered = saved.filter((item) => String(item?.value || "").trim()).length;
+      setAnswersNotice(`Saved. ${answered} of ${saved.length} answered.`);
+    } catch (saveError) {
+      setAnswersNotice(String(saveError?.message || saveError));
+    } finally {
+      setAnswersSaving(false);
+    }
+  }, [applicationAnswers]);
 
   // Web only: the browser's file picker is the one that exists on every install serving the
   // web UI, and the base64 body matches what POST /settings/applicant-documents expects.
@@ -3288,6 +3341,77 @@ export default function App() {
               })}
 
               {documentNotice ? <Text style={styles.settingsNotice}>{documentNotice}</Text> : null}
+            </View>
+
+            <View style={styles.formGroup}>
+              <Text style={styles.settingsSubsection}>Application questions</Text>
+              <Text style={styles.settingsDescription}>
+                The questions application forms ask over and over. Anything left blank is treated as unanswered:
+                the apply agent will ask you rather than guessing, because a made-up answer gets submitted
+                under your name. Use Notes for context you want considered but not pasted into a form.
+              </Text>
+
+              {applicationAnswers.length === 0 ? (
+                <Text style={styles.documentRowMeta}>
+                  No questions loaded. This needs a server with the application-answers store.
+                </Text>
+              ) : (
+                <>
+                  <Text style={styles.documentRowMeta}>
+                    {`${applicationAnswers.filter((item) => String(item?.value || "").trim()).length} of ${applicationAnswers.length} answered`}
+                  </Text>
+
+                  {APPLICATION_ANSWER_CATEGORY_ORDER.filter((category) =>
+                    applicationAnswers.some((item) => item.category === category)
+                  ).map((category) => (
+                    <View key={category}>
+                      <Text style={styles.fieldLabel}>
+                        {APPLICATION_ANSWER_CATEGORY_LABELS[category] || category}
+                      </Text>
+                      {applicationAnswers
+                        .filter((item) => item.category === category)
+                        .map((item) => {
+                          const isAnswered = Boolean(String(item?.value || "").trim());
+                          return (
+                            <View key={item.key} style={styles.formGroup}>
+                              <Text style={styles.documentRowMeta}>
+                                {isAnswered ? item.label : `${item.label} — unanswered`}
+                              </Text>
+                              <TextInput
+                                style={styles.textField}
+                                value={item.value}
+                                onChangeText={(value) => handleChangeApplicationAnswer(item.key, "value", value)}
+                                placeholder="Leave blank to be asked"
+                                autoCapitalize="sentences"
+                              />
+                              <TextInput
+                                style={[styles.textField, styles.textFieldMultiline]}
+                                value={item.notes}
+                                onChangeText={(value) => handleChangeApplicationAnswer(item.key, "notes", value)}
+                                placeholder="Notes (optional) — context, not form text"
+                                autoCapitalize="sentences"
+                                multiline
+                                numberOfLines={2}
+                              />
+                            </View>
+                          );
+                        })}
+                    </View>
+                  ))}
+
+                  {answersNotice ? <Text style={styles.settingsNotice}>{answersNotice}</Text> : null}
+
+                  <Pressable
+                    onPress={handleSaveApplicationAnswers}
+                    disabled={answersSaving}
+                    style={[styles.settingsSaveButton, answersSaving ? styles.settingsSaveButtonDisabled : null]}
+                  >
+                    <Text style={styles.settingsSaveButtonText}>
+                      {answersSaving ? "Saving..." : "Save Application Questions"}
+                    </Text>
+                  </Pressable>
+                </>
+              )}
             </View>
 
             {settingsNotice ? <Text style={styles.settingsNotice}>{settingsNotice}</Text> : null}

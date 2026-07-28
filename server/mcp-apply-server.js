@@ -30,7 +30,8 @@ const {
 } = require("./helpers/normalize-strings.js");
 const { MCP_SETTINGS_DEFAULTS } = require("./helpers/normalize-mcp-settings.js");
 const { setDb } = require("./services/runtime-context.js");
-const { getMcpSettings, buildMcpRunbook, buildCoverLetterDraft } = require("./services/mcp.js");
+const { getMcpSettings, buildMcpRunbook } = require("./services/mcp.js");
+const { buildCoverLetterDraft, buildCoverLetterBrief } = require("./services/cover-letter.js");
 const { getPersonalInformation } = require("./services/personal-info.js");
 const {
   listPostingsWithFilters,
@@ -1011,12 +1012,13 @@ async function main() {
     "draft_cover_letter",
     {
       description:
-        "Generate a cover letter draft for a posting using applicantee information. Pass document=<key> to draft from a specific resume variant (see get_resume for the available keys) -- the document's text is returned alongside the draft as source_document so the letter can be written against the background that actually fits the target role, rather than a generic profile.",
+        "Assemble the material for a cover letter and a scaffold to write it into. Returns `brief`: the posting's own responsibilities and requirements, the vocabulary it emphasises that the resume also uses, specific resume lines worth citing (resume_evidence), and -- importantly -- requirements the resume does not support (unmatched_requirements), which must not be claimed. `draft` is a scaffold with {{slots}} to replace, not a finished letter: write the letter yourself from the brief, citing real experience rather than restating the posting. Pass document=<key> to work from a specific resume variant (get_resume lists the keys). The posting's description is fetched on demand if it has not been stored.",
       inputSchema: {
         company_name: z.string().optional(),
         position_name: z.string().optional(),
         job_posting_url: z.string().optional(),
         document: z.string().optional(),
+        fetch_missing: z.boolean().optional(),
         instructions: z.string().optional()
       }
     },
@@ -1042,10 +1044,36 @@ async function main() {
         positionName = positionName || String(posting?.position_name || "").trim();
       }
 
-      // The draft is a template; the resume variant is what gives the caller the material
-      // to make it specific. Defaults to the conventional 'resume' key.
       const documentKey = normalizeDocumentKind(args?.document || "resume");
       const sourceDocument = documentKey ? await getApplicantDocument(documentKey) : null;
+
+      // The description is what makes a letter about this job rather than any job. Fetch
+      // it on demand when it has not been stored yet -- a letter written without it is
+      // the generic template this tool used to produce.
+      let description = "";
+      if (jobPostingUrl) {
+        const [posting] = await getPostingsByUrls([jobPostingUrl]);
+        description = String(posting?.job_description || "").trim();
+        if (!description && normalizeBoolean(args?.fetch_missing, true)) {
+          const row = await db.get(
+            `SELECT id, job_posting_url, locations_json, pay_min, pay_max
+             FROM Postings WHERE job_posting_url = ? LIMIT 1;`,
+            [jobPostingUrl]
+          );
+          if (row) {
+            const { refreshPostingFromPage } = require("./services/posting-page-fetcher.js");
+            await refreshPostingFromPage(row).catch(() => null);
+            const [refreshed] = await getPostingsByUrls([jobPostingUrl]);
+            description = String(refreshed?.job_description || "").trim();
+          }
+        }
+      }
+
+      const brief = buildCoverLetterBrief({
+        description,
+        resume_text: sourceDocument?.text || "",
+        posting: { company_name: companyName, position_name: positionName }
+      });
 
       const draft = buildCoverLetterDraft(
         personalInformation,
@@ -1054,7 +1082,8 @@ async function main() {
           position_name: positionName,
           job_posting_url: jobPostingUrl
         },
-        args?.instructions || mcpSettings.instructions_for_agent
+        args?.instructions || mcpSettings.instructions_for_agent,
+        brief
       );
 
       return asToolResult({
@@ -1063,6 +1092,9 @@ async function main() {
           position_name: positionName,
           job_posting_url: jobPostingUrl
         },
+        // The material to write from: what the posting asks for, where the resume
+        // genuinely speaks to it, and which requirements it does not.
+        brief,
         source_document: sourceDocument
           ? {
               key: sourceDocument.key,

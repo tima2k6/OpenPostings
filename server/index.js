@@ -86,7 +86,8 @@ const { migrateSettingsAndApplicationsFromDatabase } = require("./services/migra
 const { ensureBlockedCompaniesTable, listBlockedCompanies, blockCompanyByName, unblockCompanyByName } = require("./services/blocked-companies.js");
 const { ensurePersonalInformationTable, getPersonalInformation, upsertPersonalInformation } = require("./services/personal-info.js");
 const { upsertSeededCompanySource } = require("./services/seeded-source.js");
-const { getMcpSettings, upsertMcpSettings, buildMcpRunbook, buildCoverLetterDraft } = require("./services/mcp.js");
+const { getMcpSettings, upsertMcpSettings, buildMcpRunbook } = require("./services/mcp.js");
+const { buildCoverLetterDraft, buildCoverLetterBrief } = require("./services/cover-letter.js");
 const { listApplications, createApplication, updateApplicationStatus, deleteApplicationById } = require("./services/applications.js");
 const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable, startSyncStallWatchdog } = require("./services/sync-runtime.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
@@ -1834,11 +1835,30 @@ function createServer() {
     }
 
     const instructions = String(req.body?.instructions || settings?.instructions_for_agent || "").trim();
-    const draft = buildCoverLetterDraft(personalInformation, posting, instructions);
+
+    // The brief is what makes the letter about this job: the posting's own requirements,
+    // the resume lines that speak to them, and the ones nothing in the resume supports.
+    const documentKey = normalizeDocumentKind(req.body?.document || "resume") || "resume";
+    const sourceDocument = await getApplicantDocument(documentKey);
+    let description = "";
+    if (jobPostingUrl) {
+      const descriptionRow = await db.get(
+        `SELECT job_description FROM Postings WHERE job_posting_url = ? LIMIT 1;`,
+        [jobPostingUrl]
+      );
+      description = String(descriptionRow?.job_description || "").trim();
+    }
+    const brief = buildCoverLetterBrief({
+      description,
+      resume_text: sourceDocument?.text || "",
+      posting
+    });
+    const draft = buildCoverLetterDraft(personalInformation, posting, instructions, brief);
 
     res.json({
       ok: true,
       posting,
+      brief,
       draft
     });
   });

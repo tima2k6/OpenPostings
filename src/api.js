@@ -276,6 +276,18 @@ export function uploadApplicantDocument(payload) {
   });
 }
 
+export function fetchApplicationAnswers() {
+  return request("/settings/application-answers");
+}
+
+// Accepts the full list; the server upserts by key, so unchanged rows are harmless.
+export function saveApplicationAnswers(items) {
+  return request("/settings/application-answers", {
+    method: "PUT",
+    body: JSON.stringify({ items: Array.isArray(items) ? items : [] })
+  });
+}
+
 export function fetchMcpSettings() {
   return request("/settings/mcp");
 }

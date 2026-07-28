@@ -174,45 +174,8 @@ function buildMcpRunbook(settings, personalInformation, candidates) {
   };
 }
 
-function buildCoverLetterDraft(personalInformation, posting, instructions = "") {
-  const firstName = String(personalInformation?.first_name || "").trim() || "Applicant";
-  const lastName = String(personalInformation?.last_name || "").trim();
-  const fullName = `${firstName}${lastName ? ` ${lastName}` : ""}`.trim();
-  const yearsOfExperience = parseNonNegativeInteger(personalInformation?.years_of_experience);
-  const positionName = String(posting?.position_name || "the role").trim();
-  const companyName = String(posting?.company_name || "your company").trim();
-  const linkedinUrl = String(personalInformation?.linkedin_url || "").trim();
-  const githubUrl = String(personalInformation?.github_url || "").trim();
-  const portfolioUrl = String(personalInformation?.portfolio_url || "").trim();
-  const educationLevel = String(personalInformation?.education_level || "").trim();
-  const extraInstructions = String(instructions || "").trim();
+// buildCoverLetterDraft now lives in cover-letter.js, alongside the brief that gives it
+// something specific to say. Re-exported here so existing callers keep working.
+const { buildCoverLetterDraft, buildCoverLetterBrief } = require("./cover-letter.js");
 
-  const profileDetails = [];
-  if (yearsOfExperience > 0) profileDetails.push(`${yearsOfExperience}+ years of relevant experience`);
-  if (educationLevel) profileDetails.push(`education in ${educationLevel}`);
-  if (linkedinUrl) profileDetails.push(`LinkedIn: ${linkedinUrl}`);
-  if (githubUrl) profileDetails.push(`GitHub: ${githubUrl}`);
-  if (portfolioUrl) profileDetails.push(`Portfolio: ${portfolioUrl}`);
-
-  const profileSentence =
-    profileDetails.length > 0
-      ? `My background includes ${profileDetails.join(", ")}.`
-      : "I bring hands-on experience delivering high-quality work in fast-moving environments.";
-
-  const instructionSentence = extraInstructions
-    ? `I am especially aligned with these priorities: ${extraInstructions}.`
-    : "";
-
-  return `Dear Hiring Team,
-
-I am excited to apply for the ${positionName} role at ${companyName}. ${profileSentence}
-
-I am motivated by opportunities where I can contribute quickly, collaborate with a strong team, and improve outcomes for customers and the business. ${instructionSentence}
-
-Thank you for your consideration. I would value the chance to discuss how I can support ${companyName}.
-
-Sincerely,
-${fullName}`.trim();
-}
-
-module.exports = { getMcpSettings, upsertMcpSettings, buildMcpRunbook, buildCoverLetterDraft };
+module.exports = { getMcpSettings, upsertMcpSettings, buildMcpRunbook, buildCoverLetterDraft, buildCoverLetterBrief };
