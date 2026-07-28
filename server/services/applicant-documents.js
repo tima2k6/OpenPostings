@@ -292,6 +292,10 @@ async function listApplicantDocuments() {
   );
   return rows.map((row) => ({
     key: String(row.kind || ""),
+    // `kind` is carried alongside `key` because getApplicantDocument returns both and the
+    // settings page keys off it. Dropping it here when this list grew its own shape left
+    // the app reporting "Not uploaded yet" for a resume that was sitting in the database.
+    kind: String(row.kind || ""),
     label: String(row.label || ""),
     file_name: String(row.file_name || ""),
     format: String(row.format || ""),

@@ -3363,7 +3363,7 @@ export default function App() {
                 { kind: "resume", label: "Resume" },
                 { kind: "projects_portfolio", label: "Projects Portfolio" }
               ].map(({ kind, label }) => {
-                const stored = applicantDocuments.find((item) => item?.kind === kind);
+                const stored = applicantDocuments.find((item) => (item?.key || item?.kind) === kind);
                 const isUploadingThis = documentUploading === kind;
                 return (
                   <View key={kind} style={styles.documentRow}>

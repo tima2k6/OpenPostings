@@ -9,7 +9,7 @@ const os = require("os");
 const path = require("path");
 const zlib = require("zlib");
 
-const { extractDocumentText, readZipEntry, saveApplicantDocument, getApplicantDocument } = require("../services/applicant-documents.js");
+const { extractDocumentText, readZipEntry, saveApplicantDocument, getApplicantDocument, listApplicantDocuments } = require("../services/applicant-documents.js");
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openpostings-doc-"));
 
@@ -205,6 +205,41 @@ async function testDatabaseRoundTrip() {
   }
 }
 
+// The settings page finds a stored document by matching an id against this list. When the
+// list grew its own shape for the multi-document work the field was renamed kind -> key and
+// nothing failed: the endpoint still returned the resume, the page still rendered, and it
+// simply said "Not uploaded yet" for a document that had been in the database all along. A
+// renamed field in a payload that a UI reads by name is invisible to every other test here,
+// so the shape is pinned.
+async function testListShapeKeepsBothIdFields() {
+  const { open } = require("sqlite");
+  const sqlite3 = require("sqlite3");
+  const { setDb, getDb } = require("../services/runtime-context.js");
+  const previousDb = getDb();
+  setDb(await open({ filename: ":memory:", driver: sqlite3.Database }));
+
+  try {
+    const stored = await saveApplicantDocument({
+      kind: "resume",
+      file_name: "resume.txt",
+      content: Buffer.from("Operations leader with P&L ownership across multiple sites.")
+    });
+    assert.strictEqual(stored.key, "resume");
+    assert.strictEqual(stored.kind, "resume");
+
+    const listed = await listApplicantDocuments();
+    const row = listed.find((item) => item.key === "resume");
+    assert.ok(row, "an uploaded document must appear in the list");
+    assert.strictEqual(row.kind, "resume", "kind must survive alongside key -- the settings page reads it");
+    assert.strictEqual(row.file_name, "resume.txt");
+    assert.ok(row.chars > 0, "the list must describe the document without the caller re-reading it");
+    assert.ok(!("text" in row), "the list must not ship extracted text");
+    assert.ok(!("content" in row), "the list must not ship document bytes");
+  } finally {
+    setDb(previousDb);
+  }
+}
+
 async function run() {
   try {
     await testPlainText();
@@ -214,6 +249,7 @@ async function run() {
     await testUnsupportedFormat();
     testZipReaderRejectsGarbage();
     await testDatabaseRoundTrip();
+    await testListShapeKeepsBothIdFields();
     console.log("applicant-documents tests passed");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
