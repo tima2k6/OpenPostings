@@ -29,8 +29,9 @@ const {
   normalizeAppliedByLabel
 } = require("./helpers/normalize-strings.js");
 const { MCP_SETTINGS_DEFAULTS } = require("./helpers/normalize-mcp-settings.js");
-const { setDb } = require("./services/runtime-context.js");
-const { getMcpSettings, buildMcpRunbook, buildCoverLetterDraft } = require("./services/mcp.js");
+const { setDb, runInWriteTransaction } = require("./services/runtime-context.js");
+const { getMcpSettings, buildMcpRunbook } = require("./services/mcp.js");
+const { buildCoverLetterDraft, buildCoverLetterBrief } = require("./services/cover-letter.js");
 const { getPersonalInformation } = require("./services/personal-info.js");
 const {
   listPostingsWithFilters,
@@ -39,6 +40,11 @@ const {
   enrichPostingsWithApplicationState
 } = require("./services/postings.js");
 const { listApplications } = require("./services/applications.js");
+const {
+  ensureApplicationAnswersTable,
+  getApplicationAnswerSummary,
+  setApplicationAnswer
+} = require("./services/application-answers.js");
 const {
   extractDocumentText,
   getApplicantDocument,
@@ -228,7 +234,8 @@ async function ensureTables() {
       ["description_fetched_at", "ALTER TABLE Postings ADD COLUMN description_fetched_at INTEGER;"],
       ["status", "ALTER TABLE Postings ADD COLUMN status TEXT NOT NULL DEFAULT 'unverified';"],
       ["dead_since_epoch", "ALTER TABLE Postings ADD COLUMN dead_since_epoch INTEGER;"],
-      ["requires_account", "ALTER TABLE Postings ADD COLUMN requires_account INTEGER;"]
+      ["requires_account", "ALTER TABLE Postings ADD COLUMN requires_account INTEGER;"],
+      ["hidden_reason", "ALTER TABLE Postings ADD COLUMN hidden_reason TEXT NOT NULL DEFAULT '';"]
     ];
     for (const [columnName, ddl] of postingsMigrations) {
       if (!postingsColumnNames.has(columnName)) await db.exec(ddl);
@@ -255,6 +262,9 @@ async function openDatabase() {
   // default window instead of the one configured for this instance.
   await ensureSyncServiceSettingsTable();
   await loadSyncServiceSettingsIntoRuntime();
+  // Seeds the standard screening questions so get_application_answers can report what is
+  // still unanswered even on a database the API server has not started against yet.
+  await ensureApplicationAnswersTable();
 }
 
 // An explicitly passed filter replaces the saved preference; an empty one falls back to it,
@@ -354,6 +364,7 @@ async function findCandidates(options = {}) {
     include_applied: normalizeBoolean(options.include_applied, false),
     include_ignored: normalizeBoolean(options.include_ignored, false),
     include_dead: normalizeBoolean(options.include_dead, false),
+    include_stale_dated: normalizeBoolean(options.include_stale_dated, false),
     // Descriptions are the bulk of the payload, and an agent that only needs to rank titles
     // and open URLs does not want them in its context. Opt in per call.
     include_descriptions: normalizeBoolean(options.include_descriptions, false)
@@ -510,9 +521,8 @@ async function createApplicationFromAgent(input) {
     );
   }
 
-  await db.exec("BEGIN TRANSACTION;");
-  try {
-    const result = await db.run(
+  const application = await runInWriteTransaction(async (handle) => {
+    const result = await handle.run(
       `
         INSERT INTO applications (
           company_id,
@@ -524,7 +534,7 @@ async function createApplicationFromAgent(input) {
       [company.id, positionName, applicationDate, status]
     );
 
-    await db.run(
+    await handle.run(
       `
         INSERT INTO application_attribution (
           application_id,
@@ -541,7 +551,7 @@ async function createApplicationFromAgent(input) {
     );
 
     if (jobPostingUrl) {
-      await db.run(
+      await handle.run(
         `
           INSERT INTO posting_application_state (
             job_posting_url,
@@ -564,7 +574,6 @@ async function createApplicationFromAgent(input) {
       );
     }
 
-    await db.exec("COMMIT;");
     return {
       id: result.lastID,
       company_id: company.id,
@@ -576,10 +585,9 @@ async function createApplicationFromAgent(input) {
       applied_by_type: "agent",
       applied_by_label: appliedByLabel
     };
-  } catch (error) {
-    await db.exec("ROLLBACK;");
-    throw error;
-  }
+  });
+
+  return application;
 }
 
 async function main() {
@@ -602,11 +610,20 @@ async function main() {
       ensureMcpAgentEnabled(mcpSettings);
       const documents = await listApplicantDocuments();
       const configuredPaths = await checkConfiguredDocumentPaths();
+      const answers = await getApplicationAnswerSummary();
       return asToolResult({
         personal_information: personalInformation,
         mcp_settings: mcpSettings,
         documents,
         document_keys: documents.map((document) => document.key),
+        // Which form questions are already answered and which still need asking. Read in
+        // full with get_application_answers before filling anything in.
+        application_answers: {
+          answered_count: answers.answered_count,
+          unanswered_count: answers.unanswered_count,
+          unanswered: answers.unanswered,
+          contract: answers.contract
+        },
         // Only the entries that are actually a problem: a path that cannot be read and
         // whose document has not been uploaded either.
         unreadable_documents: configuredPaths.filter((entry) => !entry.readable && !entry.uploaded),
@@ -657,7 +674,7 @@ async function main() {
     "find_posting_candidates",
     {
       description:
-        "Find postings to apply to, using the same filter engine as the app's job list. Any filter left empty falls back to the saved MCP preference for it; pass use_settings=false to ignore saved preferences entirely. Applied, ignored and dead postings are excluded by default (include_dead=true to see verified-gone ones). Pay ranges keep postings with no published pay figure -- pay_unknown_count reports how many -- unless include_unknown_pay=false. Rows carry location_conflict, which flags a posting whose description restricts hiring to fewer places than its header lists. Job descriptions are omitted unless include_descriptions=true. Call get_filter_options for the valid values of the list filters.",
+        "Find postings to apply to, using the same filter engine as the app's job list. Any filter left empty falls back to the saved MCP preference for it; pass use_settings=false to ignore saved preferences entirely. Applied, ignored and dead postings are excluded by default (include_dead=true to see verified-gone ones). Postings hidden only because their posting date is older than the freshness window are excluded too but remain applyable -- include_stale_dated=true brings them back, and rows carry hidden_reason so you can tell them from delisted ones. Pay ranges keep postings with no published pay figure -- pay_unknown_count reports how many -- unless include_unknown_pay=false. Rows carry location_conflict, which flags a posting whose description restricts hiring to fewer places than its header lists. Job descriptions are omitted unless include_descriptions=true. Call get_filter_options for the valid values of the list filters.",
       inputSchema: {
         search: z.string().optional(),
         ats: z
@@ -680,6 +697,7 @@ async function main() {
         include_applied: z.boolean().optional(),
         include_ignored: z.boolean().optional(),
         include_dead: z.boolean().optional(),
+        include_stale_dated: z.boolean().optional(),
         include_descriptions: z.boolean().optional(),
         use_settings: z.boolean().optional(),
         limit: z.number().int().positive().max(MAX_CANDIDATE_LIMIT).optional(),
@@ -696,7 +714,7 @@ async function main() {
     "query_postings",
     {
       description:
-        "Precision query over the raw Postings table, for questions find_posting_candidates cannot phrase: each *_any group ORs its terms, groups AND together, and *_none excludes -- so '(manager OR director) AND NOT (assistant OR shift), in WA, over 140k, still listed within 3 days' is one call. Title and company terms are substring matches. location_any terms name cities and match the posting's parsed locations, optionally qualified as 'City, ST' or 'City, ST, US' -- 'Kent, WA' cannot match Kent, England or Kentucky. Use remote_only=true for remote roles rather than a location term. Unlike find_posting_candidates this ignores saved preferences and the app's freshness window, and can see hidden postings via visibility. Most rows carry no pay figure, so pay_min/pay_max keep unknown-pay rows by default (pay_unknown_count reports how many); pass include_unknown_pay=false or has_pay=true to demand a confirmed figure. Rows carry applied/ignored flags but no descriptions; screen the shortlist with get_posting_details. When approximate=true the counts are a floor, not a total.",
+        "Precision query over the raw Postings table, for questions find_posting_candidates cannot phrase: each *_any group ORs its terms, groups AND together, and *_none excludes -- so '(manager OR director) AND NOT (assistant OR shift), in WA, over 140k, still listed within 3 days' is one call. Title and company terms are substring matches. location_any terms name cities and match the posting's parsed locations, optionally qualified as 'City, ST' or 'City, ST, US' -- 'Kent, WA' cannot match Kent, England or Kentucky. Use remote_only=true for remote roles rather than a location term. Unlike find_posting_candidates this ignores saved preferences and the app's freshness window, and can see hidden postings via visibility -- and visibility distinguishes why a posting is hidden: 'stale_dated' is still listed by the employer but older than the freshness window (so still applyable), 'delisted' means the ATS stopped listing it, and 'open' returns both visible and stale-dated. Most rows carry no pay figure, so pay_min/pay_max keep unknown-pay rows by default (pay_unknown_count reports how many); pass include_unknown_pay=false or has_pay=true to demand a confirmed figure. Rows carry applied/ignored flags but no descriptions; screen the shortlist with get_posting_details. When approximate=true the counts are a floor, not a total.",
       inputSchema: {
         title_any: z.array(z.string()).optional(),
         title_all: z.array(z.string()).optional(),
@@ -718,7 +736,7 @@ async function main() {
         has_pay: z.boolean().optional(),
         seen_days: z.number().positive().optional(),
         found_days: z.number().positive().optional(),
-        visibility: z.enum(["visible", "hidden", "all"]).optional(),
+        visibility: z.enum(["visible", "hidden", "all", "open", "stale_dated", "delisted"]).optional(),
         sort: z.enum(MCP_QUERY_SORT_VALUES).optional(),
         dir: z.enum(["asc", "desc"]).optional(),
         limit: z.number().int().positive().max(MAX_ROWS).optional()
@@ -789,6 +807,47 @@ async function main() {
         items,
         missing: requested.filter((url) => !foundUrls.has(url))
       });
+    }
+  );
+
+  mcpServer.registerTool(
+    "get_application_answers",
+    {
+      description:
+        "The applicant's stored answers to the questions application forms ask -- work authorization, sponsorship, salary expectation, notice period, relocation, and the rest. Read this before filling any form. Questions come back split into `answers` (stored, safe to use as written) and `unanswered` (empty). An unanswered question must be put to the user and its answer recorded with set_application_answer; it must never be inferred from the resume, guessed from the posting, carried over from a similar application, or left as a plausible-looking placeholder. A wrong answer here is submitted under the applicant's name and cannot be retracted."
+    },
+    async () => {
+      const mcpSettings = await getMcpSettings();
+      ensureMcpAgentEnabled(mcpSettings);
+      return asToolResult(await getApplicationAnswerSummary());
+    }
+  );
+
+  mcpServer.registerTool(
+    "set_application_answer",
+    {
+      description:
+        "Record an answer the user has explicitly given, so the next application does not have to ask again. Only for values the user actually stated in conversation or confirmed -- this is a memory of what they said, not a place to persist an inference. If you did not hear it from them, ask instead of writing. Use the key from get_application_answers where one fits; a new slug creates a custom question.",
+      inputSchema: {
+        key: z.string(),
+        value: z.string(),
+        notes: z.string().optional(),
+        label: z.string().optional(),
+        category: z.string().optional()
+      }
+    },
+    async (args) => {
+      const mcpSettings = await getMcpSettings();
+      ensureMcpAgentEnabled(mcpSettings);
+      return asToolResult(
+        await setApplicationAnswer({
+          key: args?.key,
+          value: args?.value,
+          notes: args?.notes,
+          label: args?.label,
+          category: args?.category
+        })
+      );
     }
   );
 
@@ -953,12 +1012,13 @@ async function main() {
     "draft_cover_letter",
     {
       description:
-        "Generate a cover letter draft for a posting using applicantee information. Pass document=<key> to draft from a specific resume variant (see get_resume for the available keys) -- the document's text is returned alongside the draft as source_document so the letter can be written against the background that actually fits the target role, rather than a generic profile.",
+        "Assemble the material for a cover letter and a scaffold to write it into. Returns `brief`: the posting's own responsibilities and requirements, the vocabulary it emphasises that the resume also uses, specific resume lines worth citing (resume_evidence), and -- importantly -- requirements the resume does not support (unmatched_requirements), which must not be claimed. `draft` is a scaffold with {{slots}} to replace, not a finished letter: write the letter yourself from the brief, citing real experience rather than restating the posting. Pass document=<key> to work from a specific resume variant (get_resume lists the keys). The posting's description is fetched on demand if it has not been stored.",
       inputSchema: {
         company_name: z.string().optional(),
         position_name: z.string().optional(),
         job_posting_url: z.string().optional(),
         document: z.string().optional(),
+        fetch_missing: z.boolean().optional(),
         instructions: z.string().optional()
       }
     },
@@ -984,10 +1044,36 @@ async function main() {
         positionName = positionName || String(posting?.position_name || "").trim();
       }
 
-      // The draft is a template; the resume variant is what gives the caller the material
-      // to make it specific. Defaults to the conventional 'resume' key.
       const documentKey = normalizeDocumentKind(args?.document || "resume");
       const sourceDocument = documentKey ? await getApplicantDocument(documentKey) : null;
+
+      // The description is what makes a letter about this job rather than any job. Fetch
+      // it on demand when it has not been stored yet -- a letter written without it is
+      // the generic template this tool used to produce.
+      let description = "";
+      if (jobPostingUrl) {
+        const [posting] = await getPostingsByUrls([jobPostingUrl]);
+        description = String(posting?.job_description || "").trim();
+        if (!description && normalizeBoolean(args?.fetch_missing, true)) {
+          const row = await db.get(
+            `SELECT id, job_posting_url, locations_json, pay_min, pay_max
+             FROM Postings WHERE job_posting_url = ? LIMIT 1;`,
+            [jobPostingUrl]
+          );
+          if (row) {
+            const { refreshPostingFromPage } = require("./services/posting-page-fetcher.js");
+            await refreshPostingFromPage(row).catch(() => null);
+            const [refreshed] = await getPostingsByUrls([jobPostingUrl]);
+            description = String(refreshed?.job_description || "").trim();
+          }
+        }
+      }
+
+      const brief = buildCoverLetterBrief({
+        description,
+        resume_text: sourceDocument?.text || "",
+        posting: { company_name: companyName, position_name: positionName }
+      });
 
       const draft = buildCoverLetterDraft(
         personalInformation,
@@ -996,7 +1082,8 @@ async function main() {
           position_name: positionName,
           job_posting_url: jobPostingUrl
         },
-        args?.instructions || mcpSettings.instructions_for_agent
+        args?.instructions || mcpSettings.instructions_for_agent,
+        brief
       );
 
       return asToolResult({
@@ -1005,6 +1092,9 @@ async function main() {
           position_name: positionName,
           job_posting_url: jobPostingUrl
         },
+        // The material to write from: what the posting asks for, where the resume
+        // genuinely speaks to it, and which requirements it does not.
+        brief,
         source_document: sourceDocument
           ? {
               key: sourceDocument.key,

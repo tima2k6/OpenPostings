@@ -1,5 +1,5 @@
 const { normalizePersonalInformationInput, createDefaultPersonalInformation, PERSONAL_INFORMATION_FIELDS } = require("../helpers/personal-info-normalize")
-const { getDb, setDb } = require("./runtime-context.js");
+const { getDb, setDb, runInWriteTransaction } = require("./runtime-context.js");
 
 async function ensurePersonalInformationTable() {
   const db = getDb();
@@ -91,10 +91,11 @@ async function upsertPersonalInformation(value) {
     `
   );
 
-  await db.exec("BEGIN TRANSACTION;");
-  try {
+  // Serialized with every other writer: an HTTP save landing mid-sync-batch would
+  // otherwise fail with "cannot start a transaction within a transaction".
+  await runInWriteTransaction(async (handle) => {
     if (existing?.rowid) {
-      await db.run(
+      await handle.run(
         `
           UPDATE PersonalInformation
           SET ${updateAssignments}
@@ -103,9 +104,9 @@ async function upsertPersonalInformation(value) {
         [...values, existing.rowid]
       );
 
-      await db.run(`DELETE FROM PersonalInformation WHERE rowid <> ?;`, [existing.rowid]);
+      await handle.run(`DELETE FROM PersonalInformation WHERE rowid <> ?;`, [existing.rowid]);
     } else {
-      await db.run(
+      await handle.run(
         `
           INSERT INTO PersonalInformation (${PERSONAL_INFORMATION_FIELDS.join(", ")})
           VALUES (${PERSONAL_INFORMATION_FIELDS.map(() => "?").join(", ")});
@@ -113,12 +114,7 @@ async function upsertPersonalInformation(value) {
         values
       );
     }
-
-    await db.exec("COMMIT;");
-  } catch (error) {
-    await db.exec("ROLLBACK;");
-    throw error;
-  }
+  });
 
   return normalized;
 }

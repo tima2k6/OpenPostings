@@ -75,7 +75,7 @@ const { parseTaleoCompany } = require("./ats/taleonet/service.js");
 
 
 // import helpers
-const { nowEpochSeconds, parseNonNegativeInteger, normalizeBoolean, normalizePayFilterNumber } = require("./helpers/normalize-numbers.js");
+const { nowEpochSeconds, parseNonNegativeInteger, normalizeBoolean, normalizePayFilterNumber, getPostingFreshnessWindowSeconds } = require("./helpers/normalize-numbers.js");
 const { inferAtsFromJobPostingUrl, normalizeAtsFilterValue, ATS_FILTER_OPTIONS, ATS_FILTER_OPTION_ITEMS } = require("./helpers/normalize-ats.js");
 const { parseCsvParam, normalizeStringArray, normalizeSourceUrlString, APPLICATION_STATUS_OPTIONS } = require("./helpers/normalize-strings.js");
 const { normalizeRemoteFilter } = require("./helpers/description-filters.js");
@@ -86,13 +86,16 @@ const { migrateSettingsAndApplicationsFromDatabase } = require("./services/migra
 const { ensureBlockedCompaniesTable, listBlockedCompanies, blockCompanyByName, unblockCompanyByName } = require("./services/blocked-companies.js");
 const { ensurePersonalInformationTable, getPersonalInformation, upsertPersonalInformation } = require("./services/personal-info.js");
 const { upsertSeededCompanySource } = require("./services/seeded-source.js");
-const { getMcpSettings, upsertMcpSettings, buildMcpRunbook, buildCoverLetterDraft } = require("./services/mcp.js");
+const { getMcpSettings, upsertMcpSettings, buildMcpRunbook } = require("./services/mcp.js");
+const { buildCoverLetterDraft, buildCoverLetterBrief } = require("./services/cover-letter.js");
 const { listApplications, createApplication, updateApplicationStatus, deleteApplicationById } = require("./services/applications.js");
 const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable, startSyncStallWatchdog } = require("./services/sync-runtime.js");
+const { startEnrichmentLoops, getEnrichmentStatus } = require("./services/enrichment-runtime.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
 const { listPostingsWithFilters, setPostingIgnoredState, getCounts, getWideScanStats } = require("./services/postings.js");
 const { getPostingFilterOptions } = require("./services/filter-options.js");
 const { extractDocumentText, getApplicantDocument, saveApplicantDocument, listApplicantDocuments, deleteApplicantDocument, checkConfiguredDocumentPaths, normalizeDocumentKind, MAX_DOCUMENT_KEY_LENGTH, APPLICANT_DOCUMENT_KINDS } = require("./services/applicant-documents.js");
+const { ensureApplicationAnswersTable, listApplicationAnswers, setApplicationAnswers, clearApplicationAnswer } = require("./services/application-answers.js");
 const { getDb, setDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
 
 const cors = require("cors");
@@ -604,6 +607,7 @@ async function initDb() {
   await ensurePersonalInformationTable();
   await ensureApplicationsTable();
   await ensureBlockedCompaniesTable();
+  await ensureApplicationAnswersTable();
   await ensureSyncServiceSettingsTable();
   await loadSyncServiceSettingsIntoRuntime();
   await ensureCompaniesTableSchema();
@@ -772,6 +776,24 @@ async function ensurePostingsTable() {
   // so the UI can flag applications that need a manual sign-in.
   if (!existingColumns.has("requires_account")) {
     await db.exec(`ALTER TABLE Postings ADD COLUMN requires_account INTEGER;`);
+  }
+
+  // Why a posting is hidden, not just that it is. Two unrelated pruners set hidden = 1:
+  // one for postings the ATS has stopped listing ('delisted'), one for postings whose
+  // posting_date falls outside the freshness window ('outside_date_window'). The second
+  // kind is still live and still applyable -- a DoorDash role open 22 days reads exactly
+  // like one that was taken down -- and with a single boolean there was no way to ask for
+  // one and not the other. Empty means visible.
+  if (!existingColumns.has("hidden_reason")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN hidden_reason TEXT NOT NULL DEFAULT '';`);
+    // Existing hidden rows predate the column. last_seen_epoch is what distinguishes the
+    // two: a row the sync has seen recently was hidden for its date, not for going away.
+    await db.run(
+      `UPDATE Postings
+       SET hidden_reason = CASE WHEN last_seen_epoch >= ? THEN 'outside_date_window' ELSE 'delisted' END
+       WHERE hidden = 1 AND hidden_reason = '';`,
+      [nowEpochSeconds() - getPostingFreshnessWindowSeconds()]
+    );
   }
 
   await db.exec(`
@@ -1216,6 +1238,12 @@ function createServer() {
     } catch (error) {
       res.status(400).json({ error: String(error?.message || error) });
     }
+  });
+
+  // What the background enrichment loops have been doing: page fetches and semantic
+  // reindexing. Worth checking when liveness or hiring-location fields look empty.
+  app.get("/enrichment/status", (_req, res) => {
+    res.json(getEnrichmentStatus());
   });
 
   app.get("/health", async (_req, res) => {
@@ -1730,6 +1758,34 @@ function createServer() {
     }
   });
 
+  // The answers application forms ask for. Seeded with the standard questions at empty
+  // values; an empty value means "still to ask the user", never "fill this in yourself".
+  app.get("/settings/application-answers", async (_req, res) => {
+    try {
+      res.json({ ok: true, items: await listApplicationAnswers() });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: String(error?.message || error) });
+    }
+  });
+
+  // Accepts one {key, value, ...} or {items: [...]} for a bulk fill.
+  app.put("/settings/application-answers", async (req, res) => {
+    try {
+      const items = Array.isArray(req.body?.items) ? req.body.items : [req.body];
+      res.json({ ok: true, saved: await setApplicationAnswers(items) });
+    } catch (error) {
+      res.status(400).json({ ok: false, error: String(error?.message || error) });
+    }
+  });
+
+  app.delete("/settings/application-answers/:key", async (req, res) => {
+    try {
+      res.json({ ok: true, ...(await clearApplicationAnswer(req.params.key)) });
+    } catch (error) {
+      res.status(400).json({ ok: false, error: String(error?.message || error) });
+    }
+  });
+
   app.get("/settings/applicant-documents", async (_req, res) => {
     try {
       res.json({
@@ -1804,11 +1860,30 @@ function createServer() {
     }
 
     const instructions = String(req.body?.instructions || settings?.instructions_for_agent || "").trim();
-    const draft = buildCoverLetterDraft(personalInformation, posting, instructions);
+
+    // The brief is what makes the letter about this job: the posting's own requirements,
+    // the resume lines that speak to them, and the ones nothing in the resume supports.
+    const documentKey = normalizeDocumentKind(req.body?.document || "resume") || "resume";
+    const sourceDocument = await getApplicantDocument(documentKey);
+    let description = "";
+    if (jobPostingUrl) {
+      const descriptionRow = await db.get(
+        `SELECT job_description FROM Postings WHERE job_posting_url = ? LIMIT 1;`,
+        [jobPostingUrl]
+      );
+      description = String(descriptionRow?.job_description || "").trim();
+    }
+    const brief = buildCoverLetterBrief({
+      description,
+      resume_text: sourceDocument?.text || "",
+      posting
+    });
+    const draft = buildCoverLetterDraft(personalInformation, posting, instructions, brief);
 
     res.json({
       ok: true,
       posting,
+      brief,
       draft
     });
   });
@@ -2032,6 +2107,10 @@ async function start() {
   // Watches for a pass that stops making progress and abandons it, so a wedged sync
   // does not leave the cached promise in place and stop syncing until a restart.
   startSyncStallWatchdog();
+
+  // Fetching posting pages and keeping the semantic index current run on their own
+  // clocks, deliberately not tied to a sync pass finishing.
+  startEnrichmentLoops();
 
   runAtsSync().catch((error) => {
     console.error("[OpenPostings API] initial sync failed:", error);
