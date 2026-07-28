@@ -13,7 +13,7 @@ const fs = require("fs");
 const path = require("path");
 const zlib = require("zlib");
 const { decodeHtmlEntities } = require("../helpers/normalize-strings.js");
-const { getDb } = require("./runtime-context.js");
+const { getDb, runInWriteTransaction } = require("./runtime-context.js");
 
 // Documents are an open-ended map now, not a fixed pair. A career change means keeping
 // several tailored resumes -- "resume_hospitality" against the 13 years already served,
@@ -255,9 +255,8 @@ async function ensureApplicantDocumentsTable() {
     (await db.get(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'applicant_documents';`))?.sql || ""
   );
   if (/CHECK\s*\(\s*kind\s+IN/i.test(tableSql)) {
-    await db.exec("BEGIN TRANSACTION;");
-    try {
-      await db.exec(`
+    await runInWriteTransaction(async (handle) => {
+      await handle.exec(`
         CREATE TABLE applicant_documents_migrated (
           kind TEXT NOT NULL PRIMARY KEY,
           file_name TEXT NOT NULL,
@@ -277,11 +276,7 @@ async function ensureApplicantDocumentsTable() {
         DROP TABLE applicant_documents;
         ALTER TABLE applicant_documents_migrated RENAME TO applicant_documents;
       `);
-      await db.exec("COMMIT;");
-    } catch (error) {
-      await db.exec("ROLLBACK;");
-      throw error;
-    }
+    });
   }
 }
 

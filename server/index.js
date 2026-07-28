@@ -90,6 +90,7 @@ const { getMcpSettings, upsertMcpSettings, buildMcpRunbook } = require("./servic
 const { buildCoverLetterDraft, buildCoverLetterBrief } = require("./services/cover-letter.js");
 const { listApplications, createApplication, updateApplicationStatus, deleteApplicationById } = require("./services/applications.js");
 const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable, startSyncStallWatchdog } = require("./services/sync-runtime.js");
+const { startEnrichmentLoops, getEnrichmentStatus } = require("./services/enrichment-runtime.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
 const { listPostingsWithFilters, setPostingIgnoredState, getCounts, getWideScanStats } = require("./services/postings.js");
 const { getPostingFilterOptions } = require("./services/filter-options.js");
@@ -1221,6 +1222,12 @@ function createServer() {
     }
   });
 
+  // What the background enrichment loops have been doing: page fetches and semantic
+  // reindexing. Worth checking when liveness or hiring-location fields look empty.
+  app.get("/enrichment/status", (_req, res) => {
+    res.json(getEnrichmentStatus());
+  });
+
   app.get("/health", async (_req, res) => {
     const counts = await getCounts();
     res.json({
@@ -2082,6 +2089,10 @@ async function start() {
   // Watches for a pass that stops making progress and abandons it, so a wedged sync
   // does not leave the cached promise in place and stop syncing until a restart.
   startSyncStallWatchdog();
+
+  // Fetching posting pages and keeping the semantic index current run on their own
+  // clocks, deliberately not tied to a sync pass finishing.
+  startEnrichmentLoops();
 
   runAtsSync().catch((error) => {
     console.error("[OpenPostings API] initial sync failed:", error);

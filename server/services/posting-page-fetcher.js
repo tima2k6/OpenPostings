@@ -458,9 +458,17 @@ async function refreshPostingFromPage(row) {
   return persistInspection(row, inspection);
 }
 
-// The backfill: rows with no fetched description, newest first, bounded. Also the
-// re-verification pass -- refresh_all re-visits rows whose fetch is older than
-// max_age_seconds, which is what notices postings that have died since.
+// The backfill: rows with no description at all, newest first, bounded.
+//
+// Scope is deliberate. A page fetch establishes several things at once -- description,
+// liveness, hiring restrictions, prose pay, whether an account is needed -- and the last
+// four would be worth having on every posting. But there are hundreds of thousands of
+// postings and each needs its own rate-limited request, so fetching them all is not on the
+// table. The split is: this bulk pass targets postings with no description, because that
+// is the one gap that blocks screening entirely, while get_posting_details fetches on
+// demand for the handful actually being considered, which is where the liveness and
+// hiring-restriction fields earn their keep. refresh_all widens this to re-visit rows
+// whose fetch has gone stale, which is what notices postings that have died since.
 async function runDescriptionBackfill({ limit = 200, concurrency = 4, refresh_all = false, max_age_seconds = 7 * 86400 } = {}) {
   const db = getDb();
   const cutoff = nowEpochSeconds() - Math.max(3600, Number(max_age_seconds) || 7 * 86400);

@@ -4,7 +4,7 @@ const { upsertPersonalInformation } = require("../services/personal-info")
 const { upsertMcpSettings } = require("../services/mcp")
 const { normalizeCompanyNameForBlockList } = require("../helpers/normalize-ats")
 const { parseNonNegativeInteger, nowEpochSeconds, normalizeBoolean } = require("../helpers/normalize-numbers")
-const { getDb, setDb } = require("../services/runtime-context")
+const { getDb, setDb, runInWriteTransaction } = require("../services/runtime-context")
 
 const path = require("path");
 const fs = require("fs");
@@ -191,10 +191,8 @@ async function migrateSettingsAndApplicationsFromDatabase(rawSourceDbPath, selec
       );
 
       const sourceToTargetApplicationId = new Map();
-      const db = getDb()
 
-      await db.exec("BEGIN TRANSACTION;");
-      try {
+      await runInWriteTransaction(async (db) => {
         for (const item of sourceApplications) {
           const sourceCompanyName = String(item?.source_company_name || "").trim();
           const targetCompanyId = await resolveCompanyIdByName(sourceCompanyName);
@@ -329,11 +327,7 @@ async function migrateSettingsAndApplicationsFromDatabase(rawSourceDbPath, selec
           }
         }
 
-        await db.exec("COMMIT;");
-      } catch (error) {
-        await db.exec("ROLLBACK;");
-        throw error;
-      }
+      });
     }
   } finally {
     if (sourceDb) {

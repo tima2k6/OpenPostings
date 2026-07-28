@@ -1,5 +1,5 @@
 const { normalizeSyncEnabledAts, normalizeAtsFilterValue, inferPostingLocationFromJobUrl, ATS_FILTER_OPTIONS, ATS_FILTER_OPTION_ITEMS } = require("../helpers/normalize-ats");
-const { getSyncPromise, setSyncPromise, getDb, setDb, getPostingLocationByJobUrl, setPostingLocationByJobUrl, getSyncEnabledAts, getSyncDownloadJobDescriptions, getAtsRequestQueueConcurrency } = require("./runtime-context.js");
+const { getSyncPromise, setSyncPromise, getDb, setDb, getPostingLocationByJobUrl, setPostingLocationByJobUrl, getSyncEnabledAts, getSyncDownloadJobDescriptions, getAtsRequestQueueConcurrency, runInWriteTransaction } = require("./runtime-context.js");
 const { nowEpochSeconds, getPostingFreshnessWindowSeconds, shouldStorePostingByDate } = require("../helpers/normalize-numbers")
 const { normalizeCompensationType, serializeEducationLevels, normalizeCompensationCurrencyCode, normalizeCompensationPayPeriod } = require("../helpers/description-filters")
 const { parsePostingLocation, serializeLocationsJson } = require("../helpers/parse-location.js")
@@ -1109,23 +1109,11 @@ async function runAtsSyncInternal() {
       errors: errors.slice(0, 30)
     };
 
-    // Board listings rarely carry the job body, so after each pass a bounded batch of
-    // postings gets its own page fetched for the description (plus liveness, prose pay,
-    // and hiring-restriction detection). Fire-and-forget: description fetching must
-    // never extend the pass or fail it. Lazy require to keep module load order simple.
-    if (getSyncDownloadJobDescriptions()) {
-      const { runDescriptionBackfill } = require("./posting-page-fetcher.js");
-      runDescriptionBackfill({ limit: 300 })
-        .then((summary) => {
-          syncStatus.last_description_backfill = summary;
-          console.log(
-            `[OpenPostings API] description backfill: ${summary.updated} updated, ${summary.dead} dead, ${summary.failed} failed of ${summary.scanned}`
-          );
-        })
-        .catch((error) => {
-          console.error("[OpenPostings API] description backfill failed:", error);
-        });
-    }
+    // Description fetching used to be kicked off from here, on the end of a completed
+    // pass. That was the wrong clock: a pass over tens of thousands of companies runs for
+    // hours, so on a real database the hook effectively never fired and every field that
+    // depends on fetching a posting's own page stayed empty. It now runs on its own
+    // interval -- see services/enrichment-runtime.js.
   } catch (error) {
     if (syncGeneration === passGeneration) {
       syncStatus.last_error = String(error?.message || error);
@@ -1189,9 +1177,9 @@ function runAtsSync() {
 
 
 async function upsertPostingsBatch(postings, seenEpoch) {
-  const db = getDb()
-  await db.exec("BEGIN TRANSACTION;");
-  try {
+  // Serialized against every other writer on the shared connection -- background
+  // enrichment now runs concurrently with the sync, and overlapping BEGINs fail.
+  await runInWriteTransaction(async (db) => {
     for (const posting of postings) {
       const companyName = String(posting.company_name || "").trim();
       const positionName = String(posting.position_name || "").trim() || "Untitled Position";
@@ -1301,11 +1289,7 @@ async function upsertPostingsBatch(postings, seenEpoch) {
         ]
       );
     }
-    await db.exec("COMMIT;");
-  } catch (error) {
-    await db.exec("ROLLBACK;");
-    throw error;
-  }
+  });
 }
 
 async function upsertPostings(postings, lastSeenEpoch) {
@@ -1389,18 +1373,13 @@ async function deleteExpiredHiddenPostings(referenceEpoch = nowEpochSeconds()) {
     const chunk = idsToDelete.slice(offset, offset + chunkSize);
     if (chunk.length === 0) continue;
     const placeholders = chunk.map(() => "?").join(", ");
-    await db.exec("BEGIN TRANSACTION;");
-    try {
-      const result = await db.run(
+    totalDeleted += await runInWriteTransaction(async (handle) => {
+      const result = await handle.run(
         `DELETE FROM Postings WHERE id IN (${placeholders});`,
         chunk
       );
-      await db.exec("COMMIT;");
-      totalDeleted += Number(result?.changes || 0);
-    } catch (error) {
-      await db.exec("ROLLBACK;");
-      throw error;
-    }
+      return Number(result?.changes || 0);
+    });
   }
 
   return totalDeleted;
@@ -1431,14 +1410,13 @@ async function prunePostingsOutsideDateWindow(referenceEpoch = nowEpochSeconds()
   if (idsToHide.length === 0) return 0;
 
   let totalHidden = 0;
-  await db.exec("BEGIN TRANSACTION;");
-  try {
+  await runInWriteTransaction(async (handle) => {
     const chunkSize = 800;
     for (let offset = 0; offset < idsToHide.length; offset += chunkSize) {
       const chunk = idsToHide.slice(offset, offset + chunkSize);
       if (chunk.length === 0) continue;
       const placeholders = chunk.map(() => "?").join(", ");
-      const result = await db.run(
+      const result = await handle.run(
         `
           UPDATE Postings
           SET
@@ -1452,12 +1430,7 @@ async function prunePostingsOutsideDateWindow(referenceEpoch = nowEpochSeconds()
       );
       totalHidden += Number(result?.changes || 0);
     }
-
-    await db.exec("COMMIT;");
-  } catch (error) {
-    await db.exec("ROLLBACK;");
-    throw error;
-  }
+  });
 
   return totalHidden;
 }

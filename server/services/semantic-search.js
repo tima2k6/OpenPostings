@@ -21,7 +21,7 @@
 // not connect two texts that describe the same work in entirely disjoint vocabulary. If a
 // neural backend is ever wanted, `scoreCandidates` is the seam: replace it and leave the
 // rest.
-const { getDb } = require("./runtime-context.js");
+const { getDb, runInWriteTransaction } = require("./runtime-context.js");
 
 const FTS_TABLE = "postings_fts";
 const MAX_QUERY_TERMS = 60;
@@ -173,10 +173,11 @@ async function rebuildSemanticIndex({ rebuild = false, batch_size = 5000 } = {})
     );
     if (rows.length === 0) break;
 
-    await db.exec("BEGIN TRANSACTION;");
-    try {
+    // Serialized against every other writer: this runs on a background timer alongside the
+    // sync, and two overlapping BEGINs on the shared connection fail outright.
+    await runInWriteTransaction(async (handle) => {
       for (const row of rows) {
-        await db.run(
+        await handle.run(
           `INSERT INTO ${FTS_TABLE}(rowid, position_name, company_name, job_description)
            VALUES (?, ?, ?, ?);`,
           [row.id, row.position_name || "", row.company_name || "", row.job_description || ""]
@@ -186,11 +187,7 @@ async function rebuildSemanticIndex({ rebuild = false, batch_size = 5000 } = {})
         totalIndexed += 1;
       }
       await writeIndexState(lastId, totalIndexed);
-      await db.exec("COMMIT;");
-    } catch (error) {
-      await db.exec("ROLLBACK;");
-      throw error;
-    }
+    });
   }
 
   return { indexed, total_indexed: totalIndexed, since_id: since, last_id: lastId };

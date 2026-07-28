@@ -29,7 +29,7 @@ const {
   normalizeAppliedByLabel
 } = require("./helpers/normalize-strings.js");
 const { MCP_SETTINGS_DEFAULTS } = require("./helpers/normalize-mcp-settings.js");
-const { setDb } = require("./services/runtime-context.js");
+const { setDb, runInWriteTransaction } = require("./services/runtime-context.js");
 const { getMcpSettings, buildMcpRunbook } = require("./services/mcp.js");
 const { buildCoverLetterDraft, buildCoverLetterBrief } = require("./services/cover-letter.js");
 const { getPersonalInformation } = require("./services/personal-info.js");
@@ -519,9 +519,8 @@ async function createApplicationFromAgent(input) {
     );
   }
 
-  await db.exec("BEGIN TRANSACTION;");
-  try {
-    const result = await db.run(
+  const application = await runInWriteTransaction(async (handle) => {
+    const result = await handle.run(
       `
         INSERT INTO applications (
           company_id,
@@ -533,7 +532,7 @@ async function createApplicationFromAgent(input) {
       [company.id, positionName, applicationDate, status]
     );
 
-    await db.run(
+    await handle.run(
       `
         INSERT INTO application_attribution (
           application_id,
@@ -550,7 +549,7 @@ async function createApplicationFromAgent(input) {
     );
 
     if (jobPostingUrl) {
-      await db.run(
+      await handle.run(
         `
           INSERT INTO posting_application_state (
             job_posting_url,
@@ -573,7 +572,6 @@ async function createApplicationFromAgent(input) {
       );
     }
 
-    await db.exec("COMMIT;");
     return {
       id: result.lastID,
       company_id: company.id,
@@ -585,10 +583,9 @@ async function createApplicationFromAgent(input) {
       applied_by_type: "agent",
       applied_by_label: appliedByLabel
     };
-  } catch (error) {
-    await db.exec("ROLLBACK;");
-    throw error;
-  }
+  });
+
+  return application;
 }
 
 async function main() {

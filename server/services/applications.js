@@ -1,7 +1,7 @@
 const { normalizeLikeText, normalizeApplicationStatus, normalizeAppliedByType, normalizeAppliedByLabel } = require("../helpers/normalize-strings");
 const { parseNonNegativeInteger, nowEpochSeconds } = require("../helpers/normalize-numbers");
 const { markPostingAppliedState } = require("./postings.js");
-const { getDb, setDb } = require("../services/runtime-context")
+const { getDb, setDb, runInWriteTransaction } = require("../services/runtime-context")
 
 async function resolveCompanyIdForApplication(companyName) {
   const normalized = normalizeLikeText(companyName);
@@ -208,9 +208,8 @@ async function createApplication(input) {
   const appliedByLabel = normalizeAppliedByLabel(input?.applied_by_label, appliedByType);
   const db = getDb()
 
-  await db.exec("BEGIN TRANSACTION;");
-  try {
-    const result = await db.run(
+  const insertedId = await runInWriteTransaction(async (handle) => {
+    const result = await handle.run(
       `
         INSERT INTO applications (
           company_id,
@@ -222,7 +221,7 @@ async function createApplication(input) {
       [company.id, positionName, applicationDate, status]
     );
 
-    await db.run(
+    await handle.run(
       `
         INSERT INTO application_attribution (
           application_id,
@@ -249,12 +248,12 @@ async function createApplication(input) {
       });
     }
 
-    await db.exec("COMMIT;");
-    return getApplicationById(result.lastID);
-  } catch (error) {
-    await db.exec("ROLLBACK;");
-    throw error;
-  }
+    return result.lastID;
+  });
+
+  // Read back outside the transaction: getApplicationById joins several tables and has no
+  // business extending the write lock.
+  return getApplicationById(insertedId);
 }
 
 async function updateApplicationStatus(applicationId, statusValue) {
@@ -277,9 +276,7 @@ async function updateApplicationStatus(applicationId, statusValue) {
 }
 
 async function deleteApplicationById(applicationId) {
-  const db = getDb()
-  await db.exec("BEGIN TRANSACTION;");
-  try {
+  return runInWriteTransaction(async (db) => {
     const trackedPostingRows = await db.all(
       `
         SELECT job_posting_url
@@ -373,12 +370,8 @@ async function deleteApplicationById(applicationId) {
       }
     }
 
-    await db.exec("COMMIT;");
     return Number(result?.changes || 0) > 0;
-  } catch (error) {
-    await db.exec("ROLLBACK;");
-    throw error;
-  }
+  });
 }
 
 module.exports = { resolveCompanyIdForApplication, resolveCompanyIdFromPostingUrl, getExistingAppliedApplicationByPostingUrl, listApplications, createApplication, updateApplicationStatus, deleteApplicationById };
