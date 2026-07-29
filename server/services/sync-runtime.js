@@ -3,6 +3,7 @@ const { getSyncPromise, setSyncPromise, getDb, setDb, getPostingLocationByJobUrl
 const { nowEpochSeconds, getPostingFreshnessWindowSeconds, shouldStorePostingByDate } = require("../helpers/normalize-numbers")
 const { normalizeCompensationType, serializeEducationLevels, normalizeCompensationCurrencyCode, normalizeCompensationPayPeriod } = require("../helpers/description-filters")
 const { parsePostingLocation, serializeLocationsJson } = require("../helpers/parse-location.js")
+const { recordError } = require("./error-log.js")
 
 const { collectPostingsForWorkdayCompany } = require("../ats/workday/service.js");
 const { collectPostingsForAshbyCompany } = require("../ats/ashby/service.js");
@@ -112,7 +113,16 @@ const syncStatus = {
   last_error: null,
   progress: null,
   stall_recoveries: 0,
-  last_stall_recovery_at: null
+  last_stall_recovery_at: null,
+  // A pass that crawls happily but cannot write is indistinguishable from a healthy one
+  // in every other field here -- company progress advances, no error is thrown to the top
+  // level, and the summary that would have carried the failure counts is only published
+  // when the pass ends, hours later. These make "collecting but storing nothing" visible
+  // while it is still happening.
+  postings_stored: 0,
+  flush_failures: 0,
+  last_flush_error: null,
+  last_flush_error_at: null
 };
 
 // runAtsSync hands back the in-flight promise so passes cannot overlap. If a pass
@@ -813,6 +823,30 @@ const BOARD_WIDE_SYNC_TARGETS = [
   })
 ];
 
+// Runs flushes one at a time, and — the point of it — advances the queue with a settled
+// promise rather than the caller's. The previous version assigned the caller's promise
+// back to the chain, which poisoned it permanently: once a single flush rejected, every
+// later `.then(onFulfilled)` was skipped instead of run, so the flush function was never
+// called again for the rest of the pass. The crawl itself was unaffected, so one transient
+// write failure turned into 18 hours of collecting hundreds of thousands of postings into
+// memory and storing none of them, while the stall watchdog watched company progress tick
+// happily upwards. Same shape as runInWriteTransaction: the rejection goes to the caller,
+// a neutral promise goes to the chain.
+function createSerialFlushQueue(flush) {
+  let chain = Promise.resolve();
+  return (force = false) => {
+    const run = chain.then(
+      () => flush(force),
+      () => flush(force)
+    );
+    chain = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  };
+}
+
 async function runAtsSyncInternal() {
   const passGeneration = syncGeneration;
   const syncReferenceEpoch = nowEpochSeconds();
@@ -821,6 +855,10 @@ async function runAtsSyncInternal() {
   syncStatus.started_at = new Date().toISOString();
   syncStatus.progress = { current: 0, total: 0, company_name: "", total_collected: 0 };
   syncStatus.last_error = null;
+  syncStatus.postings_stored = 0;
+  syncStatus.flush_failures = 0;
+  syncStatus.last_flush_error = null;
+  syncStatus.last_flush_error_at = null;
 
   try {
     const companies = await getCompaniesForSync();
@@ -907,7 +945,6 @@ async function runAtsSyncInternal() {
     let nextCompanyIndex = 0;
     let completedCompanies = 0;
     const workerCount = Math.min(SYNC_WORKER_CONCURRENCY, Math.max(1, syncTargets.length));
-    let flushPromise = Promise.resolve();
 
     const flushPendingPostings = async (force = false) => {
       if (!Array.isArray(pendingPostingsForUpsert) || pendingPostingsForUpsert.length === 0) return;
@@ -915,13 +952,36 @@ async function runAtsSyncInternal() {
 
       const batch = pendingPostingsForUpsert.splice(0, pendingPostingsForUpsert.length);
       if (batch.length === 0) return;
-      await upsertPostings(batch, syncReferenceEpoch);
+      try {
+        await upsertPostings(batch, syncReferenceEpoch);
+        if (syncGeneration === passGeneration) {
+          syncStatus.postings_stored += batch.length;
+          syncStatus.flush_failures = 0;
+        }
+      } catch (error) {
+        // The batch was spliced off before the write, so a failure loses it -- the postings
+        // in it are not retried and are only picked up by a later pass. Worth a durable
+        // record, but only on the transition into failure: a pass whose every write fails
+        // would otherwise write thousands of identical rows into the banner.
+        if (syncGeneration === passGeneration) {
+          const firstFailure = syncStatus.flush_failures === 0;
+          syncStatus.flush_failures += 1;
+          syncStatus.last_flush_error = String(error?.message || error);
+          syncStatus.last_flush_error_at = new Date().toISOString();
+          if (firstFailure) {
+            await recordError({
+              source: "sync",
+              operation: "flushPendingPostings",
+              message: `Sync could not store collected postings: ${String(error?.message || error)}`,
+              context: { dropped_postings: batch.length, started_at: syncStatus.started_at }
+            });
+          }
+        }
+        throw error;
+      }
     };
 
-    const queueFlushPendingPostings = (force = false) => {
-      flushPromise = flushPromise.then(() => flushPendingPostings(force));
-      return flushPromise;
-    };
+    const queueFlushPendingPostings = createSerialFlushQueue(flushPendingPostings);
 
     const runSyncWorker = async () => {
       while (true) {
@@ -1627,6 +1687,6 @@ async function getSyncScopeStats() {
   };
 }
 
-module.exports = { runAtsSync, getSyncScopeStats, pruneExpiredPostings, deleteExpiredHiddenPostings, createCanonicalPostingsTable, upsertPostingsBatch, syncStatus, startSyncStallWatchdog, recoverStalledSync };
+module.exports = { runAtsSync, getSyncScopeStats, pruneExpiredPostings, deleteExpiredHiddenPostings, createCanonicalPostingsTable, upsertPostingsBatch, syncStatus, startSyncStallWatchdog, recoverStalledSync, createSerialFlushQueue };
 
 
