@@ -134,6 +134,60 @@ async function testFailureIsolation() {
   assert.strictEqual(survivor, "still working", "one failure must not close the queue");
 }
 
+// The line that turned a glitch into a 20-hour outage. The previous version set its
+// in-transaction flag *before* BEGIN and outside the try/finally, so a BEGIN that failed --
+// which is exactly what happens when another writer already holds one -- left the flag set
+// with nothing to clear it. Every subsequent write in the process then threw "cannot be
+// nested" until restart. The sync stopped storing postings, last_seen_epoch stopped
+// advancing, and 24 hours later the app's freshness window emptied the listing.
+//
+// So: a failed BEGIN must fail exactly one transaction and leave the queue usable.
+async function testBeginFailureDoesNotWedgeTheQueue() {
+  const realDb = getDb();
+  let failNextBegin = true;
+  // Passes everything through except the first BEGIN, which fails the way a busy database
+  // does.
+  const flaky = {
+    exec: async (sql) => {
+      if (failNextBegin && /^\s*BEGIN/i.test(String(sql))) {
+        failNextBegin = false;
+        throw new Error("SQLITE_BUSY: database is locked");
+      }
+      return realDb.exec(sql);
+    },
+    run: (...args) => realDb.run(...args),
+    get: (...args) => realDb.get(...args),
+    all: (...args) => realDb.all(...args)
+  };
+
+  setDb(flaky);
+  try {
+    await assert.rejects(
+      () => runInWriteTransaction(async () => "never runs"),
+      /database is locked/,
+      "a failed BEGIN surfaces to its own caller"
+    );
+
+    // The assertion that matters: the next unrelated write must still work.
+    const recovered = await runInWriteTransaction(async (handle) => {
+      await handle.run(`INSERT INTO t (tag) VALUES ('after-begin-failure');`);
+      return "recovered";
+    });
+    assert.strictEqual(recovered, "recovered", "a failed BEGIN must not wedge every later transaction");
+
+    // And repeatedly, since the real outage was a permanent wedge rather than one bad call.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const again = await runInWriteTransaction(async () => "still fine");
+      assert.strictEqual(again, "still fine");
+    }
+  } finally {
+    setDb(realDb);
+  }
+
+  const row = await getDb().get(`SELECT tag FROM t WHERE tag = 'after-begin-failure';`);
+  assert.ok(row, "the transaction after the failure committed for real");
+}
+
 // Serialization is the actual guarantee: never two transactions open at once.
 async function testNeverTwoOpenAtOnce() {
   let open = 0;
@@ -158,6 +212,7 @@ async function main() {
   await testConcurrentCallersAllSucceed();
   await testNestedStillThrows();
   await testFailureIsolation();
+  await testBeginFailureDoesNotWedgeTheQueue();
   await testNeverTwoOpenAtOnce();
   console.log("write-transaction tests passed");
 }
