@@ -1691,6 +1691,14 @@ export default function App() {
     const syncEnabledCompanies = Number(status.sync_enabled_company_count ?? summary.sync_enabled_company_count ?? 0);
     const excludedAtsCount = Number(status.excluded_ats_count ?? summary.excluded_ats_count ?? 0);
     const failedCompanies = Number(status.failed_companies ?? summary.failed_companies ?? 0);
+    // Pass position resets to 0 on every restart, so on its own it cannot say whether any
+    // company is being starved. Coverage is read from stored per-company sync times and
+    // survives restarts, which is the question worth answering after an interruption.
+    const coverage = status?.sync_coverage;
+    const coverageHint = coverage
+      ? ` | Coverage: ${Number(coverage.synced_within_window || 0).toLocaleString()}/${Number(coverage.enabled_companies || 0).toLocaleString()} companies synced in the last ${Math.round(Number(coverage.window_seconds || 86400) / 3600)}h` +
+        (Number(coverage.never_synced || 0) > 0 ? `, ${Number(coverage.never_synced).toLocaleString()} not yet reached` : "")
+      : "";
     const base = `Last sync: ${syncTime} | Sync-enabled companies: ${syncEnabledCompanies} | Stored today: ${status.posting_count || 0} | Failed companies: ${failedCompanies} | Excluded by ${freshnessHours}h window: ${excludedByDate} | Excluded ATS: ${excludedAtsCount}`;
     if (status.running && status.progress) {
       const collectedCount = Number(status.progress.total_collected || 0);
@@ -1700,9 +1708,9 @@ export default function App() {
         collectedCount > 0 && storedCount === 0
           ? " | Sync is collecting postings; visible results appear as batches are saved."
           : "";
-      return `${base} | Syncing ${status.progress.current}/${status.progress.total}: ${syncingCompanyName} (collected ${collectedCount})${liveSyncHint}`;
+      return `${base} | Syncing ${status.progress.current}/${status.progress.total}: ${syncingCompanyName} (collected ${collectedCount})${liveSyncHint}${coverageHint}`;
     }
-    return base;
+    return `${base}${coverageHint}`;
   }, [status, syncServiceSettings.active_posting_freshness_hours, syncServiceSettings.posting_freshness_hours]);
 
   const failedCompaniesByAtsList = useMemo(() => {

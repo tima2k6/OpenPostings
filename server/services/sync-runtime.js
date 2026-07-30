@@ -738,6 +738,55 @@ async function flushCompanySyncMarks() {
   }
 }
 
+// Coverage, as opposed to pass position. syncStatus.progress lives in memory and resets to
+// 0 on every restart, so it answers "how far into this run are we" and cannot answer the
+// question that actually matters after an interruption: is anything being starved. This
+// reads last_synced_epoch, so it survives restarts by construction.
+//
+// Scoped to the platforms currently enabled for sync. Counting the disabled ones would
+// report them as permanently unsynced, which is true and completely uninteresting.
+async function getSyncCoverageStats(withinSeconds = 24 * 60 * 60) {
+  const db = getDb();
+  if (!db) return null;
+
+  const enabled = normalizeSyncEnabledAts(Array.from(getSyncEnabledAts()));
+  if (enabled.length === 0) {
+    return { enabled_companies: 0, never_synced: 0, synced_within_window: 0, stale: 0, oldest_sync_age_seconds: null, window_seconds: withinSeconds };
+  }
+
+  const now = nowEpochSeconds();
+  const cutoff = now - withinSeconds;
+  const placeholders = enabled.map(() => "?").join(", ");
+  const row = await db.get(
+    `SELECT
+       COUNT(*) AS total,
+       SUM(CASE WHEN last_synced_epoch IS NULL THEN 1 ELSE 0 END) AS never_synced,
+       SUM(CASE WHEN last_synced_epoch >= ? THEN 1 ELSE 0 END) AS recent,
+       MIN(last_synced_epoch) AS oldest
+     FROM companies
+     WHERE LOWER(TRIM(ATS_name)) IN (${placeholders})
+       AND NOT EXISTS (
+         SELECT 1 FROM blocked_companies b
+         WHERE b.normalized_company_name = LOWER(TRIM(companies.company_name))
+       );`,
+    [cutoff, ...enabled]
+  );
+
+  const total = Number(row?.total || 0);
+  const neverSynced = Number(row?.never_synced || 0);
+  const recent = Number(row?.recent || 0);
+  const oldest = Number(row?.oldest || 0);
+  return {
+    enabled_companies: total,
+    never_synced: neverSynced,
+    synced_within_window: recent,
+    // Seen at some point, but not inside the window -- the ones drifting toward starvation.
+    stale: Math.max(0, total - recent - neverSynced),
+    oldest_sync_age_seconds: oldest > 0 ? now - oldest : null,
+    window_seconds: withinSeconds
+  };
+}
+
 async function getCompaniesForSync() {
   const db = getDb();
   const rows = await db.all(
@@ -1760,6 +1809,7 @@ async function getSyncScopeStats() {
 }
 
 module.exports = {
+  getSyncCoverageStats,
   // Exported for tests: pass resumability is the property worth pinning, and it is only
   // observable through the ordering plus the progress marks.
   getCompaniesForSync,

@@ -89,7 +89,7 @@ const { upsertSeededCompanySource } = require("./services/seeded-source.js");
 const { getMcpSettings, upsertMcpSettings, buildMcpRunbook } = require("./services/mcp.js");
 const { buildCoverLetterDraft, buildCoverLetterBrief } = require("./services/cover-letter.js");
 const { listApplications, createApplication, updateApplicationStatus, deleteApplicationById } = require("./services/applications.js");
-const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable, startSyncStallWatchdog } = require("./services/sync-runtime.js");
+const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable, startSyncStallWatchdog, getSyncCoverageStats } = require("./services/sync-runtime.js");
 const { startEnrichmentLoops, getEnrichmentStatus } = require("./services/enrichment-runtime.js");
 const { startWriteLivenessWatchdog, getWriteLivenessStatus } = require("./services/write-liveness.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
@@ -1410,15 +1410,19 @@ function createServer() {
 
   app.get("/sync/status", async (_req, res) => {
     try {
-      const [counts, syncScopeStats, syncSettings] = await Promise.all([
+      const [counts, syncScopeStats, syncSettings, coverage] = await Promise.all([
         getCounts(),
         getSyncScopeStats(),
-        getSyncServiceSettings()
+        getSyncServiceSettings(),
+        // Survives restarts, unlike syncStatus.progress, so this is what answers "is
+        // anything being starved" after an interrupted pass.
+        getSyncCoverageStats().catch(() => null)
       ]);
       const payload = sanitizeFrontendValue({
         ...syncStatus,
         ...syncScopeStats,
         filtered_query_queue: getWideScanStats(),
+        sync_coverage: coverage,
         posting_freshness_hours: syncSettings?.posting_freshness_hours,
         active_posting_freshness_hours: syncSettings?.active_posting_freshness_hours,
         min_posting_freshness_hours: syncSettings?.min_posting_freshness_hours,
