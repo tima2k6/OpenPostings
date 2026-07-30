@@ -688,27 +688,89 @@ async function collectPostingsForCompany(company, options = {}) {
 }
 
 
+// Least-recently-synced first, which is what makes a pass resumable.
+//
+// This had no ORDER BY, so every pass walked the same 61,612 companies in rowid order. A
+// pass takes hours; any restart sent it back to the front of that list to re-crawl what it
+// had just done, and anything past the point it reached was never visited at all. Whole
+// ATS platforms sitting late in the table could go permanently unsynced without anything
+// looking wrong.
+//
+// Ordering by last_synced_epoch removes the need for pass bookkeeping entirely: a restart
+// naturally continues with the companies nobody has looked at longest, and every company is
+// reached eventually no matter how often the process is interrupted. Never-synced companies
+// (NULL) sort first, so a newly seeded platform is picked up before anything is revisited.
+// Marks are buffered rather than written per company. A pass covers 61,612 of them, and one
+// UPDATE each would put 61,612 write transactions in front of the posting flushes they are
+// competing with. Losing a buffered mark on a crash is harmless -- the company is simply
+// re-crawled on the next lap, which is idempotent.
+const COMPANY_SYNC_MARK_BATCH = Number(process.env.SYNC_MARK_BATCH_SIZE || 250);
+let pendingCompanySyncMarks = [];
+
+function markCompanySynced(companyId, epoch) {
+  pendingCompanySyncMarks.push({ id: Number(companyId), epoch: Number(epoch) || nowEpochSeconds() });
+  if (pendingCompanySyncMarks.length >= COMPANY_SYNC_MARK_BATCH) {
+    // Fire and forget: progress bookkeeping must never hold up or fail a sync pass.
+    flushCompanySyncMarks().catch(() => {});
+  }
+}
+
+async function flushCompanySyncMarks() {
+  if (pendingCompanySyncMarks.length === 0) return 0;
+  const batch = pendingCompanySyncMarks.splice(0, pendingCompanySyncMarks.length);
+  const epoch = batch[batch.length - 1].epoch;
+  const ids = [...new Set(batch.map((entry) => entry.id).filter(Boolean))];
+  if (ids.length === 0) return 0;
+
+  try {
+    const placeholders = ids.map(() => "?").join(", ");
+    await runInWriteTransaction(async (handle) => {
+      await handle.run(
+        `UPDATE companies SET last_synced_epoch = ? WHERE id IN (${placeholders});`,
+        [epoch, ...ids]
+      );
+    });
+    return ids.length;
+  } catch (error) {
+    // A lost mark costs a re-crawl, not data. Not worth failing the pass or filling the
+    // error banner.
+    return 0;
+  }
+}
+
 async function getCompaniesForSync() {
   const db = getDb();
   const rows = await db.all(
     `
-      SELECT id, company_name, url_string, ATS_name
+      SELECT id, company_name, url_string, ATS_name, last_synced_epoch
       FROM companies
       WHERE NOT EXISTS (
         SELECT 1
         FROM blocked_companies b
         WHERE b.normalized_company_name = LOWER(TRIM(companies.company_name))
-      );
+      )
+      ORDER BY COALESCE(last_synced_epoch, 0) ASC, id ASC;
     `
   );
 
   const enabledAts = new Set(normalizeSyncEnabledAts(Array.from(getSyncEnabledAts())));
+  // Staleness first, and only then the old ATS/name grouping as a deterministic tiebreak.
+  //
+  // This used to sort by ATS name and discard the query's order entirely, which is what made
+  // the "missing platforms" problem structural rather than incidental: the pass worked
+  // through platforms alphabetically, so an interrupted run always re-did the ones near the
+  // start of the alphabet and the ones near the end were never reached at all.
+  //
+  // Grouping by ATS is not load-bearing. Rate limiting is enforced per platform inside the
+  // request queue, so interleaving platforms is if anything gentler -- concurrent workers
+  // spread across several hosts instead of hammering one.
   return rows
     .filter((row) => enabledAts.has(normalizeAtsFilterValue(row?.ATS_name)))
     .sort((a, b) => {
-      const aAts = String(a?.ATS_name || "");
-      const bAts = String(b?.ATS_name || "");
-      const atsCompare = aAts.localeCompare(bAts);
+      const aSynced = Number(a?.last_synced_epoch || 0);
+      const bSynced = Number(b?.last_synced_epoch || 0);
+      if (aSynced !== bSynced) return aSynced - bSynced;
+      const atsCompare = String(a?.ATS_name || "").localeCompare(String(b?.ATS_name || ""));
       if (atsCompare !== 0) return atsCompare;
       return String(a?.company_name || "").localeCompare(String(b?.company_name || ""));
     });
@@ -1032,6 +1094,12 @@ async function runAtsSyncInternal() {
             message: String(error?.message || error)
           });
         } finally {
+          // Marked on completion whether or not it succeeded. A company that always fails
+          // must not stay at the head of the queue forever, starving everything behind it --
+          // it gets its turn again on the next lap like everything else.
+          if (company?.id) {
+            markCompanySynced(company.id, syncReferenceEpoch);
+          }
           if (pendingPostingsForUpsert.length >= SYNC_POSTING_FLUSH_BATCH_SIZE) {
             try {
               await queueFlushPendingPostings(false);
@@ -1168,6 +1236,10 @@ async function runAtsSyncInternal() {
       excluded_during_sync_by_posting_date: excludedByPostingDate,
       errors: errors.slice(0, 30)
     };
+
+    // The tail of the progress buffer, so the final partial batch is recorded rather than
+    // re-crawled next time.
+    await flushCompanySyncMarks();
 
     // Description fetching used to be kicked off from here, on the end of a completed
     // pass. That was the wrong clock: a pass over tens of thousands of companies runs for
@@ -1687,6 +1759,11 @@ async function getSyncScopeStats() {
   };
 }
 
-module.exports = { runAtsSync, getSyncScopeStats, pruneExpiredPostings, deleteExpiredHiddenPostings, createCanonicalPostingsTable, upsertPostingsBatch, syncStatus, startSyncStallWatchdog, recoverStalledSync, createSerialFlushQueue };
+module.exports = {
+  // Exported for tests: pass resumability is the property worth pinning, and it is only
+  // observable through the ordering plus the progress marks.
+  getCompaniesForSync,
+  markCompanySynced,
+  flushCompanySyncMarks, runAtsSync, getSyncScopeStats, pruneExpiredPostings, deleteExpiredHiddenPostings, createCanonicalPostingsTable, upsertPostingsBatch, syncStatus, startSyncStallWatchdog, recoverStalledSync, createSerialFlushQueue };
 
 

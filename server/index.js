@@ -787,6 +787,18 @@ async function ensurePostingsTable() {
   // kind is still live and still applyable -- a DoorDash role open 22 days reads exactly
   // like one that was taken down -- and with a single boolean there was no way to ask for
   // one and not the other. Empty means visible.
+  // Sync progress, so a pass survives a restart. Without it every pass walked the company
+  // table in rowid order from the top, and since a pass takes hours, any restart re-crawled
+  // the same front of the list and never reached the tail -- whole ATS platforms could go
+  // permanently unsynced.
+  const companyColumns = await db.all(`PRAGMA table_info('companies');`);
+  if (!companyColumns.some((column) => String(column?.name) === "last_synced_epoch")) {
+    await db.exec(`ALTER TABLE companies ADD COLUMN last_synced_epoch INTEGER;`);
+  }
+  // The sync orders every pass by this column, so it needs to be an index scan rather than
+  // a sort of 61,612 rows on each start.
+  await db.exec(`CREATE INDEX IF NOT EXISTS idx_companies_last_synced ON companies (last_synced_epoch, id);`);
+
   if (!existingColumns.has("hidden_reason")) {
     await db.exec(`ALTER TABLE Postings ADD COLUMN hidden_reason TEXT NOT NULL DEFAULT '';`);
     // Existing hidden rows predate the column. last_seen_epoch is what distinguishes the
