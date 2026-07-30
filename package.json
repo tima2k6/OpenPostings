@@ -24,6 +24,7 @@
     "test:backend:enrichment-runtime": "node server/tests/enrichment-runtime.test.js",
     "test:backend:hidden-reason": "node server/tests/hidden-reason.test.js",
     "test:backend:error-log": "node server/tests/error-log.test.js",
+    "test:backend:write-transaction": "node server/tests/write-transaction.test.js",
     "test:filter-normalize": "node server/tests/filter-normalize.test.js",
     "test:backend:api-request-errors": "node server/tests/api-request-errors.test.js",
     "test:backend:db-browser": "node server/tests/db-browser.test.js",

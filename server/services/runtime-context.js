@@ -28,13 +28,26 @@ function getDb() {
 // The chain deliberately absorbs failures on both branches: a task that threw must not
 // prevent every later transaction in the process from running.
 let writeTransactionChain = Promise.resolve();
-let insideWriteTransaction = false;
+
+// Nesting has to be distinguished from concurrency, and a plain module-level boolean cannot
+// do it. The first version of this guard set a flag while a transaction ran and threw if a
+// caller arrived to find it set -- which rejected every *concurrent* caller, not just nested
+// ones. That is the exact case the chain exists to handle: the sync flushing postings while
+// a background enrichment pass holds the transaction is two independent writers that should
+// queue, and instead the sync threw and dropped its batch. It cost 152 postings per
+// occurrence before the error log surfaced it.
+//
+// AsyncLocalStorage answers the question the flag was trying to: "is the code calling me
+// running inside a transaction task?" A nested call inherits the store and is rejected; an
+// unrelated caller has no store and queues normally.
+const { AsyncLocalStorage } = require("node:async_hooks");
+const writeTransactionContext = new AsyncLocalStorage();
 
 async function runInWriteTransaction(task) {
-  // A nested call would wait on the chain that its own caller is still holding, and hang
-  // forever with no error. Failing loudly turns a silent deadlock into a stack trace
+  // A genuinely nested call would wait on the chain its own caller is still holding, and
+  // hang forever with no error. Failing loudly turns a silent deadlock into a stack trace
   // pointing at the offending call site.
-  if (insideWriteTransaction) {
+  if (writeTransactionContext.getStore()) {
     throw new Error(
       "runInWriteTransaction cannot be nested: this task is already inside a write transaction. " +
         "Pass the handle it was given down instead of opening another transaction."
@@ -44,10 +57,11 @@ async function runInWriteTransaction(task) {
   const execute = async () => {
     const handle = getDb();
     if (!handle) throw new Error("No database handle is set.");
-    insideWriteTransaction = true;
     await handle.exec("BEGIN TRANSACTION;");
     try {
-      const result = await task(handle);
+      // Only the task runs inside the context, so the nesting check above sees it while
+      // this transaction is open and does not see it for callers arriving from elsewhere.
+      const result = await writeTransactionContext.run({ active: true }, () => task(handle));
       await handle.exec("COMMIT;");
       return result;
     } catch (error) {
@@ -56,8 +70,6 @@ async function runInWriteTransaction(task) {
         await handle.exec("ROLLBACK;");
       } catch {}
       throw error;
-    } finally {
-      insideWriteTransaction = false;
     }
   };
 
