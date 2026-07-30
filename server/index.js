@@ -589,6 +589,15 @@ async function initDb() {
     -- exactly that into dropping the Postings table. Wait instead.
     PRAGMA busy_timeout = 30000;
 
+    -- 2 MB of page cache for a 2.4 GB database meant almost every read touched disk. 256 MB
+    -- is still small relative to the file but covers the hot indexes.
+    PRAGMA cache_size = -262144;
+
+    -- The WAL had grown to 412 MB because the default 1000-page threshold never kept up with
+    -- a continuously-writing sync, and every reader has to scan it. A larger threshold
+    -- checkpoints in fewer, bigger passes instead of never finishing small ones.
+    PRAGMA wal_autocheckpoint = 20000;
+
     PRAGMA journal_mode = WAL;
 
     CREATE TABLE IF NOT EXISTS companies (
@@ -611,6 +620,14 @@ async function initDb() {
   await ensureBlockedCompaniesTable();
   await ensureApplicationAnswersTable();
   await ensureErrorLogTable();
+  // Real wall-clock time of the last sync write. Kept separate from Postings.last_seen_epoch,
+  // which records when a pass started rather than when a row was written.
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS sync_write_heartbeat (
+      id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+      wrote_at_epoch INTEGER NOT NULL
+    );
+  `);
   await ensureSyncServiceSettingsTable();
   await loadSyncServiceSettingsIntoRuntime();
   await ensureCompaniesTableSchema();

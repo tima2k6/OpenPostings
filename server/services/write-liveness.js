@@ -58,8 +58,23 @@ async function checkWriteLiveness({
 
   let newest = 0;
   try {
-    const row = await db.get(`SELECT MAX(last_seen_epoch) AS newest FROM Postings;`);
-    newest = Number(row?.newest || 0);
+    // The heartbeat, not MAX(last_seen_epoch). That column carries syncReferenceEpoch --
+    // the time the *pass* began, stamped identically on every row the pass writes -- so
+    // reading it as "time of last write" reports the age of the running pass and fired a
+    // false stall on every pass longer than the threshold. It did exactly that twice.
+    const { getLastSyncWriteEpoch } = require("./sync-runtime.js");
+    newest = Number(await getLastSyncWriteEpoch());
+    if (!newest) {
+      // No heartbeat yet (a database that predates it). Fall back, but the fallback shares
+      // the flaw above, so treat a missing heartbeat as unknown rather than as a stall.
+      const row = await db.get(`SELECT MAX(last_seen_epoch) AS newest FROM Postings;`);
+      const fallback = Number(row?.newest || 0);
+      if (fallback > 0) {
+        state.last_checked_at = new Date(now * 1000).toISOString();
+        state.stalled = false;
+        return { checked: true, stalled: false, reason: "no write heartbeat yet; not inferring a stall from pass timestamps" };
+      }
+    }
   } catch (error) {
     // A table that cannot be read is a different problem, and one the caller of this will
     // already be seeing.

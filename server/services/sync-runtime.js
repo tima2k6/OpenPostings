@@ -745,6 +745,36 @@ async function flushCompanySyncMarks() {
 //
 // Scoped to the platforms currently enabled for sync. Counting the disabled ones would
 // report them as permanently unsynced, which is true and completely uninteresting.
+// The time a posting was last actually written, which is not what last_seen_epoch records.
+// That column is stamped with syncReferenceEpoch -- captured once when a pass starts -- so
+// every row a pass writes carries the pass's start time. Reading MAX(last_seen_epoch) as
+// "when did we last write" therefore reports the age of the current pass, and made the
+// liveness watchdog fire a false stall on every pass longer than its threshold.
+async function recordSyncWriteHeartbeat(epoch = nowEpochSeconds()) {
+  try {
+    const db = getDb();
+    if (!db) return;
+    await db.run(
+      `INSERT INTO sync_write_heartbeat (id, wrote_at_epoch) VALUES (1, ?)
+       ON CONFLICT(id) DO UPDATE SET wrote_at_epoch = excluded.wrote_at_epoch;`,
+      [epoch]
+    );
+  } catch {
+    // Heartbeat bookkeeping must never fail a sync write.
+  }
+}
+
+async function getLastSyncWriteEpoch() {
+  try {
+    const db = getDb();
+    if (!db) return 0;
+    const row = await db.get(`SELECT wrote_at_epoch FROM sync_write_heartbeat WHERE id = 1;`);
+    return Number(row?.wrote_at_epoch || 0);
+  } catch {
+    return 0;
+  }
+}
+
 async function getSyncCoverageStats(withinSeconds = 24 * 60 * 60) {
   const db = getDb();
   if (!db) return null;
@@ -1045,7 +1075,16 @@ async function runAtsSyncInternal() {
       });
     }
     const postingLocationByJobUrl = getPostingLocationByJobUrl();
-    const nextPostingLocationByJobUrl = new Map(postingLocationByJobUrl);
+    // Mutated in place rather than cloned. This used to be `new Map(postingLocationByJobUrl)`,
+    // which duplicated one entry per stored posting -- 886,773 URL/location string pairs --
+    // at the start of every pass, so the process carried two full copies for the pass's
+    // entire multi-hour duration. That is most of the 2.2 GB resident this was observed at,
+    // on a host with 8 GB, and the memory pressure is the likeliest cause of the API errors
+    // and the MCP disconnect that surfaced alongside it.
+    //
+    // The clone bought nothing: the map is a cache of a column already in the database, and
+    // both copies were replaced by the same object at the end of the pass anyway.
+    const nextPostingLocationByJobUrl = postingLocationByJobUrl;
 
     // Tracks which job_posting_urls have already been queued this run, without holding onto the
     // full posting payload (job descriptions can be large and this set stays alive for the whole
@@ -1065,6 +1104,8 @@ async function runAtsSyncInternal() {
       if (batch.length === 0) return;
       try {
         await upsertPostings(batch, syncReferenceEpoch);
+        // Real wall-clock time of a real write, unlike syncReferenceEpoch.
+        await recordSyncWriteHeartbeat();
         if (syncGeneration === passGeneration) {
           syncStatus.postings_stored += batch.length;
           syncStatus.flush_failures = 0;
@@ -1810,6 +1851,8 @@ async function getSyncScopeStats() {
 
 module.exports = {
   getSyncCoverageStats,
+  getLastSyncWriteEpoch,
+  recordSyncWriteHeartbeat,
   // Exported for tests: pass resumability is the property worth pinning, and it is only
   // observable through the ordering plus the progress marks.
   getCompaniesForSync,

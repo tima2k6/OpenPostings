@@ -33,13 +33,25 @@ async function setup() {
       job_posting_url TEXT NOT NULL,
       last_seen_epoch INTEGER
     );
+    CREATE TABLE IF NOT EXISTS sync_write_heartbeat (
+      id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+      wrote_at_epoch INTEGER NOT NULL
+    );
   `);
 }
 
+// Writes the heartbeat, which is what the watchdog reads. Postings.last_seen_epoch is set
+// too, deliberately to a *different* and much older value, so any case that passes here is
+// proving the watchdog uses the heartbeat rather than the pass-start column.
 async function setNewestWrite(epoch) {
   const db = getDb();
   await db.run(`DELETE FROM Postings;`);
-  await db.run(`INSERT INTO Postings (job_posting_url, last_seen_epoch) VALUES ('https://x/1', ?);`, [epoch]);
+  await db.run(`INSERT INTO Postings (job_posting_url, last_seen_epoch) VALUES ('https://x/1', ?);`, [epoch - 99 * 3600]);
+  await db.run(
+    `INSERT INTO sync_write_heartbeat (id, wrote_at_epoch) VALUES (1, ?)
+     ON CONFLICT(id) DO UPDATE SET wrote_at_epoch = excluded.wrote_at_epoch;`,
+    [epoch]
+  );
 }
 
 function freshState() {
@@ -69,6 +81,29 @@ async function testFiresWhenWritesHaveStopped() {
     Number(alert.context.freshness_window_hours) > 0,
     "the notice records which freshness window it was reasoning about"
   );
+}
+
+// The false positive this watchdog actually produced, twice. A pass stamps every row it
+// writes with syncReferenceEpoch, captured when the pass began, so during a long pass
+// MAX(last_seen_epoch) is hours old while writes are landing continuously. Reading that
+// column reported a stall on a completely healthy sync.
+async function testLongRunningPassIsNotAStall() {
+  await acknowledgeErrors([]);
+  const db = getDb();
+  // Six hours into a pass: rows carry the pass start time, but a write just happened.
+  await db.run(`DELETE FROM Postings;`);
+  await db.run(`INSERT INTO Postings (job_posting_url, last_seen_epoch) VALUES ('https://x/1', ?);`, [NOW - 6 * HOUR]);
+  await db.run(
+    `INSERT INTO sync_write_heartbeat (id, wrote_at_epoch) VALUES (1, ?)
+     ON CONFLICT(id) DO UPDATE SET wrote_at_epoch = excluded.wrote_at_epoch;`,
+    [NOW - 30]
+  );
+
+  const state = freshState();
+  const result = await checkWriteLiveness({ now: NOW, thresholdSeconds: THRESHOLD, state });
+  assert.strictEqual(result.stalled, false, "a long pass with recent writes is not a stall");
+  const { items } = await listErrors({});
+  assert.strictEqual(items.length, 0, "no notice for a healthy long-running pass");
 }
 
 async function testSilentWhenWritesAreRecent() {
@@ -151,6 +186,7 @@ async function testStartupGracePeriod() {
 async function testNoWritesEverIsReported() {
   await acknowledgeErrors([]);
   await getDb().run(`DELETE FROM Postings;`);
+  await getDb().run(`DELETE FROM sync_write_heartbeat;`);
   const state = freshState();
   const result = await checkWriteLiveness({ now: NOW, thresholdSeconds: THRESHOLD, state });
 
@@ -163,6 +199,7 @@ async function testNoWritesEverIsReported() {
 async function main() {
   await setup();
   await testFiresWhenWritesHaveStopped();
+  await testLongRunningPassIsNotAStall();
   await testSilentWhenWritesAreRecent();
   await testDoesNotRepeatWithinAnEpisode();
   await testRecoveryResetsTheEpisode();
