@@ -59,10 +59,16 @@ async function testFiresWhenWritesHaveStopped() {
   const alert = items.find((item) => item.operation === "write_liveness");
   assert.ok(alert, "a stalled write path must produce a notice");
   assert.match(alert.message, /has not stored a posting in 20 hours/);
-  // The message has to say what it means for the user, not just state a number -- the
-  // consequence is the app emptying, and that is the part worth acting on.
-  assert.match(alert.message, /listing will empty/i);
+  // The message has to say what it means for the user, not just state a number. It also has
+  // to read the *configured* freshness window rather than assume the module default: this
+  // install runs 7 days, and an earlier version asserted 24 hours and so claimed the listing
+  // was about to empty when it had six days of headroom.
+  assert.match(alert.message, /freshness window of \d+ hours/i);
   assert.strictEqual(alert.context.threshold_seconds, THRESHOLD);
+  assert.ok(
+    Number(alert.context.freshness_window_hours) > 0,
+    "the notice records which freshness window it was reasoning about"
+  );
 }
 
 async function testSilentWhenWritesAreRecent() {
