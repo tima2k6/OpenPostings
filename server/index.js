@@ -91,6 +91,7 @@ const { buildCoverLetterDraft, buildCoverLetterBrief } = require("./services/cov
 const { listApplications, createApplication, updateApplicationStatus, deleteApplicationById } = require("./services/applications.js");
 const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable, startSyncStallWatchdog } = require("./services/sync-runtime.js");
 const { startEnrichmentLoops, getEnrichmentStatus } = require("./services/enrichment-runtime.js");
+const { startWriteLivenessWatchdog, getWriteLivenessStatus } = require("./services/write-liveness.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
 const { listPostingsWithFilters, setPostingIgnoredState, getCounts, getWideScanStats } = require("./services/postings.js");
 const { getPostingFilterOptions } = require("./services/filter-options.js");
@@ -1294,7 +1295,7 @@ function createServer() {
   // What the background enrichment loops have been doing: page fetches and semantic
   // reindexing. Worth checking when liveness or hiring-location fields look empty.
   app.get("/enrichment/status", (_req, res) => {
-    res.json(getEnrichmentStatus());
+    res.json({ ...getEnrichmentStatus(), write_liveness: getWriteLivenessStatus() });
   });
 
   app.get("/health", async (_req, res) => {
@@ -2198,6 +2199,11 @@ async function start() {
   // Fetching posting pages and keeping the semantic index current run on their own
   // clocks, deliberately not tied to a sync pass finishing.
   startEnrichmentLoops();
+
+  // Notices a write path that has gone quiet, which no error can report because nothing
+  // throws. This is what would have caught the transaction wedge in an hour instead of
+  // twenty.
+  startWriteLivenessWatchdog();
 
   runAtsSync().catch((error) => {
     console.error("[OpenPostings API] initial sync failed:", error);
