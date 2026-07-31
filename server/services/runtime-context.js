@@ -15,6 +15,46 @@ function getDb() {
   return db;
 }
 
+// A second connection, opened read-only, for the endpoints the app polls.
+//
+// Everything shared one connection, and a SQLite connection executes one statement at a
+// time -- so every read the app made queued behind whatever write transaction the sync was
+// in the middle of. The app's own timeout message named it: "the API may be busy (a sync
+// competes with it for the same database connection)". The /db browser already had its own
+// read-only connection for exactly this reason; the listing and status endpoints did not.
+//
+// WAL mode is what makes this safe: a reader on a separate connection sees the latest
+// committed data without taking a lock, so it neither blocks the writer nor waits for it.
+let readerDb = null;
+
+// Registered explicitly by whoever owns the writer, never inferred.
+//
+// The first version resolved its own path from DB_PATH or a default, which meant it opened
+// the production database no matter which one setDb() had been handed -- so every test
+// using a temp fixture silently read live data instead, and any deployment whose path came
+// from somewhere other than that env var would have done the same. A connection that
+// guesses which database it is talking to is worse than no second connection.
+function setReaderDb(nextReaderDb) {
+  readerDb = nextReaderDb;
+  return readerDb;
+}
+
+function getReaderDb() {
+  return readerDb;
+}
+
+// The writer is the fallback, so callers need not care whether a reader was registered.
+// Correctness never depends on it: the reader is a performance decision, and pointing at
+// the same database is a correctness one.
+function getReadDb() {
+  return readerDb || getDb();
+}
+
+// setDb replacing the writer invalidates any reader registered against the old database.
+function resetReaderDb() {
+  readerDb = null;
+}
+
 // SQLite has no nested transactions, and every writer in this process shares the single
 // connection above. Two overlapping `BEGIN TRANSACTION` statements therefore fail outright
 // with "cannot start a transaction within a transaction" -- which is exactly what happened
@@ -91,6 +131,9 @@ function getPostingLocationByJobUrl() {
 
 function setDb(nextDb) {
   db = nextDb;
+  // A reader opened against the previous database must not survive the swap -- that is
+  // exactly how the listing ended up reading production data inside a test fixture.
+  readerDb = null;
 }
 
 function setSyncPromise(nextSyncPromise) {
@@ -132,6 +175,10 @@ function setAtsRequestQueueConcurrency(nextAtsRequestQueueConcurrency) {
 
 module.exports = {
   getDb,
+  getReadDb,
+  getReaderDb,
+  setReaderDb,
+  resetReaderDb,
   runInWriteTransaction,
   setDb,
   getSyncPromise,

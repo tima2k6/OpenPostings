@@ -41,12 +41,27 @@ async function seed(db, postings) {
   }
 }
 
+// The reader connection must never point at a different database than the writer. It first
+// resolved its own path from DB_PATH with a hardcoded default, so it opened the production
+// database no matter what setDb() had been given -- every test below silently read live
+// data instead of its fixture, which is how this was caught. setDb now clears any reader
+// registered against the previous database.
+async function assertReaderFollowsTheWriter() {
+  const { getReadDb, getDb: currentDb } = require("../services/runtime-context.js");
+  assert.strictEqual(
+    getReadDb(),
+    currentDb(),
+    "with no reader registered, reads must use the writer -- never a guessed database"
+  );
+}
+
 async function withDb(postings, run) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openpostings-pushdown-"));
   setDb(await openDatabase({ filename: path.join(dir, "test.db") }));
   setPostingLocationByJobUrl(new Map());
   try {
     await createCanonicalPostingsTable();
+    await assertReaderFollowsTheWriter();
     const db = getDb();
     await db.exec(`
       CREATE TABLE IF NOT EXISTS blocked_companies (

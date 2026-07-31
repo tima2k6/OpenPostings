@@ -4,7 +4,7 @@ const { normalizeStringArray, normalizeLikeText, normalizeAppliedByType, normali
 const { normalizeCompensationType, normalizeCompensationPayPeriod, normalizeEducationLevels, parseEducationLevels, normalizeCompensationCurrencyCode, parseCountyFilters, parseCountryFilters, parseRegionFilters, normalizeRemoteFilters, buildIndustryMatchersByKey, rowMatchesIndustryLikeParts, rowMatchesEducationFilter, rowMatchesCompensationFilter, rowMatchesCompensationRangeFilter, rowMatchesLocationFilters, rowMatchesRemoteFilter, buildDefaultCountryFilterOptions, inferLocationGeo, LOCATION_REGION_OPTIONS, STATE_CODE_TO_NAME } = require("../helpers/description-filters");
 const { normalizePayFilterNumber, normalizeBoolean, parseNonNegativeInteger, nowEpochSeconds, parsePostingDateToEpochSeconds, getPostingFreshnessWindowSeconds } = require("../helpers/normalize-numbers");
 const { inferAshbyLocationFromDescription } = require("../ats/ashby/service.js");
-const { getDb, setDb, getPostingLocationByJobUrl } = require("../services/runtime-context")
+const { getDb, setDb, getReadDb, getPostingLocationByJobUrl } = require("../services/runtime-context")
 const { parseCityFilters, rowMatchesCityFilters, parseLocationsJson, parsePostingLocation } = require("../helpers/parse-location")
 
 const DEFAULT_COUNTRY_FILTER_OPTIONS = buildDefaultCountryFilterOptions();
@@ -426,7 +426,12 @@ async function hydrateJobDescriptions(db, items) {
 }
 
 async function listPostingsWithFilters(options = {}) {
-  const db = getDb()
+  // The reader connection, not the writer. This is the app's hottest read, and on the
+  // shared connection every call queued behind whatever write transaction the sync was in
+  // -- which is exactly the timeout the app reports ("a sync competes with it for the same
+  // database connection"). WAL lets a separate reader see committed data without taking a
+  // lock, so it neither blocks the sync nor waits on it.
+  const db = getReadDb();
   const freshnessCutoffEpoch = getPostingFreshnessCutoffEpoch();
   const search = String(options?.search || "").trim();
   const limit = Math.max(1, Math.min(2000, Number(options?.limit || 500)));
@@ -1074,7 +1079,9 @@ async function setPostingIgnoredState(payload) {
 
 
 async function getCounts() {
-  const db = getDb()
+  // Reader connection: /sync/status is polled continuously and its COUNT(*) over ~930k
+  // postings has no business queueing behind a sync write transaction.
+  const db = getReadDb()
   const companyRow = await db.get(`SELECT COUNT(*) AS count FROM companies;`);
   const postingRow = await db.get(
     `

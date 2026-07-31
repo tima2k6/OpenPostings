@@ -98,7 +98,7 @@ const { getPostingFilterOptions } = require("./services/filter-options.js");
 const { extractDocumentText, getApplicantDocument, saveApplicantDocument, listApplicantDocuments, deleteApplicantDocument, checkConfiguredDocumentPaths, normalizeDocumentKind, MAX_DOCUMENT_KEY_LENGTH, APPLICANT_DOCUMENT_KINDS } = require("./services/applicant-documents.js");
 const { ensureApplicationAnswersTable, listApplicationAnswers, setApplicationAnswers, clearApplicationAnswer } = require("./services/application-answers.js");
 const { ensureErrorLogTable, recordError, listErrors, acknowledgeErrors } = require("./services/error-log.js");
-const { getDb, setDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
+const { getDb, setDb, setReaderDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
 
 const cors = require("cors");
 const express = require("express");
@@ -106,7 +106,7 @@ const fs = require("fs");
 const path = require("path");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
-const { openDatabase } = require("./db/open-database.js");
+const { openDatabase, getSqliteReadOnlyMode } = require("./db/open-database.js");
 const { findCompanies, findPostings, runReadOnlyQuery, rejectUnsafeQuery, MAX_ROWS } = require("./services/db-browser.js");
 const { DB_BROWSER_PAGE } = require("./services/db-browser-page.js");
 const { runQuery: runPostingQuery } = require("./services/db-query.js");
@@ -579,6 +579,20 @@ async function initDb() {
   setDb(await openDatabase({
     filename: DB_PATH
   }));
+
+  // A second connection on the same file, read-only, for the endpoints the app polls.
+  // Registered explicitly with DB_PATH rather than letting the helper guess, because a
+  // reader pointing at a different database than the writer is a correctness bug, not a
+  // performance one. Opened after the writer so a failure here degrades to sharing the
+  // writer rather than preventing startup.
+  try {
+    const reader = await openDatabase({ filename: DB_PATH, mode: getSqliteReadOnlyMode() });
+    await reader.exec("PRAGMA busy_timeout = 15000; PRAGMA cache_size = -65536;");
+    setReaderDb(reader);
+    console.log("[OpenPostings API] reader connection open (app reads do not queue behind sync writes)");
+  } catch (error) {
+    console.error("[OpenPostings API] reader connection unavailable, falling back to the shared one:", error?.message || error);
+  }
 
   const db = getDb();
 
