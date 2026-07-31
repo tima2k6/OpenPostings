@@ -145,7 +145,21 @@ async function ensureFtsIndex() {
 // Populates the index for rows that have description text. Incremental: only ids above
 // `since_id` are added, so a rebuild after a sync pass is cheap. Pass rebuild=true to
 // discard and rebuild from scratch (needed after descriptions change in place).
-async function rebuildSemanticIndex({ rebuild = false, batch_size = 5000 } = {}) {
+// 5,000 was far too large a batch, for two compounding reasons that only showed up under
+// measurement. Each row carries its full job_description, so a batch materialised roughly
+// 5,000 descriptions at once and V8 copied each again on the way into FTS -- a memory
+// series caught RSS stepping up 1,809 MB in a single sample and back down when GC caught
+// it. Repeated catch-up batches ratcheted the process toward the 4.5 GB cgroup ceiling,
+// where it thrashed in reclaim at 14% CPU.
+//
+// The batch is also one write transaction, so a large one holds the write chain -- and
+// therefore the sync's posting flushes -- for as long as it takes to insert every row.
+//
+// Smaller batches cost a few more queries and give back both: bounded peak memory and a
+// write lock held in short bursts.
+const SEMANTIC_INDEX_BATCH_SIZE = Number(process.env.SEMANTIC_INDEX_BATCH_SIZE || 400);
+
+async function rebuildSemanticIndex({ rebuild = false, batch_size = SEMANTIC_INDEX_BATCH_SIZE } = {}) {
   const db = getDb();
   await ensureFtsIndex();
 
