@@ -1206,6 +1206,22 @@ async function runAtsSyncInternal() {
           // progress the watchdog has already cleared.
           if (syncGeneration === passGeneration) {
             lastSyncProgressAtMs = Date.now();
+            // Attribution, not estimation. A first attempt at accounting for a 4.8 GB
+            // process from posting counts explained under half a gigabyte, so the real
+            // shape of the growth has to be measured. external/arrayBuffers separates
+            // "JS objects we are retaining" from "HTTP response buffers we are not
+            // releasing", which are different bugs with different fixes.
+            const memory = process.memoryUsage();
+            syncStatus.memory = {
+              rss_mb: Math.round(memory.rss / 1048576),
+              heap_used_mb: Math.round(memory.heapUsed / 1048576),
+              heap_total_mb: Math.round(memory.heapTotal / 1048576),
+              external_mb: Math.round(memory.external / 1048576),
+              array_buffers_mb: Math.round((memory.arrayBuffers || 0) / 1048576),
+              pending_postings: pendingPostingsForUpsert.length,
+              deduped_urls: dedupedPostingUrls.size,
+              location_map: nextPostingLocationByJobUrl.size
+            };
             syncStatus.progress = {
               current: completedCompanies,
               total: syncTargets.length,
