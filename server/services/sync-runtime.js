@@ -856,6 +856,45 @@ async function getCompaniesForSync() {
 }
 
 
+// Round-robin across ATS platforms, preserving staleness order within each.
+//
+// The target list was shuffled before this, which spread load across platforms but threw
+// away the ordering getCompaniesForSync had just applied. Since no pass has ever run to
+// completion -- 67,784 targets at several hours, against restarts -- a shuffled list means
+// each pass samples a random subset, so coverage creeps up by luck. That is why ~4,000
+// companies stayed permanently unreached no matter how many passes ran: nothing guaranteed
+// they were ever near the front.
+//
+// Interleaving gets both properties. Consecutive targets belong to different platforms, so
+// eight workers do not pile onto one board's rate limit, while the stalest company of every
+// platform is still reached first and an interrupted pass has made real progress rather
+// than random progress.
+function interleaveTargetsByAts(companies) {
+  const byAts = new Map();
+  for (const company of companies) {
+    const key = normalizeAtsFilterValue(company?.ATS_name) || "unknown";
+    if (!byAts.has(key)) byAts.set(key, []);
+    // Order within a platform is the staleness order already applied upstream.
+    byAts.get(key).push(company);
+  }
+
+  const queues = Array.from(byAts.values());
+  const interleaved = [];
+  let index = 0;
+  let placed = true;
+  while (placed) {
+    placed = false;
+    for (const queue of queues) {
+      if (index < queue.length) {
+        interleaved.push(queue[index]);
+        placed = true;
+      }
+    }
+    index += 1;
+  }
+  return interleaved;
+}
+
 function shuffleArrayInPlace(values) {
   const items = Array.isArray(values) ? values : [];
   for (let i = items.length - 1; i > 0; i -= 1) {
@@ -1004,7 +1043,7 @@ async function runAtsSyncInternal() {
   try {
     const companies = await getCompaniesForSync();
     const enabledAts = new Set(normalizeSyncEnabledAts(Array.from(getSyncEnabledAts())));
-    const shuffledCompanies = shuffleArrayInPlace([...companies]);
+    const shuffledCompanies = interleaveTargetsByAts(companies);
     const syncTargets = [];
     for (const boardTarget of BOARD_WIDE_SYNC_TARGETS) {
       if (!enabledAts.has(boardTarget.ATS_name)) continue;
@@ -1867,6 +1906,7 @@ async function getSyncScopeStats() {
 
 module.exports = {
   getSyncCoverageStats,
+  interleaveTargetsByAts,
   getLastSyncWriteEpoch,
   recordSyncWriteHeartbeat,
   // Exported for tests: pass resumability is the property worth pinning, and it is only

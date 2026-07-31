@@ -17,7 +17,12 @@ const path = require("path");
 
 const { openDatabase } = require("../db/open-database.js");
 const { setDb, getDb, setSyncEnabledAts } = require("../services/runtime-context.js");
-const { getCompaniesForSync, markCompanySynced, flushCompanySyncMarks } = require("../services/sync-runtime.js");
+const {
+  getCompaniesForSync,
+  markCompanySynced,
+  flushCompanySyncMarks,
+  interleaveTargetsByAts
+} = require("../services/sync-runtime.js");
 
 const NOW = 1_800_000_000;
 
@@ -130,8 +135,57 @@ async function testFailingCompanyDoesNotStarveTheRest() {
   assert.notStrictEqual(next[0].id, first.id, "a failing company yields its place on the next lap");
 }
 
+// Ordering has to survive assembly, not just be produced. getCompaniesForSync sorted by
+// staleness and the caller then ran the list through a shuffle, which silently discarded it
+// -- so passes sampled a random subset and roughly 4,000 companies stayed unreached however
+// many passes ran. The sort being correct in isolation proved nothing.
+function testOrderingSurvivesAssembly() {
+  const companies = [];
+  // Three platforms, each with one never-synced company at the front (staleness order).
+  for (const ats of ["greenhouse", "lever", "ashby"]) {
+    companies.push({ id: `${ats}-new`, ATS_name: ats, last_synced_epoch: null });
+    for (let i = 0; i < 5; i += 1) {
+      companies.push({ id: `${ats}-${i}`, ATS_name: ats, last_synced_epoch: 1000 + i });
+    }
+  }
+
+  const ordered = interleaveTargetsByAts(companies);
+  assert.strictEqual(ordered.length, companies.length, "interleaving must not drop or duplicate targets");
+  assert.strictEqual(new Set(ordered.map((c) => c.id)).size, companies.length, "no duplicates");
+
+  // Coverage: every never-synced company is reached before any platform's second company.
+  const neverSyncedPositions = ordered
+    .map((company, index) => (company.last_synced_epoch === null ? index : -1))
+    .filter((index) => index >= 0);
+  assert.ok(
+    Math.max(...neverSyncedPositions) < 3,
+    "the never-synced company of every platform must be in the first round, not left to chance"
+  );
+
+  // Load spreading: consecutive targets must not be the same platform while alternatives
+  // remain. This is what the shuffle was there for and must not be lost recovering the
+  // ordering.
+  for (let i = 1; i < 9; i += 1) {
+    assert.notStrictEqual(
+      ordered[i].ATS_name,
+      ordered[i - 1].ATS_name,
+      `targets ${i - 1} and ${i} hit the same platform back to back`
+    );
+  }
+
+  // Within a platform, staleness order is preserved.
+  const greenhouse = ordered.filter((c) => c.ATS_name === "greenhouse");
+  assert.strictEqual(greenhouse[0].id, "greenhouse-new");
+  assert.deepStrictEqual(
+    greenhouse.slice(1).map((c) => c.last_synced_epoch),
+    [1000, 1001, 1002, 1003, 1004],
+    "oldest-first ordering must survive within each platform"
+  );
+}
+
 async function main() {
   await setup(100);
+  testOrderingSurvivesAssembly();
   await testNeverSyncedComeFirst();
   await testAnInterruptedPassResumesRatherThanRestarting();
   await testRepeatedInterruptionsStillCoverEveryAts();
