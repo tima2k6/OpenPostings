@@ -159,9 +159,18 @@ async function ensureFtsIndex() {
 // write lock held in short bursts.
 const SEMANTIC_INDEX_BATCH_SIZE = Number(process.env.SEMANTIC_INDEX_BATCH_SIZE || 400);
 
-async function rebuildSemanticIndex({ rebuild = false, batch_size = SEMANTIC_INDEX_BATCH_SIZE } = {}) {
+async function rebuildSemanticIndex({
+  rebuild = false,
+  batch_size = SEMANTIC_INDEX_BATCH_SIZE,
+  max_batches = Number.POSITIVE_INFINITY
+} = {}) {
   const db = getDb();
   await ensureFtsIndex();
+
+  const batchSize = Math.max(1, Math.floor(Number(batch_size) || SEMANTIC_INDEX_BATCH_SIZE));
+  const maxBatches = Number.isFinite(Number(max_batches))
+    ? Math.max(1, Math.floor(Number(max_batches)))
+    : Number.POSITIVE_INFINITY;
 
   if (rebuild) {
     // 'delete-all' is the external-content table's own reset command; a plain DELETE
@@ -176,16 +185,21 @@ async function rebuildSemanticIndex({ rebuild = false, batch_size = SEMANTIC_IND
   let lastId = since;
   let indexed = 0;
   let totalIndexed = rebuild ? 0 : state.indexed_count;
-  for (;;) {
+  let batches = 0;
+  let complete = false;
+  while (batches < maxBatches) {
     const rows = await db.all(
       `SELECT id, position_name, company_name, job_description
        FROM Postings
        WHERE id > ? AND job_description IS NOT NULL AND TRIM(job_description) <> ''
        ORDER BY id
        LIMIT ?;`,
-      [lastId, batch_size]
+      [lastId, batchSize]
     );
-    if (rows.length === 0) break;
+    if (rows.length === 0) {
+      complete = true;
+      break;
+    }
 
     // Serialized against every other writer: this runs on a background timer alongside the
     // sync, and two overlapping BEGINs on the shared connection fail outright.
@@ -202,9 +216,24 @@ async function rebuildSemanticIndex({ rebuild = false, batch_size = SEMANTIC_IND
       }
       await writeIndexState(lastId, totalIndexed);
     });
+    batches += 1;
+
+    // A short page proves there are no more currently eligible rows. Avoid an extra
+    // database read, while still reporting whether a bounded worker left work behind.
+    if (rows.length < batchSize) {
+      complete = true;
+      break;
+    }
   }
 
-  return { indexed, total_indexed: totalIndexed, since_id: since, last_id: lastId };
+  return {
+    indexed,
+    total_indexed: totalIndexed,
+    since_id: since,
+    last_id: lastId,
+    batches,
+    complete
+  };
 }
 
 // The ranking step, isolated so a different backend can replace it without touching the

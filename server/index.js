@@ -90,7 +90,11 @@ const { getMcpSettings, upsertMcpSettings, buildMcpRunbook } = require("./servic
 const { buildCoverLetterDraft, buildCoverLetterBrief } = require("./services/cover-letter.js");
 const { listApplications, createApplication, updateApplicationStatus, deleteApplicationById } = require("./services/applications.js");
 const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable, ensurePostingLocationStateIndex, startSyncStallWatchdog, getSyncCoverageStats, getLastSyncWriteEpoch } = require("./services/sync-runtime.js");
-const { startEnrichmentLoops, getEnrichmentStatus } = require("./services/enrichment-runtime.js");
+const {
+  startEnrichmentLoops,
+  getEnrichmentStatus,
+  runSemanticIndexWorker
+} = require("./services/enrichment-runtime.js");
 const { startWriteLivenessWatchdog, getWriteLivenessStatus } = require("./services/write-liveness.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
 const { listPostingsWithFilters, getPostingsByUrls, setPostingIgnoredState, getCounts, getWideScanStats } = require("./services/postings.js");
@@ -1293,8 +1297,12 @@ function createServer() {
   // Refreshes the FTS index behind similar_to. Incremental unless rebuild=true.
   app.post("/semantic/reindex", async (req, res) => {
     try {
-      const { rebuildSemanticIndex } = require("./services/semantic-search.js");
-      res.json(await rebuildSemanticIndex({ rebuild: normalizeBoolean(req.body?.rebuild, false) }));
+      res.json(
+        await runSemanticIndexWorker({
+          rebuild: normalizeBoolean(req.body?.rebuild, false),
+          maxBatches: parseNonNegativeInteger(req.body?.max_batches) || undefined
+        })
+      );
     } catch (error) {
       res.status(500).json({ error: String(error?.message || error) });
     }

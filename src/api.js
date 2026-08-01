@@ -54,10 +54,11 @@ function createCanceledRequestError() {
 
 // Without this, a request that hangs never settles: the caller sits on the promise, its
 // catch never runs, and the page renders with no data and no error -- indistinguishable
-// from "there are no postings". The API is single-threaded on one SQLite connection that
-// it shares with the sync, so a stall is a realistic state, not a hypothetical one. The
-// window is deliberately generous: a slow response is still worth waiting for, and the
-// point is to eventually say something rather than to fail fast.
+// from "there are no postings". The API event loop can still be delayed by CPU-heavy
+// background work or an overloaded request, so a deadline remains useful even though
+// reads no longer share the sync's writer connection. The window is deliberately generous:
+// a slow response is still worth waiting for, and the point is to eventually say something
+// rather than to fail fast.
 const REQUEST_TIMEOUT_MS = 30000;
 
 // The browser deliberately refuses to distinguish a refused connection from a blocked
@@ -68,7 +69,7 @@ function describeRequestError(errorValue, url) {
   if (errorValue?.name === "AbortError") {
     return new Error(
       `Request to ${url} timed out after ${Math.round(REQUEST_TIMEOUT_MS / 1000)}s. ` +
-        "The API may be busy (a sync competes with it for the same database connection)."
+        "The API did not respond before the client deadline; check for a blocking or overloaded operation."
     );
   }
 

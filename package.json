@@ -23,6 +23,7 @@
     "test:backend:application-answers": "node server/tests/application-answers.test.js",
     "test:backend:cover-letter": "node server/tests/cover-letter.test.js",
     "test:backend:enrichment-runtime": "node server/tests/enrichment-runtime.test.js",
+    "test:backend:semantic-index": "node server/tests/semantic-index-bounds.test.js",
     "test:backend:hidden-reason": "node server/tests/hidden-reason.test.js",
     "test:backend:error-log": "node server/tests/error-log.test.js",
     "test:backend:write-transaction": "node server/tests/write-transaction.test.js",

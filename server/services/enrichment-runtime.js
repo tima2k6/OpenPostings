@@ -14,11 +14,17 @@
 // the timer.
 const { nowEpochSeconds } = require("../helpers/normalize-numbers.js");
 const { getSyncDownloadJobDescriptions } = require("./runtime-context.js");
+const path = require("node:path");
+const { execFile } = require("node:child_process");
 
 const DESCRIPTION_INTERVAL_MS = Number(process.env.DESCRIPTION_BACKFILL_INTERVAL_MS || 5 * 60 * 1000);
 const DESCRIPTION_BATCH_LIMIT = Number(process.env.DESCRIPTION_BACKFILL_LIMIT || 200);
 const DESCRIPTION_CONCURRENCY = Number(process.env.DESCRIPTION_BACKFILL_CONCURRENCY || 4);
 const SEMANTIC_INTERVAL_MS = Number(process.env.SEMANTIC_INDEX_INTERVAL_MS || 15 * 60 * 1000);
+const SEMANTIC_WORKER_BATCH_SIZE = Number(process.env.SEMANTIC_INDEX_WORKER_BATCH_SIZE || 25);
+const SEMANTIC_WORKER_MAX_BATCHES = Number(process.env.SEMANTIC_INDEX_WORKER_MAX_BATCHES || 16);
+const SEMANTIC_WORKER_TIMEOUT_MS = Number(process.env.SEMANTIC_INDEX_WORKER_TIMEOUT_MS || 10 * 60 * 1000);
+const SEMANTIC_WORKER_SCRIPT = path.resolve(__dirname, "..", "scripts", "build-semantic-index.js");
 
 // When a run finds nothing to do, waiting the same short interval again just burns a query
 // every few minutes forever. Each idle run doubles the wait; any run that does work resets
@@ -131,17 +137,69 @@ function startDescriptionBackfillLoop() {
   });
 }
 
-function startSemanticIndexLoop() {
-  const { rebuildSemanticIndex } = require("./semantic-search.js");
+// FTS5 tokenization is native, synchronous work. Even a little over a hundred documents
+// was enough to stop the API event loop from returning a single byte for ten seconds.
+// Running it in a child keeps HTTP handling responsive; small transactions and a hard
+// batch ceiling also keep its SQLite writer lock bounded.
+function runSemanticIndexWorker({
+  rebuild = false,
+  batchSize = SEMANTIC_WORKER_BATCH_SIZE,
+  maxBatches = SEMANTIC_WORKER_MAX_BATCHES
+} = {}) {
+  const args = [
+    SEMANTIC_WORKER_SCRIPT,
+    "--batch-size",
+    String(Math.max(1, Math.floor(Number(batchSize) || SEMANTIC_WORKER_BATCH_SIZE))),
+    "--max-batches",
+    String(Math.max(1, Math.floor(Number(maxBatches) || SEMANTIC_WORKER_MAX_BATCHES)))
+  ];
+  if (rebuild) args.push("--rebuild");
 
+  return new Promise((resolve, reject) => {
+    execFile(
+      process.execPath,
+      args,
+      {
+        env: process.env,
+        timeout: SEMANTIC_WORKER_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024,
+        windowsHide: true
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          const detail = String(stderr || stdout || error.message).trim();
+          reject(new Error(`Semantic index worker failed: ${detail}`));
+          return;
+        }
+
+        const line = String(stdout)
+          .split(/\r?\n/)
+          .find((candidate) => candidate.startsWith("[build-semantic-index] "));
+        const match = line?.match(/^\[build-semantic-index\] (\{.*\}) in \d+s$/);
+        if (!match) {
+          reject(new Error(`Semantic index worker returned unexpected output: ${String(stdout).trim()}`));
+          return;
+        }
+
+        try {
+          resolve(JSON.parse(match[1]));
+        } catch (parseError) {
+          reject(new Error(`Semantic index worker returned invalid JSON: ${parseError.message}`));
+        }
+      }
+    );
+  });
+}
+
+function startSemanticIndexLoop() {
   return startEnrichmentLoop({
     name: "semantic reindex",
     state: enrichmentStatus.semantic_index,
     intervalMs: SEMANTIC_INTERVAL_MS,
     task: async () => {
-      // Incremental: only postings newer than the highest id already indexed, so a tick
-      // with no new descriptions costs one query.
-      const summary = await rebuildSemanticIndex({});
+      // Incremental: only postings newer than the highest id already indexed. The worker
+      // is isolated from the API event loop and bounded even if a large backlog forms.
+      const summary = await runSemanticIndexWorker({});
       enrichmentStatus.semantic_index.last_summary = summary;
       if (summary.indexed > 0) {
         console.log(
@@ -168,8 +226,11 @@ module.exports = {
   // Exported for tests: the scheduling guarantees (single-flight, idle backoff, a failing
   // run not killing the loop) are the part worth pinning down.
   startEnrichmentLoop,
+  runSemanticIndexWorker,
   createEnrichmentState,
   getEnrichmentStatus,
   DESCRIPTION_INTERVAL_MS,
-  SEMANTIC_INTERVAL_MS
+  SEMANTIC_INTERVAL_MS,
+  SEMANTIC_WORKER_BATCH_SIZE,
+  SEMANTIC_WORKER_MAX_BATCHES
 };
