@@ -190,6 +190,9 @@ export function fetchPostings(search = "", limit = 500, offset = 0, filters = {}
   if (filters?.include_descriptions === false) {
     params.set("include_descriptions", "0");
   }
+  if (filters?.review_queue) {
+    params.set("review_queue", String(filters.review_queue));
+  }
 
   return request(`/postings?${params.toString()}`);
 }
@@ -222,6 +225,18 @@ export function ignorePosting(payload) {
     method: "POST",
     body: JSON.stringify(payload || {})
   });
+}
+
+export function setPostingReviewState(payload) {
+  return request("/postings/review-state", {
+    method: "PATCH",
+    body: JSON.stringify(payload || {})
+  });
+}
+
+export function fetchPostingDetails(jobPostingUrl) {
+  const params = new URLSearchParams({ job_posting_url: String(jobPostingUrl || "") });
+  return request(`/postings/details?${params.toString()}`);
 }
 
 export function updateApplicationStatus(applicationId, status) {

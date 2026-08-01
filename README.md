@@ -23,15 +23,17 @@
   - [Example Supported Seeded URL Patterns](#example-supported-seeded-url-patterns)
   - [Troubleshooting](#troubleshooting)
 - [REST API (Summary)](#rest-api-summary)
-- [MCP Apply Agent Server](#mcp-apply-agent-server)
+- [MCP Application Copilot Server](#mcp-application-copilot-server)
 - [Security Notes](#security-notes)
 
 <br/>
-OpenPostings is an OpenSource ATS job aggregator and application tracking app. **It pulls jobs that were posted in the last 24 hours** or that has no posted date. 
+OpenPostings is a private, open-source job-search workspace. It discovers roles directly
+from employer ATS systems, helps you review and shortlist them, remembers your decisions,
+and tracks confirmed applications locally.
 
-Over **110000+** companies from multiple ATSs all sourced into 1 location!
-
-Over **THOUSANDS** fresh jobs on average **DAILY**!
+“New” means either a trustworthy posting date falls inside your configured review window,
+or the role was newly discovered and its source date is still unknown. Older roles that are
+still listed, uncertain dates, and delisted roles are labeled separately rather than called fresh.
 
 ## Youtube Video
 [![OpenPostings Discussion](https://img.youtube.com/vi/5sVIhhwx3Yk/0.jpg)](https://www.youtube.com/watch?v=5sVIhhwx3Yk)
@@ -48,18 +50,18 @@ It combines:
 - A React Native client (`Web`, `Android`, `Windows`)
 - A local Node/Express API
 - A local SQLite database
-- An MCP apply-agent server for agent-assisted workflows
+- An optional MCP application-copilot server for agent-assisted preparation
 
 
 - Pulls jobs from **multiple ATS** providers into one local database.
 - Filters postings by **search text, ATS, industry, region (AMER/EMEA/APAC), country, state, county, and remote mode**.
-- Tracks **applied/ignored** posting state and application lifecycle status.
+- Tracks **unseen/viewed/shortlisted/ignored** review state separately from application lifecycle status.
 <br>
 <img src="README-Images/apply_or_ignore.png" alt="Applications" width="25%" />
 <br>
 <img src="README-Images/applications.png" alt="Applications" width="70%" />
-- Stores applicant profile and MCP agent settings in SQLite.
-- Exposes MCP tools for **candidate selection, cover-letter drafting, and result recording.**
+- Stores applicant profile and MCP copilot settings in SQLite.
+- Exposes MCP tools for **candidate selection, application preparation, and confirmed-result recording.**
 
 ## Supported ATS
 
@@ -166,11 +168,13 @@ Current sync support includes:
 <br>
 <img src="README-Images/ATS_list.png" alt="Applications" width="70%" />
 
-OVER **110000+** companies in total. All gathered from search engine data like Google and DuckDuckGo and also using subdomain searching techniques and directory searching techniques. 
+The tracked employer set depends on the installed database and configured seeded sources; the app reports its current count at runtime rather than promising a fixed catalog size.
 <br>
 <img src="README-Images/company_amount.png" alt="Applications" width="25%" />
 <br>
-It pulls in new job data at random from companies and stores it in the database. If the posting has lasted longer than 24 hours in the database its no longer used/deleted. 
+Sync visits configured companies over time and keeps discovery and liveness timestamps.
+The configured freshness window controls review classification; it is not a guarantee that
+every source supplied a posting date.
 
 ## Docs
 - Docs: https://masterjx9.github.io/OpenPostings/docs/intro
@@ -191,8 +195,8 @@ Download the latest installer from the github releases page and run it. It will 
 
 Choose the setup type during install:
 - `Typical`: Installs the standard OpenPostings app setup (Includes the backend service worker, recommended for most users).
-- `Complete`: Installs all available OpenPostings features. (Includes the backend service worker and MCP apply agent server, which may not be needed for all users).
-- `Custom`: Lets you choose exactly which features to install (for example, whether to include the backend service worker and MCP apply agent server).
+- `Complete`: Installs all available OpenPostings features. (Includes the backend service worker and optional MCP application copilot server).
+- `Custom`: Lets you choose exactly which features to install (for example, whether to include the backend service worker and MCP application copilot server).
 <img src="README-Images/windows_setup_type.png" alt="windows install setup types" width="70%" />
 
 Once the installation is complete, you can launch OpenPostings from the start menu. 
@@ -320,6 +324,8 @@ Postings:
 
 - `GET /postings`
 - `GET /postings/filter-options`
+- `GET /postings/details`
+- `PATCH /postings/review-state`
 - `POST /postings/ignore`
 
 Applications:
@@ -348,25 +354,27 @@ MCP helper endpoints:
 - `POST /mcp/cover-letter-draft`
 - `POST /mcp/applications/complete`
 
-## MCP Apply Agent Server
+## MCP Application Copilot Server
 
 You can have Codex/Claude/Gemini/Qwen/LLMs do the following for you:
 - Get your applicantee information `get_applicant_context`
 - Read your actual resume (PDF, docx, txt or md) so screening happens against your real background `get_resume` — upload it once with `POST /settings/applicant-documents` and it is stored in the database, so it stays readable even when the server runs on a different machine than your files
 - List every filter value it can search on `get_filter_options`
-- Find the latest relevant jobs for you. `find_posting_candidates`
+- Find relevant roles in the configured review window. `find_posting_candidates`
 - Run precision queries like "(manager OR director) AND NOT assistant, in WA, over 140k, seen in the last 3 days" `query_postings`
 - Read everything stored about a shortlisted posting — description included — before opening a browser `get_posting_details`
 - Mark postings as not a fit so no later run resurfaces them `ignore_posting`
 - Check what has already been applied to, and by whom `list_applications`
-- Apply to those jobs (As long as your LLM model has access to a browser)
+- Hand prepared work to an external browser-capable agent, when you choose to use one
 - Build a dynamic cover letter for you that relates to your resume, experience and the job you are applying for. `draft_cover_letter`
 - Update job application tracking for you. `record_application_result`
 
-The intended loop is shortlist → screen → apply: read the resume once with `get_resume`,
+The intended loop is shortlist → screen → prepare → hand off: read the resume once with `get_resume`,
 filter with `find_posting_candidates` or `query_postings`, weigh each survivor's
 `get_posting_details` description against the resume, `ignore_posting` the misses (they
-stay gone across runs), apply to the rest, and `record_application_result` what happened.
+stay gone across runs), prepare the rest, and hand work to the user or an external
+browser-capable agent. Only after user approval and confirmed submission should
+`record_application_result` record what happened.
 `list_applications` keeps separate runs from double-applying.
 
 `find_posting_candidates` runs the same filter engine as the app's job list, so the agent can
@@ -406,7 +414,11 @@ args = ['C:\Users\<path to where you cloned the repo>\OpenPostings\server\mcp-ap
 
 ## Security Notes
 
-This is designed for local/self-hosted usage.
+The API binds to `127.0.0.1` by default and accepts browser requests from loopback origins.
+Native clients without an Origin header continue to work.
 
-- MCP credentials/settings are stored in local SQLite fields.
-- If you need stricter controls, add OS-level secret storage, DB encryption-at-rest, and tighter filesystem permissions.
+- Set `OPENPOSTINGS_ALLOW_LAN=true` to bind to `0.0.0.0`, or set `OPENPOSTINGS_API_HOST` explicitly.
+- Add trusted browser origins with `OPENPOSTINGS_CORS_ORIGINS` (comma-separated).
+- `OPENPOSTINGS_ALLOW_REMOTE_ORIGINS=true` is the intentional remote/self-hosted CORS escape hatch; protect that deployment with your own network and authentication controls.
+- The copilot stores preferences and preparation context, not a dedicated login email/password.
+- Submission is not inferred: the user approves the final action, and OpenPostings records a result only after submission is confirmed.

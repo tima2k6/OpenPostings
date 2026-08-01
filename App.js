@@ -34,6 +34,7 @@ import {
   fetchMcpSettings,
   fetchCodeStatus,
   fetchPostingFilterOptions,
+  fetchPostingDetails,
   fetchPersonalInformation,
   fetchPostings,
   fetchSettingsExport,
@@ -42,6 +43,7 @@ import {
   fetchSyncServiceSettings,
   fetchSyncStatus,
   ignorePosting,
+  setPostingReviewState,
   migrateDatabaseSettings,
   saveApplicationAnswers,
   saveMcpSettings,
@@ -214,7 +216,12 @@ const APPLICATION_STATUS_OPTIONS = [
   "denied"
 ];
 const DEFAULT_SYNC_INTERVAL_SECONDS = 3600;
-const FRONTEND_POSTINGS_FETCH_LIMIT = 500;
+const FRONTEND_POSTINGS_FETCH_LIMIT = 50;
+const POSTING_REVIEW_QUEUES = Object.freeze([
+  { value: "new", label: "New" },
+  { value: "shortlisted", label: "Shortlisted" },
+  { value: "reviewed", label: "Reviewed" }
+]);
 const MIN_SYNC_INTERVAL_SECONDS = 60;
 const MAX_SYNC_INTERVAL_SECONDS = 24 * 60 * 60;
 const DEFAULT_ATS_REQUEST_QUEUE_CONCURRENCY = 1;
@@ -556,6 +563,22 @@ function normalizePostingItem(item, index = 0) {
 function normalizePostingItems(items) {
   const source = Array.isArray(items) ? items : [];
   return source.map((item, index) => normalizePostingItem(item, index));
+}
+
+function getPostingFreshnessLabel(item) {
+  return sanitizeDisplayText(item?.freshness?.label, "Posting date confidence unavailable");
+}
+
+function getPostingConfidenceLabels(item) {
+  const confidence = item?.confidence && typeof item.confidence === "object" ? item.confidence : {};
+  const labels = [];
+  if (confidence.description === "available") labels.push("Description");
+  if (confidence.location === "available") labels.push("Location");
+  if (confidence.location === "conflict") labels.push("Location conflict");
+  if (confidence.compensation === "available") labels.push("Pay");
+  if (confidence.liveness === "confirmed_live") labels.push("Live checked");
+  if (confidence.liveness === "delisted") labels.push("Delisted");
+  return labels;
 }
 
 function formatPostingCompensationAmount(value, currencyCode = "") {
@@ -1114,6 +1137,8 @@ function toApiMcpSettings(value) {
 
 function PostingCard({
   item,
+  onOpenDetails,
+  onSetReviewState,
   onTrackApplication,
   onIgnorePosting,
   onBlockCompany,
@@ -1121,20 +1146,16 @@ function PostingCard({
   ignoringPostingIds,
   blockedCompanyNames,
   blockingCompanyNames,
+  reviewingPostingIds,
   showDescriptions
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const postingUrl = String(item?.job_posting_url || "").trim();
-  const onOpenPosting = useCallback(async () => {
-    if (!postingUrl) return;
-    const supported = await Linking.canOpenURL(postingUrl);
-    if (supported) {
-      await Linking.openURL(postingUrl);
-    }
-  }, [postingUrl]);
+  const onOpenPosting = useCallback(() => onOpenDetails(item), [item, onOpenDetails]);
 
   const isSaving = Boolean(savingApplicationIds?.[postingUrl]);
   const isIgnoring = Boolean(ignoringPostingIds?.[postingUrl]);
+  const isReviewing = Boolean(reviewingPostingIds?.[postingUrl]);
   const normalizedCompanyName = normalizeCompanyName(item?.company_name);
   const isCompanyBlocked = blockedCompanyNames?.has(normalizedCompanyName);
   const isBlockingCompany = blockingCompanyNames?.has(normalizedCompanyName);
@@ -1152,9 +1173,12 @@ function PostingCard({
   const appliedByLabel = sanitizeDisplayText(item?.applied_by_label, "Application already tracked");
   const postingUrlLabel = sanitizeDisplayText(item?.job_posting_url, "");
   const shouldRenderDescription = Boolean(showDescriptions) && Boolean(postingDescriptionLabel);
+  const reviewState = String(item?.review_state || "unseen");
+  const freshnessLabel = getPostingFreshnessLabel(item);
+  const confidenceLabels = getPostingConfidenceLabels(item);
 
   return (
-    <View style={[styles.card, menuOpen ? styles.cardMenuOpen : null]}>
+    <View style={[styles.card, reviewState === "ignored" ? styles.cardIgnored : null, menuOpen ? styles.cardMenuOpen : null]}>
       <View style={styles.postingCardTopRow}>
         <Pressable onPress={onOpenPosting} style={styles.postingCardMainPressArea}>
           <Text style={styles.position}>{positionName}</Text>
@@ -1162,6 +1186,13 @@ function PostingCard({
           <Text style={styles.company}>{companyLabel}</Text>
           <Text style={styles.ats}>ATS: {atsLabel}</Text>
           <Text style={styles.posted}>{postingDateLabel}</Text>
+          <Text style={styles.postingFreshness}>{freshnessLabel}</Text>
+          <View style={styles.postingBadgesRow}>
+            <Text style={[styles.postingReviewBadge, reviewState === "ignored" ? styles.postingReviewBadgeIgnored : null]}>
+              {reviewState === "shortlisted" ? "Shortlisted" : reviewState === "ignored" ? "Ignored" : reviewState === "viewed" ? "Viewed" : "New"}
+            </Text>
+            {confidenceLabels.map((label) => <Text key={label} style={styles.postingConfidenceBadge}>{label}</Text>)}
+          </View>
           {postingCompensationLabel ? <Text style={styles.postingCompensation}>{postingCompensationLabel}</Text> : null}
           {shouldRenderDescription ? (
             <Text style={styles.postingDescription}>{postingDescriptionLabel}</Text>
@@ -1184,6 +1215,30 @@ function PostingCard({
 
           {menuOpen ? (
             <View style={[styles.postingCardMenu, { zIndex: 99999, elevation: 99999 }]}>
+              <Pressable
+                onPress={() => {
+                  setMenuOpen(false);
+                  onSetReviewState(item, reviewState === "shortlisted" ? "viewed" : "shortlisted");
+                }}
+                disabled={isReviewing}
+                style={[styles.postingCardMenuItem, isReviewing ? styles.postingCardMenuItemDisabled : null]}
+              >
+                <Text style={styles.postingCardMenuItemText}>
+                  {reviewState === "shortlisted" ? "Remove From Shortlist" : "Shortlist"}
+                </Text>
+              </Pressable>
+
+              <Pressable
+                onPress={() => {
+                  setMenuOpen(false);
+                  onSetReviewState(item, "viewed");
+                }}
+                disabled={isReviewing || reviewState === "viewed"}
+                style={[styles.postingCardMenuItem, isReviewing || reviewState === "viewed" ? styles.postingCardMenuItemDisabled : null]}
+              >
+                <Text style={styles.postingCardMenuItemText}>{reviewState === "viewed" ? "Already Viewed" : "Mark Viewed"}</Text>
+              </Pressable>
+
               <Pressable
                 onPress={() => {
                   setMenuOpen(false);
@@ -1419,7 +1474,14 @@ export default function App() {
   // initial request lightweight; users can still opt into them with the existing toggle.
   const [showPostingDescriptions, setShowPostingDescriptions] = useState(false);
   const showPostingDescriptionsRef = useRef(showPostingDescriptions);
+  const [postingReviewQueue, setPostingReviewQueue] = useState("new");
+  const postingReviewQueueRef = useRef("new");
   const [postings, setPostings] = useState([]);
+  const [postingsHasMore, setPostingsHasMore] = useState(false);
+  const [postingsLoadingMore, setPostingsLoadingMore] = useState(false);
+  const [selectedPosting, setSelectedPosting] = useState(null);
+  const [postingDetailsLoading, setPostingDetailsLoading] = useState(false);
+  const [reviewingPostingIds, setReviewingPostingIds] = useState({});
   const [applications, setApplications] = useState([]);
   const [applicationsLoading, setApplicationsLoading] = useState(false);
   const [applicationsNotice, setApplicationsNotice] = useState("");
@@ -1713,7 +1775,7 @@ export default function App() {
       ? ` | Coverage: ${Number(coverage.synced_within_window || 0).toLocaleString()}/${Number(coverage.enabled_companies || 0).toLocaleString()} companies synced in the last ${Math.round(Number(coverage.window_seconds || 86400) / 3600)}h` +
         (Number(coverage.never_synced || 0) > 0 ? `, ${Number(coverage.never_synced).toLocaleString()} not yet reached` : "")
       : "";
-    const base = `Last completed sync: ${syncTime} | Visible jobs (last ${freshnessHours}h): ${Number(status.posting_count || 0).toLocaleString()} | Sync-enabled companies: ${syncEnabledCompanies.toLocaleString()} | Failed companies: ${failedCompanies} | Excluded by date: ${excludedByDate} | Excluded ATS: ${excludedAtsCount}`;
+    const base = `Last completed sync: ${syncTime} | Listed in the ${freshnessHours}h review window: ${Number(status.posting_count || 0).toLocaleString()} | Sync-enabled companies: ${syncEnabledCompanies.toLocaleString()} | Failed companies: ${failedCompanies} | Excluded by date: ${excludedByDate} | Excluded ATS: ${excludedAtsCount}`;
     if (status.running && status.progress) {
       const collectedCount = Number(status.progress.total_collected || 0);
       const syncingCompanyName = sanitizeDisplayText(status.progress.company_name, "");
@@ -1771,6 +1833,9 @@ export default function App() {
 
   const loadPostings = useCallback(async (q, options = {}) => {
     const silent = Boolean(options.silent);
+    const append = Boolean(options.append);
+    const offset = append ? Math.max(0, Number(options.offset || 0)) : 0;
+    const reviewQueue = String(options.reviewQueue || postingReviewQueueRef.current || "new");
     const filters = options.filters || postingsFiltersRef.current;
     const requestSequence = postingsRequestSequenceRef.current + 1;
     postingsRequestSequenceRef.current = requestSequence;
@@ -1779,21 +1844,19 @@ export default function App() {
     }
     setError("");
     try {
-      const response = await fetchPostings(q, FRONTEND_POSTINGS_FETCH_LIMIT, 0, {
+      const response = await fetchPostings(q, FRONTEND_POSTINGS_FETCH_LIMIT, offset, {
         ...filters,
+        review_queue: reviewQueue,
+        include_applied: true,
+        include_ignored: reviewQueue === "reviewed",
         include_descriptions: showPostingDescriptionsRef.current
       });
       if (requestSequence !== postingsRequestSequenceRef.current) {
         return;
       }
       const normalizedItems = normalizePostingItems(response?.items);
-      setPostings(normalizedItems);
-      if (normalizedItems.length >= FRONTEND_POSTINGS_FETCH_LIMIT) {
-        queueFrontendLog("warn", "postings_limit_reached", "Postings payload reached frontend fetch limit.", {
-          limit: FRONTEND_POSTINGS_FETCH_LIMIT,
-          search: q
-        });
-      }
+      setPostings((previous) => append ? [...previous, ...normalizedItems] : normalizedItems);
+      setPostingsHasMore(normalizedItems.length >= FRONTEND_POSTINGS_FETCH_LIMIT);
       lastPostingRefreshAtRef.current = Date.now();
     } catch (e) {
       if (requestSequence === postingsRequestSequenceRef.current) {
@@ -1805,6 +1868,9 @@ export default function App() {
     } finally {
       if (!silent && requestSequence === postingsRequestSequenceRef.current) {
         setLoading(false);
+      }
+      if (append) {
+        setPostingsLoadingMore(false);
       }
     }
   }, [queueFrontendLog]);
@@ -2453,15 +2519,17 @@ export default function App() {
     }));
     setError("");
     try {
-      await ignorePosting({
+      const response = await ignorePosting({
         job_posting_url: posting.job_posting_url,
         ignored: true,
         ignored_by_label: "Ignored by user"
       });
       postingsRequestSequenceRef.current += 1;
-      setPostings((prev) =>
-        prev.filter((item) => String(item?.job_posting_url || "").trim() !== postingKey)
-      );
+      const nextItem = normalizePostingItem({ ...posting, ...(response?.item || {}), review_state: "ignored", ignored: true });
+      setPostings((prev) => postingReviewQueueRef.current === "reviewed"
+        ? prev.map((item) => String(item?.job_posting_url || "").trim() === postingKey ? nextItem : item)
+        : prev.filter((item) => String(item?.job_posting_url || "").trim() !== postingKey));
+      setSelectedPosting((current) => String(current?.job_posting_url || "").trim() === postingKey ? nextItem : current);
       setApplicationsNotice(`Ignored "${posting.position_name}".`);
     } catch (e) {
       setError(String(e.message || e));
@@ -2472,6 +2540,68 @@ export default function App() {
       }));
     }
   }, []);
+
+  const handleSetPostingReviewState = useCallback(async (posting, reviewState) => {
+    const postingKey = String(posting?.job_posting_url || "").trim();
+    if (!postingKey) return null;
+    setReviewingPostingIds((previous) => ({ ...previous, [postingKey]: true }));
+    setError("");
+    try {
+      const response = await setPostingReviewState({
+        job_posting_url: postingKey,
+        review_state: reviewState
+      });
+      const nextItem = normalizePostingItem({ ...posting, ...(response?.item || {}), review_state: reviewState });
+      const queue = postingReviewQueueRef.current;
+      const remainsInQueue =
+        (queue === "shortlisted" && reviewState === "shortlisted") ||
+        (queue === "reviewed" && ["viewed", "ignored"].includes(reviewState));
+      postingsRequestSequenceRef.current += 1;
+      setPostings((previous) => remainsInQueue
+        ? previous.map((item) => String(item?.job_posting_url || "").trim() === postingKey ? nextItem : item)
+        : previous.filter((item) => String(item?.job_posting_url || "").trim() !== postingKey));
+      setSelectedPosting((current) => String(current?.job_posting_url || "").trim() === postingKey ? nextItem : current);
+      setApplicationsNotice(
+        reviewState === "shortlisted" ? `Shortlisted "${posting.position_name}".` : `Marked "${posting.position_name}" viewed.`
+      );
+      return nextItem;
+    } catch (e) {
+      setError(String(e.message || e));
+      return null;
+    } finally {
+      setReviewingPostingIds((previous) => ({ ...previous, [postingKey]: false }));
+    }
+  }, []);
+
+  const handleOpenPostingDetails = useCallback(async (posting) => {
+    const postingKey = String(posting?.job_posting_url || "").trim();
+    if (!postingKey) return;
+    setSelectedPosting(posting);
+    setPostingDetailsLoading(true);
+    if (String(posting?.review_state || "unseen") === "unseen") {
+      await handleSetPostingReviewState(posting, "viewed");
+    }
+    try {
+      const response = await fetchPostingDetails(postingKey);
+      setSelectedPosting((current) => normalizePostingItem({ ...current, ...(response?.item || {}) }));
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      setPostingDetailsLoading(false);
+    }
+  }, [handleSetPostingReviewState]);
+
+  const handleLoadMorePostings = useCallback(async () => {
+    if (postingsLoadingMore || !postingsHasMore) return;
+    setPostingsLoadingMore(true);
+    await loadPostings(searchRef.current, {
+      append: true,
+      silent: true,
+      offset: postings.length,
+      filters: postingsFiltersRef.current,
+      reviewQueue: postingReviewQueueRef.current
+    });
+  }, [loadPostings, postings.length, postingsHasMore, postingsLoadingMore]);
 
   const handleBlockCompany = useCallback(
     async (posting) => {
@@ -2824,6 +2954,10 @@ export default function App() {
     postingsFiltersRef.current = postingsFilters;
   }, [postingsFilters]);
 
+  useEffect(() => {
+    postingReviewQueueRef.current = postingReviewQueue;
+  }, [postingReviewQueue]);
+
   // Pausing the poll while hidden means a tab can come back arbitrarily stale, so becoming
   // visible triggers one immediate refresh. That is strictly cheaper than the polling it
   // replaces: one fetch per time the tab is looked at, instead of one per minute forever.
@@ -2943,7 +3077,7 @@ export default function App() {
       loadPostings(search, { filters: postingsFilters });
     }, 1800);
     return () => clearTimeout(timer);
-  }, [filtersHydrated, search, postingsFilters, loadPostings]);
+  }, [filtersHydrated, search, postingsFilters, postingReviewQueue, loadPostings]);
 
   useEffect(() => {
     if (!syncSettings.autoSyncEnabled) return undefined;
@@ -3051,6 +3185,28 @@ export default function App() {
           <Text style={styles.syncBtnText}>{syncing ? "Syncing..." : "Sync Postings"}</Text>
         </Pressable>
       </View>
+
+      <View style={styles.reviewQueueRow}>
+        {POSTING_REVIEW_QUEUES.map((queue) => {
+          const selected = postingReviewQueue === queue.value;
+          return (
+            <Pressable
+              key={queue.value}
+              onPress={() => setPostingReviewQueue(queue.value)}
+              style={[styles.reviewQueueTab, selected ? styles.reviewQueueTabActive : null]}
+            >
+              <Text style={[styles.reviewQueueTabText, selected ? styles.reviewQueueTabTextActive : null]}>{queue.label}</Text>
+            </Pressable>
+          );
+        })}
+      </View>
+      <Text style={styles.reviewQueueHelp}>
+        {postingReviewQueue === "new"
+          ? "Unseen roles with a recent confirmed date or recent discovery. Opening one marks it viewed."
+          : postingReviewQueue === "shortlisted"
+            ? "Roles you set aside for closer consideration."
+            : "Viewed and ignored roles; ignored roles remain visibly marked."}
+      </Text>
 
       {/* Sorting is not a filter: it is changed constantly while scanning results, so it
           stays visible rather than living behind the collapsed filter panel. */}
@@ -3291,6 +3447,8 @@ export default function App() {
           renderItem={({ item }) => (
             <PostingCard
               item={item}
+              onOpenDetails={handleOpenPostingDetails}
+              onSetReviewState={handleSetPostingReviewState}
               onTrackApplication={handleTrackPostingApplication}
               onIgnorePosting={handleIgnorePosting}
               onBlockCompany={handleBlockCompany}
@@ -3298,13 +3456,59 @@ export default function App() {
               ignoringPostingIds={ignoringPostingIds}
               blockedCompanyNames={blockedCompanyNames}
               blockingCompanyNames={blockingCompanyNamesSet}
+              reviewingPostingIds={reviewingPostingIds}
               showDescriptions={showPostingDescriptions}
             />
           )}
-          ListEmptyComponent={<Text style={styles.empty}>No postings found.</Text>}
+          ListEmptyComponent={<Text style={styles.empty}>{loading ? "Loading postings..." : `No ${postingReviewQueue} postings found.`}</Text>}
+          ListFooterComponent={postingsHasMore ? (
+            <Pressable onPress={handleLoadMorePostings} disabled={postingsLoadingMore} style={styles.loadMoreButton}>
+              <Text style={styles.loadMoreButtonText}>{postingsLoadingMore ? "Loading..." : "Load More"}</Text>
+            </Pressable>
+          ) : postings.length > 0 ? <Text style={styles.paginationEnd}>End of this review queue.</Text> : null}
           contentContainerStyle={styles.list}
         />
       )}
+
+      <Modal
+        visible={Boolean(selectedPosting)}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setSelectedPosting(null)}
+      >
+        <View style={styles.modalOverlay}>
+          <Pressable style={styles.modalBackdrop} onPress={() => setSelectedPosting(null)} />
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeaderRow}>
+              <Text style={styles.modalTitle}>{sanitizeDisplayText(selectedPosting?.position_name, "Posting details")}</Text>
+              <Pressable onPress={() => setSelectedPosting(null)} style={styles.modalCloseButton}>
+                <Text style={styles.modalCloseButtonText}>Close</Text>
+              </Pressable>
+            </View>
+            {postingDetailsLoading ? <ActivityIndicator style={styles.settingsLoader} /> : (
+              <ScrollView style={styles.modalBodyScroll} contentContainerStyle={styles.modalBodyContent}>
+                <Text style={styles.company}>{sanitizeDisplayText(selectedPosting?.company_name, "Unknown company")}</Text>
+                <Text style={styles.location}>{sanitizeDisplayText(selectedPosting?.location, "Location unavailable")}</Text>
+                <Text style={styles.postingFreshness}>{getPostingFreshnessLabel(selectedPosting)}</Text>
+                <Text style={styles.reviewDetailNotice}>
+                  {String(selectedPosting?.review_state || "unseen") === "unseen"
+                    ? "This role is still New; marking it viewed did not complete."
+                    : "Opening this detail marks an unseen role viewed."}
+                </Text>
+                {String(selectedPosting?.job_description || "").trim() ? (
+                  <Text style={styles.postingDescription}>{String(selectedPosting.job_description)}</Text>
+                ) : <Text style={styles.empty}>No description is stored for this posting.</Text>}
+                <Pressable
+                  onPress={() => Linking.openURL(String(selectedPosting?.job_posting_url || ""))}
+                  style={styles.settingsSaveButton}
+                >
+                  <Text style={styles.settingsSaveButtonText}>Open Employer Posting</Text>
+                </Pressable>
+              </ScrollView>
+            )}
+          </View>
+        </View>
+      </Modal>
     </>
   );
 
@@ -3459,7 +3663,7 @@ export default function App() {
             <View style={styles.formGroup}>
               <Text style={styles.settingsSubsection}>Documents on server</Text>
               <Text style={styles.settingsDescription}>
-                Upload your resume once and the apply agent can read it no matter where the server runs.
+                Upload your resume once and the application copilot can read it no matter where the server runs.
                 The file paths above stay as a fallback for installs where the server runs on this same machine.
               </Text>
 
@@ -3499,7 +3703,7 @@ export default function App() {
               <Text style={styles.settingsSubsection}>Application questions</Text>
               <Text style={styles.settingsDescription}>
                 The questions application forms ask over and over. Anything left blank is treated as unanswered:
-                the apply agent will ask you rather than guessing, because a made-up answer gets submitted
+                the application copilot will ask you rather than guessing, because a made-up answer gets submitted
                 under your name. Use Notes for context you want considered but not pasted into a form.
               </Text>
 
@@ -3950,14 +4154,14 @@ export default function App() {
         <Text style={styles.settingsTitle}>Settings</Text>
         <Text style={styles.settingsSubsection}>MCP Settings</Text>
         <Text style={styles.settingsDescription}>
-          Configure agent behavior, preferences, and a dedicated agent login email/password used for account creation and MFA.
+          Configure the application copilot's screening and preparation preferences. It does not store login credentials or submit through a browser by itself.
         </Text>
 
         {mcpSettingsLoading ? <ActivityIndicator size="small" style={styles.settingsLoader} /> : null}
 
         <View style={styles.formGroup}>
           <ToggleRow
-            label="Enable MCP application agent"
+            label="Enable MCP application copilot"
             value={mcpSettings.enabled}
             onValueChange={(value) =>
               setMcpSettings((prev) => ({
@@ -4346,6 +4550,25 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 10
   },
+  reviewQueueRow: {
+    flexDirection: "row",
+    gap: 8,
+    paddingHorizontal: 16,
+    paddingBottom: 6
+  },
+  reviewQueueTab: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: "#c6ceda",
+    borderRadius: 10,
+    paddingVertical: 9,
+    alignItems: "center",
+    backgroundColor: "#ffffff"
+  },
+  reviewQueueTabActive: { borderColor: "#0b6e4f", backgroundColor: "#0b6e4f" },
+  reviewQueueTabText: { color: "#334e68", fontSize: 12, fontWeight: "700" },
+  reviewQueueTabTextActive: { color: "#ffffff" },
+  reviewQueueHelp: { paddingHorizontal: 16, paddingBottom: 8, color: "#52606d", fontSize: 11 },
   postingsFiltersHeaderRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -4619,11 +4842,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#dbe2ea"
   },
+  cardIgnored: { backgroundColor: "#f5f6f7", borderColor: "#aab4be", opacity: 0.82 },
   cardMenuOpen: {
     position: "relative",
     zIndex: 999,
     elevation: 999,
-    paddingBottom: 132
+    paddingBottom: 225
   },
   position: {
     fontSize: 16,
@@ -4650,6 +4874,26 @@ const styles = StyleSheet.create({
     marginTop: 2,
     fontSize: 12,
     color: "#486581"
+  },
+  postingFreshness: { marginTop: 3, fontSize: 12, color: "#7c4a03", fontWeight: "700" },
+  postingBadgesRow: { flexDirection: "row", flexWrap: "wrap", gap: 5, marginTop: 6 },
+  postingReviewBadge: {
+    borderRadius: 999,
+    backgroundColor: "#e8f6ef",
+    color: "#0b6e4f",
+    fontSize: 10,
+    fontWeight: "700",
+    paddingHorizontal: 7,
+    paddingVertical: 3
+  },
+  postingReviewBadgeIgnored: { backgroundColor: "#e4e7eb", color: "#52606d" },
+  postingConfidenceBadge: {
+    borderRadius: 999,
+    backgroundColor: "#edf2f7",
+    color: "#486581",
+    fontSize: 10,
+    paddingHorizontal: 7,
+    paddingVertical: 3
   },
   postingCompensation: {
     marginTop: 2,
@@ -4780,6 +5024,19 @@ const styles = StyleSheet.create({
     marginTop: 20,
     color: "#52606d"
   },
+  loadMoreButton: {
+    alignSelf: "center",
+    minWidth: 150,
+    marginTop: 10,
+    borderRadius: 10,
+    backgroundColor: "#102a43",
+    paddingHorizontal: 18,
+    paddingVertical: 11,
+    alignItems: "center"
+  },
+  loadMoreButtonText: { color: "#ffffff", fontSize: 12, fontWeight: "700" },
+  paginationEnd: { textAlign: "center", color: "#7a8798", fontSize: 11, marginVertical: 14 },
+  reviewDetailNotice: { marginTop: 8, color: "#52606d", fontSize: 11, fontStyle: "italic" },
   applicationCard: {
     marginTop: 12,
     borderWidth: 1,

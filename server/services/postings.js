@@ -6,6 +6,8 @@ const { normalizePayFilterNumber, normalizeBoolean, parseNonNegativeInteger, now
 const { inferAshbyLocationFromDescription } = require("../ats/ashby/service.js");
 const { getDb, setDb, getReadDb, getPostingLocationByJobUrl } = require("../services/runtime-context")
 const { parseCityFilters, rowMatchesCityFilters, parseLocationsJson, parsePostingLocation } = require("../helpers/parse-location")
+const { enrichPostingClassification, classifyPosting } = require("./posting-classification.js");
+const { setPostingIgnoredCompatibility } = require("./posting-review.js");
 
 const DEFAULT_COUNTRY_FILTER_OPTIONS = buildDefaultCountryFilterOptions();
 let postingLocationGeoFilterOptionsCache = {
@@ -467,7 +469,13 @@ async function listPostingsWithFilters(options = {}) {
   // database connection"). WAL lets a separate reader see committed data without taking a
   // lock, so it neither blocks the sync nor waits on it.
   const db = getReadDb();
-  const freshnessCutoffEpoch = getPostingFreshnessCutoffEpoch();
+  const classificationNowEpoch = nowEpochSeconds();
+  const classificationWindowSeconds = getPostingFreshnessWindowSeconds();
+  const classificationOptions = {
+    now_epoch: classificationNowEpoch,
+    freshness_window_seconds: classificationWindowSeconds
+  };
+  const freshnessCutoffEpoch = classificationNowEpoch - classificationWindowSeconds;
   const search = String(options?.search || "").trim();
   const limit = Math.max(1, Math.min(2000, Number(options?.limit || 500)));
   const offset = Math.max(0, Number(options?.offset || 0));
@@ -505,6 +513,10 @@ async function listPostingsWithFilters(options = {}) {
   // freshness window. They are hidden, but unlike delisted ones they can still be applied
   // to, so this is opt-in rather than lumped in with "hidden".
   const includeStaleDated = normalizeBoolean(options?.include_stale_dated, false);
+  const reviewQueue = String(options?.review_queue || "").trim().toLowerCase();
+  if (reviewQueue && !["new", "shortlisted", "reviewed"].includes(reviewQueue)) {
+    throw new Error("review_queue must be one of: new, shortlisted, reviewed");
+  }
   // "Seattle|WA" from the dropdowns, "Seattle, WA" from a text box; both land here.
   const cityFilters = parseCityFilters(options?.cities);
   const visibilityPredicate = includeStaleDated
@@ -531,7 +543,7 @@ async function listPostingsWithFilters(options = {}) {
     cityFilters.length > 0 ||
     !(remoteFilters.length === 1 && remoteFilters[0] === "all");
 
-  const needsWideScan = Boolean(search) || hasStructuredFilters;
+  const needsWideScan = Boolean(search) || hasStructuredFilters || Boolean(reviewQueue);
   const postingLocationByJobUrl = getPostingLocationByJobUrl();
   const stateLocationFallbackUrls = stateCodes.length > 0
     ? Array.from(postingLocationByJobUrl.entries())
@@ -546,7 +558,7 @@ async function listPostingsWithFilters(options = {}) {
 
   const runPostingsQuery = async () => {
   let rows = [];
-  if (!search && !hasStructuredFilters) {
+  if (!search && !hasStructuredFilters && !reviewQueue) {
     if (includeApplied && includeIgnored) {
       rows = await db.all(
         `
@@ -614,21 +626,53 @@ async function listPostingsWithFilters(options = {}) {
       stateLocationFallbackUrls,
       includeUnknownPay
     });
+    const reviewStateSql = reviewQueue === "new"
+      ? "AND COALESCE(NULLIF(s.review_state, ''), CASE WHEN COALESCE(s.ignored, 0) = 1 THEN 'ignored' ELSE 'unseen' END) = 'unseen'"
+      : reviewQueue === "shortlisted"
+        ? "AND COALESCE(s.review_state, '') = 'shortlisted'"
+        : reviewQueue === "reviewed"
+          ? "AND (COALESCE(s.review_state, '') IN ('viewed', 'ignored') OR COALESCE(s.ignored, 0) = 1)"
+          : "";
+    const reviewStateSelect = reviewQueue
+      ? "COALESCE(NULLIF(s.review_state, ''), CASE WHEN COALESCE(s.ignored, 0) = 1 THEN 'ignored' ELSE 'unseen' END)"
+      : "'unseen'";
+    const reviewStateJoin = reviewQueue
+      ? `LEFT JOIN (
+          SELECT job_posting_url AS state_job_posting_url, review_state, ignored
+          FROM posting_application_state
+        ) s ON s.state_job_posting_url = p.job_posting_url`
+      : `LEFT JOIN (
+          SELECT job_posting_url AS state_job_posting_url
+          FROM posting_application_state
+        ) s ON s.state_job_posting_url = p.job_posting_url`;
+    const reviewVisibilitySql = reviewQueue === "shortlisted" || reviewQueue === "reviewed"
+      ? "1 = 1"
+      : "p.hidden = 0 AND p.last_seen_epoch >= ?";
+    const reviewVisibilityParams = reviewQueue === "shortlisted" || reviewQueue === "reviewed"
+      ? []
+      : [freshnessCutoffEpoch];
     rows = await db.all(
       `
-        SELECT id, company_name, position_name, job_posting_url, posting_date, location, locations_json, status, location_conflict, requires_account, hidden, hidden_reason, compensation_type, education_levels, pay_min, pay_max, pay_currency, pay_period, pay_raw, first_seen_epoch, last_seen_epoch
-        FROM Postings
-        WHERE hidden = 0
-          AND last_seen_epoch >= ?
+        SELECT p.id, p.company_name, p.position_name, p.job_posting_url, p.posting_date,
+               p.location, p.locations_json, p.status, p.location_conflict,
+               p.requires_account, p.hidden, p.hidden_reason, p.compensation_type,
+               p.education_levels, p.pay_min, p.pay_max, p.pay_currency, p.pay_period,
+               p.pay_raw, p.first_seen_epoch, p.last_seen_epoch,
+               CASE WHEN p.job_description IS NOT NULL AND TRIM(p.job_description) <> '' THEN 1 ELSE 0 END AS description_available,
+               ${reviewStateSelect} AS _review_state
+        FROM Postings p
+        ${reviewStateJoin}
+        WHERE ${reviewVisibilitySql}
           AND NOT EXISTS (
           SELECT 1
           FROM blocked_companies b
-          WHERE b.normalized_company_name = LOWER(TRIM(Postings.company_name))
+          WHERE b.normalized_company_name = LOWER(TRIM(p.company_name))
         )
+        ${reviewStateSql}
         ${prefilter.sql}
         ORDER BY ${orderByClause};
       `,
-      [freshnessCutoffEpoch, ...prefilter.params]
+      [...reviewVisibilityParams, ...prefilter.params]
     );
   }
 
@@ -721,9 +765,15 @@ async function listPostingsWithFilters(options = {}) {
     // hydrated for the returned page; null/"" means there genuinely isn't one.
     const normalizedJobDescription =
       row?.job_description === undefined ? undefined : normalizeJobDescription(row?.job_description, ats);
+    const classification = classifyPosting({
+      ...row,
+      posting_date: rawPostingDate,
+      job_description: normalizedJobDescription
+    }, classificationOptions);
 
     return {
       ...row,
+      ...classification,
       posting_date: postingDate || null,
       job_description: normalizedJobDescription,
       status: String(row?.status || "unverified"),
@@ -757,6 +807,12 @@ async function listPostingsWithFilters(options = {}) {
   });
 
   let enrichedRows = rows.map(enrichRowForFiltering);
+  if (reviewQueue === "new") {
+    enrichedRows = enrichedRows.filter((row) => {
+      const key = classifyPosting(row, classificationOptions).freshness.key;
+      return key === "confirmed_recent" || key === "newly_discovered";
+    });
+  }
   if (hideNoDate) {
     enrichedRows = enrichedRows.map(withHasRealSourcePostingDate);
   }
@@ -768,7 +824,7 @@ async function listPostingsWithFilters(options = {}) {
   if (hideNoDate) {
     items = items.filter((row) => Boolean(row?._has_real_source_posting_date));
   }
-  if (search || hasStructuredFilters) {
+  if (search || hasStructuredFilters || reviewQueue) {
     items = enrichedRows.filter((row) => {
       const companyName = String(row?.company_name || "").toLowerCase();
       const positionName = String(row?.position_name || "").toLowerCase();
@@ -878,6 +934,7 @@ async function listPostingsWithFilters(options = {}) {
       pay_max: payMaxFilter,
       include_unknown_pay: includeUnknownPay,
       include_stale_dated: includeStaleDated,
+      review_queue: reviewQueue,
       education_levels: educationLevels,
       states: stateCodes,
       counties: countyFilters.map((filter) =>
@@ -910,16 +967,7 @@ async function enrichPostingsWithApplicationState(items) {
   const placeholders = uniqueUrls.map(() => "?").join(", ");
   const stateRows = await db.all(
     `
-      SELECT
-        job_posting_url,
-        applied,
-        applied_by_type,
-        applied_by_label,
-        applied_at_epoch,
-        last_application_id,
-        ignored,
-        ignored_at_epoch,
-        ignored_by_label
+      SELECT *
       FROM posting_application_state
       WHERE job_posting_url IN (${placeholders});
     `,
@@ -936,11 +984,21 @@ async function enrichPostingsWithApplicationState(items) {
     const state = byUrl.get(key);
     const applied = Boolean(Number(state?.applied || 0));
     const ignored = Boolean(Number(state?.ignored || 0));
+    const reviewState = ignored
+      ? "ignored"
+      : ["unseen", "viewed", "shortlisted", "ignored"].includes(String(state?.review_state || ""))
+        ? String(state.review_state)
+        : "unseen";
     const appliedByType = applied ? normalizeAppliedByType(state?.applied_by_type) : "";
+    const classifiedItem = item?.freshness ? item : enrichPostingClassification(item);
     return {
-      ...item,
+      ...classifiedItem,
       applied,
       ignored,
+      review_state: reviewState,
+      review_state_changed_at_epoch: Number(state?.review_state_changed_at_epoch || 0),
+      viewed_at_epoch: Number(state?.viewed_at_epoch || 0),
+      shortlisted_at_epoch: Number(state?.shortlisted_at_epoch || 0),
       applied_by_type: appliedByType,
       applied_by_label: applied ? normalizeAppliedByLabel(state?.applied_by_label, appliedByType) : "",
       applied_at_epoch: Number(state?.applied_at_epoch || 0),
@@ -989,7 +1047,7 @@ async function getPostingsByUrls(jobPostingUrls) {
       locations = JSON.parse(row?.locations_json || "[]");
       hiringLocations = JSON.parse(row?.hiring_locations_json || "[]");
     } catch {}
-    return {
+    return enrichPostingClassification({
       ...row,
       ats,
       location: String(row?.location || "").trim() || inferPostingLocationFromJobUrl(row?.job_posting_url) || "",
@@ -1011,7 +1069,7 @@ async function getPostingsByUrls(jobPostingUrls) {
       job_description: normalizeJobDescription(row?.job_description, ats),
       pay_currency: normalizeCompensationCurrencyCode(row?.pay_currency),
       pay_raw: String(row?.pay_raw || "").trim() || null
-    };
+    });
   });
 
   return enrichPostingsWithApplicationState(items);
@@ -1056,71 +1114,34 @@ async function markPostingAppliedState(payload) {
     `,
     [jobPostingUrl, applied ? 1 : 0, appliedByType, appliedByLabel, appliedAtEpoch, lastApplicationId]
   );
+
+  // Application lifecycle remains independent, but saving an application is also an
+  // intentional review action. Keep an existing shortlist; otherwise move unseen/ignored
+  // rows to viewed while leaving `applied` as the durable submission indicator.
+  try {
+    await db.run(
+      `UPDATE posting_application_state
+       SET review_state = CASE WHEN review_state = 'shortlisted' THEN review_state ELSE 'viewed' END,
+           review_state_changed_at_epoch = CASE WHEN review_state = 'shortlisted'
+             THEN review_state_changed_at_epoch ELSE ? END,
+           viewed_at_epoch = COALESCE(viewed_at_epoch, ?),
+           ignored = 0, ignored_at_epoch = NULL, ignored_by_label = ''
+       WHERE job_posting_url = ?;`,
+      [appliedAtEpoch, appliedAtEpoch, jobPostingUrl]
+    );
+  } catch (error) {
+    // Compatibility for focused service tests or a database opened before startup
+    // migrations. The application write above remains valid on the legacy schema.
+    if (!String(error?.message || error).includes("no such column")) throw error;
+  }
 }
 
 
 async function setPostingIgnoredState(payload) {
-  const db = getDb()
-  const jobPostingUrl = String(payload?.job_posting_url || "").trim();
-  if (!jobPostingUrl) {
-    throw new Error("job_posting_url is required");
-  }
-
-  const ignored = normalizeBoolean(payload?.ignored, true);
-  const ignoredAtEpoch = parseNonNegativeInteger(payload?.ignored_at_epoch) || nowEpochSeconds();
-  const ignoredByLabel = normalizeIgnoredByLabel(payload?.ignored_by_label);
-
-  await db.run(
-    `
-      INSERT INTO posting_application_state (
-        job_posting_url,
-        applied,
-        applied_by_type,
-        applied_by_label,
-        applied_at_epoch,
-        last_application_id,
-        ignored,
-        ignored_at_epoch,
-        ignored_by_label,
-        updated_at
-      ) VALUES (?, 0, 'manual', '', NULL, NULL, ?, ?, ?, datetime('now'))
-      ON CONFLICT(job_posting_url) DO UPDATE SET
-        ignored = excluded.ignored,
-        ignored_at_epoch = CASE
-          WHEN excluded.ignored = 1 THEN excluded.ignored_at_epoch
-          ELSE NULL
-        END,
-        ignored_by_label = CASE
-          WHEN excluded.ignored = 1 THEN excluded.ignored_by_label
-          ELSE ''
-        END,
-        updated_at = datetime('now');
-    `,
-    [jobPostingUrl, ignored ? 1 : 0, ignoredAtEpoch, ignoredByLabel]
-  );
-
-  const row = await db.get(
-    `
-      SELECT
-        job_posting_url,
-        applied,
-        ignored,
-        ignored_at_epoch,
-        ignored_by_label
-      FROM posting_application_state
-      WHERE job_posting_url = ?
-      LIMIT 1;
-    `,
-    [jobPostingUrl]
-  );
-
-  return {
-    job_posting_url: jobPostingUrl,
-    applied: Boolean(Number(row?.applied || 0)),
-    ignored: Boolean(Number(row?.ignored || 0)),
-    ignored_at_epoch: Number(row?.ignored_at_epoch || 0),
-    ignored_by_label: String(row?.ignored_by_label || "")
-  };
+  return setPostingIgnoredCompatibility({
+    ...payload,
+    ignored: normalizeBoolean(payload?.ignored, true)
+  });
 }
 
 

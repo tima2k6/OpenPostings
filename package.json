@@ -18,6 +18,7 @@
     "test:backend:seeded-source": "node server/tests/seeded-source-parser.test.js",
     "test:backend:location-filter": "node server/tests/location-state-filter.test.js",
     "test:backend:mcp-candidate-filters": "node server/tests/mcp-candidate-filters.test.js",
+    "test:backend:posting-foundation": "node server/tests/posting-classification.test.js && node server/tests/posting-review.test.js && node server/tests/posting-review-pagination.test.js && node server/tests/migration-review-state.test.js && node server/tests/api-network.test.js && node server/tests/api-review-state.test.js",
     "test:backend:applicant-documents": "node server/tests/applicant-documents.test.js",
     "test:backend:application-answers": "node server/tests/application-answers.test.js",
     "test:backend:cover-letter": "node server/tests/cover-letter.test.js",

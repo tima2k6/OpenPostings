@@ -93,7 +93,8 @@ const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable,
 const { startEnrichmentLoops, getEnrichmentStatus } = require("./services/enrichment-runtime.js");
 const { startWriteLivenessWatchdog, getWriteLivenessStatus } = require("./services/write-liveness.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
-const { listPostingsWithFilters, setPostingIgnoredState, getCounts, getWideScanStats } = require("./services/postings.js");
+const { listPostingsWithFilters, getPostingsByUrls, setPostingIgnoredState, getCounts, getWideScanStats } = require("./services/postings.js");
+const { ensurePostingReviewSchema, setPostingReviewState } = require("./services/posting-review.js");
 const { getPostingFilterOptions } = require("./services/filter-options.js");
 const { extractDocumentText, getApplicantDocument, saveApplicantDocument, listApplicantDocuments, deleteApplicantDocument, checkConfiguredDocumentPaths, normalizeDocumentKind, MAX_DOCUMENT_KEY_LENGTH, APPLICANT_DOCUMENT_KINDS } = require("./services/applicant-documents.js");
 const { ensureApplicationAnswersTable, listApplicationAnswers, setApplicationAnswers, clearApplicationAnswer } = require("./services/application-answers.js");
@@ -112,6 +113,7 @@ const { DB_BROWSER_PAGE } = require("./services/db-browser-page.js");
 const { runQuery: runPostingQuery } = require("./services/db-query.js");
 const { computeFacets } = require("./services/db-facets.js");
 const { listSavedQueries, saveQuery, deleteQuery } = require("./services/saved-queries.js");
+const { getApiHost, createOriginPolicy } = require("./config/api-network.js");
 
 
 const PORT = Number(process.env.PORT || 8787);
@@ -922,6 +924,10 @@ async function ensureApplicationsTable() {
       ignored INTEGER NOT NULL DEFAULT 0,
       ignored_at_epoch INTEGER,
       ignored_by_label TEXT NOT NULL DEFAULT '',
+      review_state TEXT NOT NULL DEFAULT 'unseen',
+      review_state_changed_at_epoch INTEGER,
+      viewed_at_epoch INTEGER,
+      shortlisted_at_epoch INTEGER,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -1005,6 +1011,7 @@ async function ensureApplicationsTable() {
     CREATE INDEX IF NOT EXISTS idx_posting_application_state_ignored
       ON posting_application_state(ignored);
   `);
+  await ensurePostingReviewSchema(db);
 
   // These columns used to hold the agent's login email and password in plaintext, handed
   // to the agent so it could create accounts and sign in as the user. That capability is
@@ -1185,7 +1192,13 @@ let restartInProgress = false;
 function createServer() {
   const app = express();
   const db = getDb();
-  app.use(cors());
+  app.use(cors({ origin: createOriginPolicy() }));
+  app.use((error, _req, res, next) => {
+    if (String(error?.message || "").startsWith("CORS origin is not allowed:")) {
+      return res.status(403).json({ ok: false, error: "Origin is not allowed by the local API policy." });
+    }
+    return next(error);
+  });
   // 25mb: document uploads (/settings/applicant-documents) arrive as base64 JSON, and the
   // default 100kb cap cannot fit a resume PDF. Local/self-hosted API, per the security notes.
   app.use(express.json({ limit: "25mb" }));
@@ -1558,6 +1571,14 @@ function createServer() {
   app.get("/postings/filter-options", async (req, res) => {
     const options = await getPostingFilterOptions({ states: parseCsvParam(req.query.states) });
     res.json(options);
+  });
+
+  app.get("/postings/details", async (req, res) => {
+    const jobPostingUrl = String(req.query.job_posting_url || "").trim();
+    if (!jobPostingUrl) return res.status(400).json({ ok: false, error: "job_posting_url is required" });
+    const [item] = await getPostingsByUrls([jobPostingUrl]);
+    if (!item) return res.status(404).json({ ok: false, error: "posting not found" });
+    return res.json({ ok: true, item: sanitizeFrontendValue(item) });
   });
 
   app.get("/settings/personal-information", async (_req, res) => {
@@ -2217,6 +2238,15 @@ function createServer() {
     }
   });
 
+  app.patch("/postings/review-state", async (req, res) => {
+    try {
+      const item = await setPostingReviewState(req.body || {});
+      res.json({ ok: true, item });
+    } catch (error) {
+      res.status(400).json({ ok: false, error: String(error?.message || error) });
+    }
+  });
+
   app.get("/postings", async (req, res) => {
     const result = await listPostingsWithFilters({
       search: String(req.query.search || "").trim(),
@@ -2239,7 +2269,8 @@ function createServer() {
       hide_no_date: normalizeBoolean(req.query.hide_no_date, false),
       include_applied: normalizeBoolean(req.query.include_applied, true),
       include_ignored: normalizeBoolean(req.query.include_ignored, false),
-      include_descriptions: normalizeBoolean(req.query.include_descriptions, true)
+      include_descriptions: normalizeBoolean(req.query.include_descriptions, true),
+      review_queue: String(req.query.review_queue || "").trim()
     });
 
     res.json({
@@ -2257,8 +2288,9 @@ async function start() {
   await initDb();
 
   const app = createServer();
-  const server = app.listen(PORT, () => {
-    console.log(`[OpenPostings API] listening on http://localhost:${PORT}`);
+  const host = getApiHost();
+  const server = app.listen(PORT, host, () => {
+    console.log(`[OpenPostings API] listening on http://${host}:${PORT}`);
     console.log(`[OpenPostings API] using database ${DB_PATH}`);
     console.log(
       `[OpenPostings API] ATS request queue concurrency (runtime): ${getAtsRequestQueueConcurrency()} (saved changes apply after restart)`

@@ -56,6 +56,7 @@ const {
 const { runQuery, SORTABLE, MAX_ROWS } = require("./services/db-query.js");
 const { getPostingFilterOptions } = require("./services/filter-options.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime } = require("./services/sync-settings.js");
+const { ensurePostingReviewSchema } = require("./services/posting-review.js");
 
 const DB_PATH = process.env.DB_PATH || path.resolve(__dirname, "..", "jobs.db");
 
@@ -70,7 +71,7 @@ let db;
 
 function ensureMcpAgentEnabled(settings) {
   if (normalizeBoolean(settings?.enabled, false)) return;
-  throw new Error("MCP application agent is disabled in settings.");
+  throw new Error("MCP application copilot is disabled in settings.");
 }
 
 async function ensureTables() {
@@ -144,6 +145,10 @@ async function ensureTables() {
       ignored INTEGER NOT NULL DEFAULT 0,
       ignored_at_epoch INTEGER,
       ignored_by_label TEXT NOT NULL DEFAULT '',
+      review_state TEXT NOT NULL DEFAULT 'unseen',
+      review_state_changed_at_epoch INTEGER,
+      viewed_at_epoch INTEGER,
+      shortlisted_at_epoch INTEGER,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -191,6 +196,7 @@ async function ensureTables() {
       ADD COLUMN ignored_by_label TEXT NOT NULL DEFAULT '';
     `);
   }
+  await ensurePostingReviewSchema(db);
   // These columns used to hold the agent's login email and password in plaintext, handed
   // to the agent so it could create accounts and sign in as the user. That capability is
   // gone. SQLite before 3.35 cannot DROP COLUMN and the column may be NOT NULL, so the
@@ -621,17 +627,31 @@ async function createApplicationFromAgent(input) {
             applied_by_label,
             applied_at_epoch,
             last_application_id,
+            review_state,
+            review_state_changed_at_epoch,
+            viewed_at_epoch,
+            ignored,
+            ignored_at_epoch,
+            ignored_by_label,
             updated_at
-          ) VALUES (?, 1, 'agent', ?, ?, ?, datetime('now'))
+          ) VALUES (?, 1, 'agent', ?, ?, ?, 'viewed', ?, ?, 0, NULL, '', datetime('now'))
           ON CONFLICT(job_posting_url) DO UPDATE SET
             applied = 1,
             applied_by_type = 'agent',
             applied_by_label = excluded.applied_by_label,
             applied_at_epoch = excluded.applied_at_epoch,
             last_application_id = excluded.last_application_id,
+            review_state = CASE WHEN posting_application_state.review_state = 'shortlisted'
+              THEN 'shortlisted' ELSE 'viewed' END,
+            review_state_changed_at_epoch = CASE WHEN posting_application_state.review_state = 'shortlisted'
+              THEN posting_application_state.review_state_changed_at_epoch ELSE excluded.review_state_changed_at_epoch END,
+            viewed_at_epoch = COALESCE(posting_application_state.viewed_at_epoch, excluded.viewed_at_epoch),
+            ignored = 0,
+            ignored_at_epoch = NULL,
+            ignored_by_label = '',
             updated_at = datetime('now');
         `,
-        [jobPostingUrl, appliedByLabel, applicationDate, result.lastID]
+        [jobPostingUrl, appliedByLabel, applicationDate, result.lastID, applicationDate, applicationDate]
       );
     }
 
@@ -737,7 +757,7 @@ async function main() {
     "find_posting_candidates",
     {
       description:
-        "Find postings to apply to, using the same filter engine as the app's job list. Any filter left empty falls back to the saved MCP preference for it; pass use_settings=false to ignore saved preferences entirely. Applied, ignored and dead postings are excluded by default (include_dead=true to see verified-gone ones). Postings hidden only because their posting date is older than the freshness window are excluded too but remain applyable -- include_stale_dated=true brings them back, and rows carry hidden_reason so you can tell them from delisted ones. Pay ranges keep postings with no published pay figure -- pay_unknown_count reports how many -- unless include_unknown_pay=false. Rows carry location_conflict, which flags a posting whose description restricts hiring to fewer places than its header lists. Job descriptions are omitted unless include_descriptions=true. Use cities for city-level targeting: values are City|ST (get_filter_options lists them per state, busiest first) and they match parsed locations, so Kent|WA cannot return Kent in England or anything in Kentucky. Call get_filter_options for the valid values of the list filters.",
+        "Find postings to prepare, using the same filter engine as the app's job list. Any filter left empty falls back to the saved MCP preference for it; pass use_settings=false to ignore saved preferences entirely. Applied, ignored and dead postings are excluded by default (include_dead=true to see verified-gone ones). Postings hidden only because their posting date is older than the freshness window are excluded too but remain applyable -- include_stale_dated=true brings them back. Rows carry canonical freshness, confidence and review state alongside compatibility fields such as hidden_reason and ignored. Pay ranges keep postings with no published pay figure -- pay_unknown_count reports how many -- unless include_unknown_pay=false. Rows carry location_conflict, which flags a posting whose description restricts hiring to fewer places than its header lists. Job descriptions are omitted unless include_descriptions=true. Use cities for city-level targeting: values are City|ST (get_filter_options lists them per state, busiest first) and they match parsed locations, so Kent|WA cannot return Kent in England or anything in Kentucky. Call get_filter_options for the valid values of the list filters.",
       inputSchema: {
         search: z.string().optional(),
         ats: z
@@ -828,7 +848,7 @@ async function main() {
     "get_posting_details",
     {
       description:
-        "Everything stored about the named postings: full job description, pay fields, parsed locations, hiring-location restrictions (location_conflict flags a header/body disagreement), liveness status, requires_account, education levels, ATS, hidden flag, sync timestamps, and applied/ignored state. When a posting has no stored description it is fetched from the posting page on the spot and persisted (pass fetch_missing=false to skip the network). This is the screening step between shortlisting and opening a browser -- read the description against the applicant's background and decide fit before spending a browser session. URLs not in the database are returned in missing.",
+        "Everything stored about the named postings: canonical freshness and data confidence, review state, full job description, pay fields, parsed locations, hiring-location restrictions (location_conflict flags a header/body disagreement), liveness status, requires_account, education levels, ATS, sync timestamps, and applied/ignored compatibility state. When a posting has no stored description it is fetched from the posting page on the spot and persisted (pass fetch_missing=false to skip the network). This is the screening step between shortlisting and handing work to an external browser-capable agent. URLs not in the database are returned in missing.",
       inputSchema: {
         job_posting_urls: z.array(z.string()).min(1).max(20),
         fetch_missing: z.boolean().optional()

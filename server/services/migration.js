@@ -5,6 +5,7 @@ const { upsertMcpSettings } = require("../services/mcp")
 const { normalizeCompanyNameForBlockList } = require("../helpers/normalize-ats")
 const { parseNonNegativeInteger, nowEpochSeconds, normalizeBoolean } = require("../helpers/normalize-numbers")
 const { getDb, setDb, runInWriteTransaction } = require("../services/runtime-context")
+const { ensurePostingReviewSchema } = require("./posting-review.js");
 
 const path = require("path");
 const fs = require("fs");
@@ -192,6 +193,7 @@ async function migrateSettingsAndApplicationsFromDatabase(rawSourceDbPath, selec
 
       const sourceToTargetApplicationId = new Map();
 
+      await ensurePostingReviewSchema(getDb());
       await runInWriteTransaction(async (db) => {
         for (const item of sourceApplications) {
           const sourceCompanyName = String(item?.source_company_name || "").trim();
@@ -261,6 +263,11 @@ async function migrateSettingsAndApplicationsFromDatabase(rawSourceDbPath, selec
         }
 
         if (await tableExists(sourceDb, "posting_application_state")) {
+          const sourcePostingStateColumns = await sourceDb.all(`PRAGMA table_info('posting_application_state');`);
+          const sourcePostingStateColumnNames = new Set(
+            sourcePostingStateColumns.map((column) => String(column?.name || ""))
+          );
+          const hasReviewState = sourcePostingStateColumnNames.has("review_state");
           const sourcePostingStateRows = await sourceDb.all(
             `
               SELECT
@@ -272,7 +279,11 @@ async function migrateSettingsAndApplicationsFromDatabase(rawSourceDbPath, selec
                 last_application_id,
                 ignored,
                 ignored_at_epoch,
-                ignored_by_label
+                ignored_by_label,
+                ${hasReviewState ? "review_state" : "CASE WHEN COALESCE(ignored, 0) = 1 THEN 'ignored' ELSE 'unseen' END"} AS review_state,
+                ${sourcePostingStateColumnNames.has("review_state_changed_at_epoch") ? "review_state_changed_at_epoch" : "ignored_at_epoch"} AS review_state_changed_at_epoch,
+                ${sourcePostingStateColumnNames.has("viewed_at_epoch") ? "viewed_at_epoch" : "ignored_at_epoch"} AS viewed_at_epoch,
+                ${sourcePostingStateColumnNames.has("shortlisted_at_epoch") ? "shortlisted_at_epoch" : "NULL"} AS shortlisted_at_epoch
               FROM posting_application_state;
             `
           );
@@ -298,8 +309,12 @@ async function migrateSettingsAndApplicationsFromDatabase(rawSourceDbPath, selec
                   ignored,
                   ignored_at_epoch,
                   ignored_by_label,
+                  review_state,
+                  review_state_changed_at_epoch,
+                  viewed_at_epoch,
+                  shortlisted_at_epoch,
                   updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                 ON CONFLICT(job_posting_url) DO UPDATE SET
                   applied = excluded.applied,
                   applied_by_type = excluded.applied_by_type,
@@ -309,6 +324,10 @@ async function migrateSettingsAndApplicationsFromDatabase(rawSourceDbPath, selec
                   ignored = excluded.ignored,
                   ignored_at_epoch = excluded.ignored_at_epoch,
                   ignored_by_label = excluded.ignored_by_label,
+                  review_state = excluded.review_state,
+                  review_state_changed_at_epoch = excluded.review_state_changed_at_epoch,
+                  viewed_at_epoch = excluded.viewed_at_epoch,
+                  shortlisted_at_epoch = excluded.shortlisted_at_epoch,
                   updated_at = datetime('now');
               `,
               [
@@ -320,7 +339,11 @@ async function migrateSettingsAndApplicationsFromDatabase(rawSourceDbPath, selec
                 mappedLastApplicationId,
                 normalizeBoolean(row?.ignored, false) ? 1 : 0,
                 parseNonNegativeInteger(row?.ignored_at_epoch) || null,
-                ignoredByLabel
+                ignoredByLabel,
+                String(row?.review_state || "unseen"),
+                parseNonNegativeInteger(row?.review_state_changed_at_epoch) || null,
+                parseNonNegativeInteger(row?.viewed_at_epoch) || null,
+                parseNonNegativeInteger(row?.shortlisted_at_epoch) || null
               ]
             );
             summary.posting_application_state_upserts += 1;
