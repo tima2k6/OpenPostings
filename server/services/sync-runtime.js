@@ -120,6 +120,10 @@ const syncStatus = {
   // when the pass ends, hours later. These make "collecting but storing nothing" visible
   // while it is still happening.
   postings_stored: 0,
+  new_postings: 0,
+  refreshed_postings: 0,
+  last_progress_at: null,
+  last_write_at: null,
   flush_failures: 0,
   last_flush_error: null,
   last_flush_error_at: null
@@ -1036,6 +1040,10 @@ async function runAtsSyncInternal() {
   syncStatus.progress = { current: 0, total: 0, company_name: "", total_collected: 0 };
   syncStatus.last_error = null;
   syncStatus.postings_stored = 0;
+  syncStatus.new_postings = 0;
+  syncStatus.refreshed_postings = 0;
+  syncStatus.last_progress_at = syncStatus.started_at;
+  syncStatus.last_write_at = null;
   syncStatus.flush_failures = 0;
   syncStatus.last_flush_error = null;
   syncStatus.last_flush_error_at = null;
@@ -1142,11 +1150,15 @@ async function runAtsSyncInternal() {
       const batch = pendingPostingsForUpsert.splice(0, pendingPostingsForUpsert.length);
       if (batch.length === 0) return;
       try {
-        await upsertPostings(batch, syncReferenceEpoch);
+        const writeCounts = await upsertPostings(batch, syncReferenceEpoch);
         // Real wall-clock time of a real write, unlike syncReferenceEpoch.
-        await recordSyncWriteHeartbeat();
+        const wroteAt = new Date();
+        await recordSyncWriteHeartbeat(Math.floor(wroteAt.getTime() / 1000));
         if (syncGeneration === passGeneration) {
           syncStatus.postings_stored += batch.length;
+          syncStatus.new_postings += Number(writeCounts?.inserted || 0);
+          syncStatus.refreshed_postings += Number(writeCounts?.refreshed || 0);
+          syncStatus.last_write_at = wroteAt.toISOString();
           syncStatus.flush_failures = 0;
         }
       } catch (error) {
@@ -1245,6 +1257,7 @@ async function runAtsSyncInternal() {
           // progress the watchdog has already cleared.
           if (syncGeneration === passGeneration) {
             lastSyncProgressAtMs = Date.now();
+            syncStatus.last_progress_at = new Date(lastSyncProgressAtMs).toISOString();
             // Attribution, not estimation. A first attempt at accounting for a 4.8 GB
             // process from posting counts explained under half a gigabyte, so the real
             // shape of the growth has to be measured. external/arrayBuffers separates
@@ -1261,11 +1274,19 @@ async function runAtsSyncInternal() {
               deduped_urls: dedupedPostingUrls.size,
               location_map: nextPostingLocationByJobUrl.size
             };
+            const elapsedSeconds = Math.max(1, (lastSyncProgressAtMs - Date.parse(syncStatus.started_at)) / 1000);
+            const targetsPerMinute = completedCompanies / (elapsedSeconds / 60);
+            const remainingTargets = Math.max(0, syncTargets.length - completedCompanies);
+            const etaSeconds = targetsPerMinute > 0 ? Math.round((remainingTargets / targetsPerMinute) * 60) : null;
             syncStatus.progress = {
               current: completedCompanies,
               total: syncTargets.length,
               company_name: `${company.company_name} (${company.ATS_name})`,
-              total_collected: dedupedPostingUrls.size
+              ats_name: String(company.ATS_name || ""),
+              total_collected: dedupedPostingUrls.size,
+              percent: syncTargets.length > 0 ? Math.round((completedCompanies / syncTargets.length) * 1000) / 10 : 0,
+              targets_per_minute: Math.round(targetsPerMinute * 10) / 10,
+              eta_seconds: etaSeconds
             };
           }
         }
@@ -1371,6 +1392,8 @@ async function runAtsSyncInternal() {
       total_companies: syncTargets.length,
       ...syncScopeStats,
       total_postings_stored: dedupedPostingUrls.size,
+      new_postings: syncStatus.new_postings,
+      refreshed_postings: syncStatus.refreshed_postings,
       worker_concurrency: workerCount,
       ats_request_queue_concurrency: getAtsRequestQueueConcurrency(),
       failed_companies: errors.length,
@@ -1456,8 +1479,26 @@ function runAtsSync() {
 async function upsertPostingsBatch(postings, seenEpoch) {
   // Serialized against every other writer on the shared connection -- background
   // enrichment now runs concurrently with the sync, and overlapping BEGINs fail.
-  await runInWriteTransaction(async (db) => {
+  return runInWriteTransaction(async (db) => {
+    const validPostingByUrl = new Map();
     for (const posting of postings) {
+      const jobPostingUrl = String(posting?.job_posting_url || "").trim();
+      if (jobPostingUrl) validPostingByUrl.set(jobPostingUrl, posting);
+    }
+    const validPostings = Array.from(validPostingByUrl.values());
+    if (validPostings.length === 0) return { inserted: 0, refreshed: 0 };
+
+    // The sync used to report every successful UPSERT as a newly stored posting. Check the
+    // batch inside the same write transaction so the UI can distinguish genuine discoveries
+    // from existing rows that were merely refreshed.
+    const placeholders = validPostings.map(() => "?").join(", ");
+    const existingRows = await db.all(
+      `SELECT job_posting_url FROM Postings WHERE job_posting_url IN (${placeholders});`,
+      validPostings.map((posting) => String(posting.job_posting_url).trim())
+    );
+    const existingUrls = new Set(existingRows.map((row) => String(row?.job_posting_url || "")));
+
+    for (const posting of validPostings) {
       const companyName = String(posting.company_name || "").trim();
       const positionName = String(posting.position_name || "").trim() || "Untitled Position";
       const jobPostingUrl = String(posting.job_posting_url || "").trim();
@@ -1567,20 +1608,25 @@ async function upsertPostingsBatch(postings, seenEpoch) {
         ]
       );
     }
+    const refreshed = validPostings.reduce(
+      (count, posting) => count + (existingUrls.has(String(posting.job_posting_url).trim()) ? 1 : 0),
+      0
+    );
+    return { inserted: validPostings.length - refreshed, refreshed };
   });
 }
 
 async function upsertPostings(postings, lastSeenEpoch) {
-  if (!Array.isArray(postings) || postings.length === 0) return;
+  if (!Array.isArray(postings) || postings.length === 0) return { inserted: 0, refreshed: 0 };
   const seenEpoch = Number(lastSeenEpoch || nowEpochSeconds());
   try {
-    await upsertPostingsBatch(postings, seenEpoch);
+    return await upsertPostingsBatch(postings, seenEpoch);
   } catch (error) {
     if (!isRecoverablePostingStorageError(error)) {
       throw error;
     }
     await rebuildPostingsTableStorage();
-    await upsertPostingsBatch(postings, seenEpoch);
+    return upsertPostingsBatch(postings, seenEpoch);
   }
 }
 
@@ -1802,6 +1848,79 @@ async function createCanonicalPostingsTable() {
 
     CREATE INDEX IF NOT EXISTS idx_postings_hidden_last_seen_epoch
       ON Postings(hidden, last_seen_epoch);
+
+    CREATE INDEX IF NOT EXISTS idx_postings_state_region
+      ON Postings(state_region);
+  `);
+  await ensurePostingLocationStateIndex();
+}
+
+// A posting can list several states while Postings.state_region stores only its primary
+// location. Keeping the small many-to-many projection indexed lets state-filtered listing
+// requests start from roughly 9k matching rows instead of scanning close to a million.
+// This is derived data: it can always be rebuilt from Postings and never owns user data.
+async function ensurePostingLocationStateIndex() {
+  const db = getDb();
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS posting_location_states (
+      posting_id INTEGER NOT NULL,
+      state_region TEXT NOT NULL,
+      PRIMARY KEY (posting_id, state_region)
+    ) WITHOUT ROWID;
+
+    CREATE INDEX IF NOT EXISTS idx_posting_location_states_state
+      ON posting_location_states(state_region, posting_id);
+
+    CREATE TRIGGER IF NOT EXISTS trg_posting_location_states_insert
+    AFTER INSERT ON Postings
+    BEGIN
+      INSERT OR IGNORE INTO posting_location_states (posting_id, state_region)
+      SELECT NEW.id, UPPER(TRIM(NEW.state_region))
+      WHERE NEW.state_region IS NOT NULL AND TRIM(NEW.state_region) <> '';
+
+      INSERT OR IGNORE INTO posting_location_states (posting_id, state_region)
+      SELECT DISTINCT NEW.id, UPPER(TRIM(json_extract(value, '$.state_region')))
+      FROM json_each(CASE WHEN json_valid(NEW.locations_json) THEN NEW.locations_json ELSE '[]' END)
+      WHERE json_extract(value, '$.state_region') IS NOT NULL
+        AND TRIM(json_extract(value, '$.state_region')) <> ''
+        AND UPPER(TRIM(json_extract(value, '$.state_region'))) <> COALESCE(UPPER(TRIM(NEW.state_region)), '');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_posting_location_states_update
+    AFTER UPDATE OF state_region, locations_json ON Postings
+    WHEN NEW.state_region IS NOT OLD.state_region OR NEW.locations_json IS NOT OLD.locations_json
+    BEGIN
+      DELETE FROM posting_location_states WHERE posting_id = NEW.id;
+
+      INSERT OR IGNORE INTO posting_location_states (posting_id, state_region)
+      SELECT NEW.id, UPPER(TRIM(NEW.state_region))
+      WHERE NEW.state_region IS NOT NULL AND TRIM(NEW.state_region) <> '';
+
+      INSERT OR IGNORE INTO posting_location_states (posting_id, state_region)
+      SELECT DISTINCT NEW.id, UPPER(TRIM(json_extract(value, '$.state_region')))
+      FROM json_each(CASE WHEN json_valid(NEW.locations_json) THEN NEW.locations_json ELSE '[]' END)
+      WHERE json_extract(value, '$.state_region') IS NOT NULL
+        AND TRIM(json_extract(value, '$.state_region')) <> ''
+        AND UPPER(TRIM(json_extract(value, '$.state_region'))) <> COALESCE(UPPER(TRIM(NEW.state_region)), '');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_posting_location_states_delete
+    AFTER DELETE ON Postings
+    BEGIN
+      DELETE FROM posting_location_states WHERE posting_id = OLD.id;
+    END;
+
+    INSERT OR IGNORE INTO posting_location_states (posting_id, state_region)
+    SELECT id, UPPER(TRIM(state_region))
+    FROM Postings
+    WHERE state_region IS NOT NULL AND TRIM(state_region) <> '';
+
+    INSERT OR IGNORE INTO posting_location_states (posting_id, state_region)
+    SELECT p.id, UPPER(TRIM(json_extract(j.value, '$.state_region')))
+    FROM Postings p
+    JOIN json_each(CASE WHEN json_valid(p.locations_json) THEN p.locations_json ELSE '[]' END) j
+    WHERE json_extract(j.value, '$.state_region') IS NOT NULL
+      AND TRIM(json_extract(j.value, '$.state_region')) <> '';
   `);
 }
 
@@ -1818,6 +1937,7 @@ async function rebuildPostingsTableStorage() {
     `[OpenPostings API] REBUILDING Postings table storage after corruption; dropping ${rowCount} rows`
   );
   await db.exec(`DROP TABLE IF EXISTS Postings;`);
+  await db.exec(`DELETE FROM posting_location_states;`).catch(() => undefined);
   await createCanonicalPostingsTable();
 }
 
@@ -1913,6 +2033,4 @@ module.exports = {
   // observable through the ordering plus the progress marks.
   getCompaniesForSync,
   markCompanySynced,
-  flushCompanySyncMarks, runAtsSync, getSyncScopeStats, pruneExpiredPostings, deleteExpiredHiddenPostings, createCanonicalPostingsTable, upsertPostingsBatch, syncStatus, startSyncStallWatchdog, recoverStalledSync, createSerialFlushQueue };
-
-
+  flushCompanySyncMarks, runAtsSync, getSyncScopeStats, pruneExpiredPostings, deleteExpiredHiddenPostings, createCanonicalPostingsTable, ensurePostingLocationStateIndex, upsertPostingsBatch, syncStatus, startSyncStallWatchdog, recoverStalledSync, createSerialFlushQueue };

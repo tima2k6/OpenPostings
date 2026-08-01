@@ -362,6 +362,30 @@ async function testStatePrefilterMatchesOnStateName() {
   });
 }
 
+async function testStateProjectionKeepsSecondaryLocations() {
+  await withDb([], async (db) => {
+    const locationsJson = JSON.stringify([
+      { city: "Denver", state_region: "CO", country: "US", is_remote: false },
+      { city: "Seattle", state_region: "WA", country: "US", is_remote: false }
+    ]);
+    await db.run(
+      `INSERT INTO Postings
+         (company_name, position_name, job_posting_url, location, state_region,
+          locations_json, posting_date, first_seen_epoch, last_seen_epoch, hidden)
+       VALUES ('Acme', 'Engineer', 'https://x/multi-state',
+               'Denver, CO / Seattle, WA', 'CO', ?, '1/1/26', ?, ?, 0)`,
+      [locationsJson, NOW - 60, NOW - 60]
+    );
+
+    const result = await listPostingsWithFilters({ states: ["WA"] });
+    assert.deepStrictEqual(
+      urlsOf(result),
+      ["https://x/multi-state"],
+      "the indexed state projection must retain a selected secondary location"
+    );
+  });
+}
+
 async function testFilteredRowsCarryDisplayFields() {
   await withDb([{ url: "https://x/a", position: "Engineer", location: "Austin, TX" }], async () => {
     const result = await listPostingsWithFilters({ search: "engineer" });
@@ -386,6 +410,7 @@ async function main() {
   await testDelistedPostingIsNotListed();
   await testStatePrefilterKeepsUrlInferredLocations();
   await testStatePrefilterMatchesOnStateName();
+  await testStateProjectionKeepsSecondaryLocations();
   await testFilteredRowsCarryDisplayFields();
   console.log("posting-filter-pushdown tests passed");
 }

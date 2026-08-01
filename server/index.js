@@ -89,7 +89,7 @@ const { upsertSeededCompanySource } = require("./services/seeded-source.js");
 const { getMcpSettings, upsertMcpSettings, buildMcpRunbook } = require("./services/mcp.js");
 const { buildCoverLetterDraft, buildCoverLetterBrief } = require("./services/cover-letter.js");
 const { listApplications, createApplication, updateApplicationStatus, deleteApplicationById } = require("./services/applications.js");
-const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable, startSyncStallWatchdog, getSyncCoverageStats } = require("./services/sync-runtime.js");
+const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable, ensurePostingLocationStateIndex, startSyncStallWatchdog, getSyncCoverageStats, getLastSyncWriteEpoch } = require("./services/sync-runtime.js");
 const { startEnrichmentLoops, getEnrichmentStatus } = require("./services/enrichment-runtime.js");
 const { startWriteLivenessWatchdog, getWriteLivenessStatus } = require("./services/write-liveness.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
@@ -607,10 +607,17 @@ async function initDb() {
     -- is still small relative to the file but covers the hot indexes.
     PRAGMA cache_size = -262144;
 
-    -- The WAL had grown to 412 MB because the default 1000-page threshold never kept up with
-    -- a continuously-writing sync, and every reader has to scan it. A larger threshold
-    -- checkpoints in fewer, bigger passes instead of never finishing small ones.
-    PRAGMA wal_autocheckpoint = 20000;
+    -- The WAL sat at 412 MB for days. Raising the checkpoint threshold to 20,000 pages was
+    -- the wrong direction: it let the file grow further, and every reader scans it, so reads
+    -- got slower rather than faster. Worse, SQLite checkpoints on the last connection close,
+    -- so a 412 MB WAL added fourteen seconds to every shutdown -- the bulk of what was left
+    -- of the restart window after the process layers were removed.
+    --
+    -- 4,000 pages checkpoints often enough to keep the file small, and journal_size_limit is
+    -- what actually stops it growing without bound: without it the WAL is checkpointed but
+    -- never truncated, so it stays at its high-water mark forever.
+    PRAGMA wal_autocheckpoint = 4000;
+    PRAGMA journal_size_limit = 67108864;
 
     PRAGMA journal_mode = WAL;
 
@@ -629,6 +636,7 @@ async function initDb() {
   `);
 
   await ensurePostingsTable();
+  await ensurePostingLocationStateIndex();
   await ensurePersonalInformationTable();
   await ensureApplicationsTable();
   await ensureBlockedCompaniesTable();
@@ -869,6 +877,9 @@ async function ensurePostingsTable() {
 
     CREATE INDEX IF NOT EXISTS idx_postings_location
       ON Postings(location);
+
+    CREATE INDEX IF NOT EXISTS idx_postings_state_region
+      ON Postings(state_region);
   `);
 }
 
@@ -1441,14 +1452,16 @@ function createServer() {
 
   app.get("/sync/status", async (_req, res) => {
     try {
-      const [counts, syncScopeStats, syncSettings, coverage] = await Promise.all([
+      const [counts, syncScopeStats, syncSettings, coverage, lastWriteEpoch] = await Promise.all([
         getCounts(),
         getSyncScopeStats(),
         getSyncServiceSettings(),
         // Survives restarts, unlike syncStatus.progress, so this is what answers "is
         // anything being starved" after an interrupted pass.
-        getSyncCoverageStats().catch(() => null)
+        getSyncCoverageStats().catch(() => null),
+        getLastSyncWriteEpoch()
       ]);
+      const durableLastWriteEpoch = Number(lastWriteEpoch || 0);
       const payload = sanitizeFrontendValue({
         ...syncStatus,
         ...syncScopeStats,
@@ -1458,6 +1471,11 @@ function createServer() {
         active_posting_freshness_hours: syncSettings?.active_posting_freshness_hours,
         min_posting_freshness_hours: syncSettings?.min_posting_freshness_hours,
         max_posting_freshness_hours: syncSettings?.max_posting_freshness_hours,
+        last_write_at:
+          syncStatus.last_write_at ||
+          (durableLastWriteEpoch > 0 ? new Date(durableLastWriteEpoch * 1000).toISOString() : null),
+        last_write_age_seconds:
+          durableLastWriteEpoch > 0 ? Math.max(0, Math.floor(Date.now() / 1000) - durableLastWriteEpoch) : null,
         ...counts
       });
       return res.json(payload);
@@ -2231,13 +2249,35 @@ async function start() {
   await initDb();
 
   const app = createServer();
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`[OpenPostings API] listening on http://localhost:${PORT}`);
     console.log(`[OpenPostings API] using database ${DB_PATH}`);
     console.log(
       `[OpenPostings API] ATS request queue concurrency (runtime): ${getAtsRequestQueueConcurrency()} (saved changes apply after restart)`
     );
   });
+
+  // Shut down promptly and predictably. A restart leaves the app unable to reach the API
+  // for however long this takes, and the app surfaces that as a hard error rather than a
+  // known maintenance window -- so the window has to be short. The deadline is the point:
+  // a sync pass holds in-flight HTTP requests with 30s timeouts, and waiting politely for
+  // those turns a one-second restart into a minute of downtime.
+  const shutdown = (signal) => {
+    console.log(`[OpenPostings API] ${signal} received; shutting down`);
+    const deadline = setTimeout(() => {
+      console.log("[OpenPostings API] shutdown deadline reached; exiting now");
+      process.exit(0);
+    }, 2000);
+    // Never let the deadline itself hold the process open.
+    if (typeof deadline.unref === "function") deadline.unref();
+    try {
+      server.close(() => process.exit(0));
+    } catch {
+      process.exit(0);
+    }
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 
   // Watches for a pass that stops making progress and abandons it, so a wedged sync
   // does not leave the cached promise in place and stop syncing until a restart.

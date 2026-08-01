@@ -90,7 +90,7 @@ async function testQueryFilters() {
   await createCanonicalPostingsTable();
 
   // Through the real ingest path, so the parsed columns are what production writes.
-  await upsertPostingsBatch(
+  const initialWriteCounts = await upsertPostingsBatch(
     [
       { company_name: "doordash", position_name: "Manager, Local Markets Growth", job_posting_url: "https://x/dd", location: "Dallas, TX; Nashville, TN; Denver, CO, Seattle, WA; Phoenix, AZ" },
       { company_name: "ukco", position_name: "Ops Manager", job_posting_url: "https://x/uk", location: "Sittingbourne, Kent, Kent Science Park" },
@@ -104,6 +104,7 @@ async function testQueryFilters() {
     ],
     NOW
   );
+  assert.deepStrictEqual(initialWriteCounts, { inserted: 9, refreshed: 0 });
 
   // Acceptance: a Washington filter returns nothing from Kentucky, England or South
   // Africa -- and a Puget Sound city list cannot leak through substrings.
@@ -130,6 +131,19 @@ async function testQueryFilters() {
   );
   const remoteUs = await runQuery({ remote_only: "1", countries: "US" });
   assert.deepStrictEqual(remoteUs.rows.map((row) => row.job_posting_url), ["https://x/rem"]);
+
+  const followupWriteCounts = await upsertPostingsBatch(
+    [
+      { company_name: "doordash", position_name: "Manager, Local Markets Growth", job_posting_url: "https://x/dd", location: "Seattle, WA" },
+      { company_name: "newco", position_name: "Engineer", job_posting_url: "https://x/new", location: "Tacoma, WA" }
+    ],
+    NOW + 1
+  );
+  assert.deepStrictEqual(
+    followupWriteCounts,
+    { inserted: 1, refreshed: 1 },
+    "sync progress must distinguish a genuinely new row from an existing row refresh"
+  );
 }
 
 // City filters as the dropdowns emit them. "City|ST" exists because a bare city name is

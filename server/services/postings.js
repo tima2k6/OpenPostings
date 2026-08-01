@@ -64,7 +64,7 @@ function escapeLikeTerm(term) {
 // narrow silently loses postings. Only filters that can be proven superset-safe against a
 // stored column are included; ats, industry, location and remote all match on values
 // derived at read time (inferred from the URL, joined from companies) and are left to JS.
-function buildCandidatePrefilter({ searchTerms, payMinFilter, payMaxFilter, payPeriods, stateCodes, includeUnknownPay = true }) {
+function buildCandidatePrefilter({ searchTerms, payMinFilter, payMaxFilter, payPeriods, stateCodes, stateLocationFallbackUrls = [], includeUnknownPay = true }) {
   const clauses = [];
   const params = [];
 
@@ -112,31 +112,66 @@ function buildCandidatePrefilter({ searchTerms, payMinFilter, payMaxFilter, payP
     );
   }
 
-  // rowMatchesLocationFilters ANDs the state test: when any state is selected, every row it
-  // keeps must satisfy it. A state match needs either the bare code or the full state name
-  // present in the location text, so requiring one of those as a substring is a superset of
-  // what JS keeps -- weak as a filter ("%wa%" also matches Warsaw), but enough to stop a
-  // location-only query from materialising every visible posting.
+  // Prefer the indexed projection of parsed state columns/JSON. The old LIKE-only prefilter treated a two-letter
+  // state code as an arbitrary substring ("WA" matched Warsaw), which left hundreds of
+  // thousands of false candidates for JavaScript to materialise and discard. Multi-location
+  // postings need the projection because the flat column intentionally stores only the
+  // primary location.
   //
-  // Rows with an empty location column are always kept: their enriched value is inferred
-  // from the job URL, which this query cannot see. Getting that wrong would silently drop
-  // every Workday posting, since none of them store a location.
+  // Empty stored locations are covered by separator-bounded URL matches and by explicit
+  // runtime-map URLs below. Retaining every empty row was correct but expensive: it forced
+  // roughly 150k known non-matches through JavaScript for every state-filtered refresh.
   if (Array.isArray(stateCodes) && stateCodes.length > 0) {
-    const stateClauses = [];
+    const structuredStatePlaceholders = stateCodes.map(() => "?").join(", ");
+    const legacyStateClauses = [];
+    const urlStateClauses = [];
+    const legacyStateParams = [];
+    const urlStateParams = [];
+    const fallbackUrlParams = [];
     for (const code of stateCodes) {
       const stateName = STATE_CODE_TO_NAME[String(code || "").trim().toUpperCase()];
-      stateClauses.push(`LOWER(location) LIKE ? ESCAPE '\\'`);
-      params.push(`%${escapeLikeTerm(String(code || "").toLowerCase())}%`);
+      legacyStateClauses.push(`LOWER(location) LIKE ? ESCAPE '\\'`);
+      legacyStateParams.push(`%${escapeLikeTerm(String(code || "").toLowerCase())}%`);
       if (stateName) {
-        stateClauses.push(`LOWER(location) LIKE ? ESCAPE '\\'`);
-        params.push(`%${escapeLikeTerm(stateName)}%`);
+        legacyStateClauses.push(`LOWER(location) LIKE ? ESCAPE '\\'`);
+        legacyStateParams.push(`%${escapeLikeTerm(stateName)}%`);
+        urlStateClauses.push(`LOWER(job_posting_url) LIKE ? ESCAPE '\\'`);
+        urlStateParams.push(`%${escapeLikeTerm(stateName)}%`);
       }
+      // URL-derived locations are the reason empty stored locations previously had to be
+      // retained wholesale. Match only separator-bounded state slugs here: an arbitrary
+      // "%wa%" URL search also matches words such as "software" and recreates the scan.
+      urlStateClauses.push(`LOWER(job_posting_url) GLOB ?`);
+      urlStateParams.push(`*[-/_]${String(code || "").toLowerCase()}[-/_]*`);
     }
+
+    const fallbackUrlClauses = [];
+    for (let index = 0; index < stateLocationFallbackUrls.length; index += 400) {
+      const chunk = stateLocationFallbackUrls.slice(index, index + 400);
+      fallbackUrlClauses.push(`job_posting_url IN (${chunk.map(() => "?").join(", ")})`);
+      fallbackUrlParams.push(...chunk);
+    }
+    params.push(
+      ...stateCodes,
+      ...legacyStateParams,
+      ...urlStateParams,
+      ...fallbackUrlParams
+    );
     clauses.push(`
       AND (
-        location IS NULL
-        OR TRIM(location) = ''
-        OR ${stateClauses.join("\n        OR ")}
+        id IN (
+          SELECT posting_id
+          FROM posting_location_states
+          WHERE state_region IN (${structuredStatePlaceholders})
+        )
+        OR (
+          (locations_json IS NULL OR TRIM(locations_json) = '' OR locations_json = '[]')
+          AND location IS NOT NULL
+          AND TRIM(location) <> ''
+          AND (${legacyStateClauses.join("\n          OR ")})
+        )
+        OR ${urlStateClauses.join("\n        OR ")}
+        ${fallbackUrlClauses.length > 0 ? `OR ${fallbackUrlClauses.join("\n        OR ")}` : ""}
       )`);
   }
 
@@ -497,6 +532,17 @@ async function listPostingsWithFilters(options = {}) {
     !(remoteFilters.length === 1 && remoteFilters[0] === "all");
 
   const needsWideScan = Boolean(search) || hasStructuredFilters;
+  const postingLocationByJobUrl = getPostingLocationByJobUrl();
+  const stateLocationFallbackUrls = stateCodes.length > 0
+    ? Array.from(postingLocationByJobUrl.entries())
+        .filter(([, location]) => rowMatchesLocationFilters(location, stateCodes, [], [], []))
+        .map(([jobPostingUrl]) => String(jobPostingUrl || "").trim())
+        .filter(Boolean)
+        // Persisted rows are covered by state_region/locations_json. This fallback is for
+        // the at-most-one flush batch whose runtime location is ahead of SQLite; bounding it
+        // avoids exceeding SQLite's parameter limit on multi-state searches.
+        .slice(-1000)
+    : [];
 
   const runPostingsQuery = async () => {
   let rows = [];
@@ -565,6 +611,7 @@ async function listPostingsWithFilters(options = {}) {
       payMaxFilter,
       payPeriods,
       stateCodes,
+      stateLocationFallbackUrls,
       includeUnknownPay
     });
     rows = await db.all(
@@ -585,7 +632,6 @@ async function listPostingsWithFilters(options = {}) {
     );
   }
 
-  const postingLocationByJobUrl = getPostingLocationByJobUrl();
   const companyAtsByNormalizedName = new Map();
   const normalizedCompanyNames = Array.from(
     new Set(

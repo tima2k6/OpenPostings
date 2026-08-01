@@ -487,6 +487,17 @@ function formatTimeSafe(value, fallback = "Unknown time") {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
+function formatDurationCompact(secondsValue) {
+  const seconds = Number(secondsValue);
+  if (!Number.isFinite(seconds) || seconds < 0) return "unknown";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+}
+
 function formatApplicationDate(value) {
   const epochSeconds = Number(value);
   if (!Number.isFinite(epochSeconds) || epochSeconds <= 0) {
@@ -1404,7 +1415,9 @@ export default function App() {
   });
   const [postingFilterOptionsLoading, setPostingFilterOptionsLoading] = useState(false);
   const [postingsFilterPanelOpen, setPostingsFilterPanelOpen] = useState(false);
-  const [showPostingDescriptions, setShowPostingDescriptions] = useState(true);
+  // Listing descriptions are large and are not needed to scan titles/locations. Keep the
+  // initial request lightweight; users can still opt into them with the existing toggle.
+  const [showPostingDescriptions, setShowPostingDescriptions] = useState(false);
   const showPostingDescriptionsRef = useRef(showPostingDescriptions);
   const [postings, setPostings] = useState([]);
   const [applications, setApplications] = useState([]);
@@ -1473,6 +1486,7 @@ export default function App() {
   const postingsRefreshInFlightRef = useRef(false);
   const lastPostingRefreshAtRef = useRef(0);
   const wasSyncRunningRef = useRef(false);
+  const lastObservedNewPostingsRef = useRef(null);
   const postingsRequestSequenceRef = useRef(0);
   const applicationsRequestSequenceRef = useRef(0);
   const frontendLogQueueRef = useRef([]);
@@ -1699,19 +1713,28 @@ export default function App() {
       ? ` | Coverage: ${Number(coverage.synced_within_window || 0).toLocaleString()}/${Number(coverage.enabled_companies || 0).toLocaleString()} companies synced in the last ${Math.round(Number(coverage.window_seconds || 86400) / 3600)}h` +
         (Number(coverage.never_synced || 0) > 0 ? `, ${Number(coverage.never_synced).toLocaleString()} not yet reached` : "")
       : "";
-    const base = `Last sync: ${syncTime} | Sync-enabled companies: ${syncEnabledCompanies} | Stored today: ${status.posting_count || 0} | Failed companies: ${failedCompanies} | Excluded by ${freshnessHours}h window: ${excludedByDate} | Excluded ATS: ${excludedAtsCount}`;
+    const base = `Last completed sync: ${syncTime} | Visible jobs (last ${freshnessHours}h): ${Number(status.posting_count || 0).toLocaleString()} | Sync-enabled companies: ${syncEnabledCompanies.toLocaleString()} | Failed companies: ${failedCompanies} | Excluded by date: ${excludedByDate} | Excluded ATS: ${excludedAtsCount}`;
     if (status.running && status.progress) {
       const collectedCount = Number(status.progress.total_collected || 0);
-      const storedCount = Number(status.posting_count || 0);
       const syncingCompanyName = sanitizeDisplayText(status.progress.company_name, "");
-      const liveSyncHint =
-        collectedCount > 0 && storedCount === 0
-          ? " | Sync is collecting postings; visible results appear as batches are saved."
-          : "";
-      return `${base} | Syncing ${status.progress.current}/${status.progress.total}: ${syncingCompanyName} (collected ${collectedCount})${liveSyncHint}${coverageHint}`;
+      const progressPercent = Number(status.progress.percent || 0);
+      const targetsPerMinute = Number(status.progress.targets_per_minute || 0);
+      const etaSeconds = status.progress.eta_seconds;
+      const newPostings = Number(status.new_postings || 0);
+      const refreshedPostings = Number(status.refreshed_postings || 0);
+      const lastWriteAge = status.last_write_age_seconds;
+      return `${base} | Syncing ${Number(status.progress.current || 0).toLocaleString()}/${Number(status.progress.total || 0).toLocaleString()} (${progressPercent.toFixed(1)}%) | New: ${newPostings.toLocaleString()} | Refreshed: ${refreshedPostings.toLocaleString()} | Collected: ${collectedCount.toLocaleString()} | Rate: ${targetsPerMinute.toFixed(1)} targets/min | ETA: ${formatDurationCompact(etaSeconds)} | Last write: ${formatDurationCompact(lastWriteAge)} ago | Last completed target: ${syncingCompanyName}${coverageHint}`;
     }
     return `${base}${coverageHint}`;
   }, [status, syncServiceSettings.active_posting_freshness_hours, syncServiceSettings.posting_freshness_hours]);
+
+  const syncProgressFraction = useMemo(() => {
+    if (!status?.running || !status?.progress) return 0;
+    const current = Number(status.progress.current || 0);
+    const total = Number(status.progress.total || 0);
+    if (!(total > 0)) return 0;
+    return Math.max(0, Math.min(1, current / total));
+  }, [status]);
 
   const failedCompaniesByAtsList = useMemo(() => {
     const summary = status?.last_sync_summary || {};
@@ -2969,14 +2992,20 @@ export default function App() {
         const isRunning = Boolean(latest.running);
         const syncJustFinished = wasSyncRunningRef.current && !isRunning;
         wasSyncRunningRef.current = isRunning;
+        const newPostings = Number(latest.new_postings || 0);
+        const previousNewPostings = lastObservedNewPostingsRef.current;
+        const discoveredNewPostings =
+          previousNewPostings !== null && newPostings > Number(previousNewPostings || 0);
+        lastObservedNewPostingsRef.current = newPostings;
 
         if (effectiveActivePage !== PAGE_KEYS.POSTINGS) return;
         if (postingsRefreshInFlightRef.current) return;
 
         const now = Date.now();
-        const minRefreshMs = isRunning ? 15000 : 60000;
-        const dueForRefresh = now - lastPostingRefreshAtRef.current >= minRefreshMs;
-        if (!dueForRefresh && !syncJustFinished) return;
+        const sinceLastRefreshMs = now - lastPostingRefreshAtRef.current;
+        const newPostingRefreshDue = discoveredNewPostings && sinceLastRefreshMs >= 30000;
+        const periodicRefreshDue = sinceLastRefreshMs >= (isRunning ? 120000 : 60000);
+        if (!newPostingRefreshDue && !periodicRefreshDue && !syncJustFinished) return;
 
         postingsRefreshInFlightRef.current = true;
         try {
@@ -3065,7 +3094,7 @@ export default function App() {
             <Text style={styles.postingsFiltersToggleText}>Browse DB</Text>
           </Pressable>
           <View style={styles.postingDescriptionToggleRow}>
-            <Text style={styles.postingDescriptionToggleLabel}>Descriptions</Text>
+            <Text style={styles.postingDescriptionToggleLabel}>Load descriptions</Text>
             <Switch value={showPostingDescriptions} onValueChange={setShowPostingDescriptions} />
           </View>
         </View>
@@ -3245,6 +3274,11 @@ export default function App() {
       ) : null}
 
       <Text style={styles.status}>{statusText}</Text>
+      {status?.running && status?.progress ? (
+        <View style={styles.syncProgressTrack} accessibilityLabel={`Sync ${Math.round(syncProgressFraction * 100)} percent complete`}>
+          <View style={[styles.syncProgressFill, { width: `${Math.max(1, syncProgressFraction * 100)}%` }]} />
+        </View>
+      ) : null}
       {loading && !initializing ? <Text style={styles.small}>Refreshing results...</Text> : null}
       {applicationsNotice ? <Text style={styles.inlineNotice}>{applicationsNotice}</Text> : null}
 
@@ -4551,6 +4585,19 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     fontSize: 12,
     color: "#334e68"
+  },
+  syncProgressTrack: {
+    height: 8,
+    marginHorizontal: 16,
+    marginTop: 6,
+    borderRadius: 4,
+    overflow: "hidden",
+    backgroundColor: "#dbe2ea"
+  },
+  syncProgressFill: {
+    height: "100%",
+    borderRadius: 4,
+    backgroundColor: "#0b6e4f"
   },
   error: {
     marginHorizontal: 16,
