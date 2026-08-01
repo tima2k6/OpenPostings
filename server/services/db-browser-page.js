@@ -121,11 +121,17 @@ const DB_BROWSER_PAGE = `<!doctype html>
   .grid input, .grid select { width: 100%; }
   pre { overflow-x: auto; background: #eef2f6; padding: 10px; border-radius: 8px; font-size: 12px; }
   @media (prefers-color-scheme: dark) { pre { background: #1b242e; } }
-  button.saved, button.saved-x, #posting-clear, #posting-save, #posting-sql {
+  button.saved, button.saved-x, #posting-clear, #posting-save, #posting-share, #posting-export, #posting-sql {
     border: 1px solid #c6ceda; background: #fff; color: inherit; border-radius: 8px;
     padding: 7px 12px; cursor: pointer; font: inherit; font-size: 13px; }
-  @media (prefers-color-scheme: dark) { button.saved, button.saved-x, #posting-clear, #posting-save, #posting-sql { background: #18202a; border-color: #2d3947; } }
+  @media (prefers-color-scheme: dark) { button.saved, button.saved-x, #posting-clear, #posting-save, #posting-share, #posting-export, #posting-sql { background: #18202a; border-color: #2d3947; } }
+  button:disabled { cursor: wait; opacity: .65; }
+  .empty { padding: 28px 16px; text-align: center; }
+  .empty b { display: block; margin-bottom: 4px; }
   a { color: #1f6feb; }
+  button.linkbtn { border: 0; padding: 0; background: none; color: #1f6feb; cursor: pointer;
+                   font: inherit; text-align: left; }
+  button.linkbtn:hover { text-decoration: underline; }
   .examples button { background: none; border: none; color: #1f6feb; cursor: pointer; font: inherit;
                      padding: 0; text-decoration: underline; font-size: 12px; }
 </style>
@@ -220,8 +226,11 @@ const DB_BROWSER_PAGE = `<!doctype html>
     <div class="row">
       <button id="posting-clear">Clear</button>
       <button id="posting-save">Save this query</button>
+      <button id="posting-share">Copy link</button>
+      <button id="posting-export" disabled>Export CSV</button>
       <button id="posting-sql">Show SQL</button>
       <span id="posting-count" class="hint"></span>
+      <span id="posting-notice" class="hint" role="status" aria-live="polite"></span>
     </div>
     <div class="row" id="saved-row"></div>
     <pre id="posting-sqlout" hidden></pre>
@@ -284,7 +293,12 @@ ORDER BY n DESC</textarea>
 
   function esc(v) {
     return String(v === null || v === undefined ? "" : v)
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+  function externalUrl(v) {
+    var value = String(v || "").trim();
+    return /^https?:\\/\\//i.test(value) ? value : "";
   }
   function when(epoch) {
     var n = Number(epoch);
@@ -324,9 +338,17 @@ ORDER BY n DESC</textarea>
           var pill = r.total === 0
             ? '<span class="pill none">none stored</span>'
             : (r.visible === 0 ? '<span class="pill warn">all hidden</span>' : '<span class="pill ok">' + r.visible + " visible</span>");
-          return "<td>" + esc(r.company_name) + "</td><td>" + esc(r.ATS_name) + "</td><td>" + r.total +
-            "</td><td>" + pill + "</td><td>" + when(r.last_seen_epoch) + '</td><td class="wrap">' + esc(r.url_string) + "</td>";
+          var board = externalUrl(r.url_string)
+            ? '<a href="' + esc(r.url_string) + '" target="_blank" rel="noopener">open board</a>'
+            : esc(r.url_string);
+          return '<td><button class="linkbtn company-drill" data-company="' + esc(r.company_name) + '">' +
+            esc(r.company_name) + "</button></td><td>" + esc(r.ATS_name) + "</td><td>" + r.total +
+            "</td><td>" + pill + "</td><td>" + when(r.last_seen_epoch) +
+            '</td><td class="wrap">' + board + "</td>";
         }
+      });
+      Array.prototype.forEach.call(document.querySelectorAll("#company-out .company-drill"), function (b) {
+        b.addEventListener("click", function () { drillToCompany(b.getAttribute("data-company"), false); });
       });
     }).catch(function (e) { fail("company-out", e.message); });
   }
@@ -341,6 +363,8 @@ ORDER BY n DESC</textarea>
     "f-seen": "seen_days", "f-found": "found_days",
     "f-ats": "ats", "f-vis": "visibility", "f-sort": "sort", "f-dir": "dir", "f-limit": "limit"
   };
+  var DEFAULT_FILTERS = { visibility: "open", sort: "last_seen", dir: "desc", limit: "200" };
+
   // Checkboxes send "1" when ticked and nothing at all when not, because the query layer
   // treats an absent parameter as "no opinion" and an empty string as a value.
   var FLAGS = { "f-remote": "remote_only", "f-haspay": "has_pay" };
@@ -360,6 +384,7 @@ ORDER BY n DESC</textarea>
     return out;
   }
   function writeFilters(state) {
+    state = Object.assign({}, DEFAULT_FILTERS, state || {});
     Object.keys(FIELDS).forEach(function (id) {
       document.getElementById(id).value = state[FIELDS[id]] === undefined ? "" : state[FIELDS[id]];
     });
@@ -374,6 +399,14 @@ ORDER BY n DESC</textarea>
     if (pick) pick.value = states.indexOf(",") === -1 ? states.trim() : "";
   }
 
+  function drillToCompany(name, preserveFilters) {
+    var state = preserveFilters ? readFilters() : DEFAULT_FILTERS;
+    writeFilters(Object.assign({}, state, { company_any: name }));
+    show("postings");
+    ranPostings = true;
+    run();
+  }
+
   // Filters survive a reload. Without this every visit started blank, so narrowing to a
   // state meant re-picking it before every single search -- which is most of what made the
   // page tedious. The URL carries the same state so a query can be bookmarked or sent to
@@ -385,11 +418,13 @@ ORDER BY n DESC</textarea>
     try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) {}
     try {
       var qs = new URLSearchParams(state).toString();
-      history.replaceState(null, "", qs ? "?" + qs : location.pathname);
+      var next = qs ? "?" + qs : location.pathname;
+      var current = location.search || location.pathname;
+      if (current !== next) history.pushState(null, "", next);
     } catch (e) {}
   }
 
-  function restore() {
+  function restore(fromHistory) {
     // The URL wins: a link someone opened is a deliberate request for that exact query,
     // while localStorage is only what this browser happened to do last.
     var fromUrl = {};
@@ -398,10 +433,14 @@ ORDER BY n DESC</textarea>
       new URLSearchParams(location.search).forEach(function (v, k) { fromUrl[k] = v; hasUrl = true; });
     } catch (e) {}
     if (hasUrl) { writeFilters(fromUrl); return; }
+    // A bare /db reached with Back means the URL itself is the requested state. Do not
+    // immediately replace it with whatever localStorage remembers and push a new entry.
+    if (fromHistory) { writeFilters(DEFAULT_FILTERS); return; }
     try {
       var saved = JSON.parse(localStorage.getItem(STORE_KEY) || "null");
-      if (saved && typeof saved === "object") writeFilters(saved);
+      if (saved && typeof saved === "object") { writeFilters(saved); return; }
     } catch (e) {}
+    writeFilters(DEFAULT_FILTERS);
   }
   // Mirrors SORTABLE in server/services/db-query.js. Clicking the active field flips the
   // direction, which is the behaviour a column header would have had before the table was
@@ -469,15 +508,17 @@ ORDER BY n DESC</textarea>
   // two of them were full ISO timestamps. Each posting is one block that reflows, so the
   // same markup reads on a phone and on a desktop.
   function postingList(rows) {
-    if (!rows.length) return '<p class="hint">No rows.</p>';
+    if (!rows.length) return '<div class="empty"><b>No postings match these filters.</b>' +
+      '<span class="hint">Remove an applied filter or broaden the title and location terms.</span></div>';
     return '<ul class="plist">' + rows.map(function (r) {
       var pay = money(r);
       return '<li class="pitem">' +
-        '<a class="ptitle" href="' + esc(r.job_posting_url) + '" target="_blank" rel="noopener">' +
+        '<a class="ptitle" href="' + esc(externalUrl(r.job_posting_url) || "#") + '" target="_blank" rel="noopener">' +
           esc(r.position_name || "Untitled") + "</a>" +
         '<div class="pmeta">' +
           hiddenPill(r) +
-          '<span class="pco">' + esc(r.company_name) + "</span>" +
+          '<button class="linkbtn pco company-drill" data-company="' + esc(r.company_name) + '">' +
+            esc(r.company_name) + "</button>" +
           (r.location ? ' <span class="psep">\u00b7</span> ' + esc(r.location) : "") +
         "</div>" +
         '<div class="pside">' +
@@ -517,10 +558,42 @@ ORDER BY n DESC</textarea>
     return (lo && hi && lo !== hi) ? k(lo) + "-" + k(hi) : k(hi || lo);
   }
 
+  function csvCell(value) {
+    var text = String(value === null || value === undefined ? "" : value);
+    if (/^[=+@-]/.test(text)) text = "'" + text;
+    return '"' + text.replace(/"/g, '""') + '"';
+  }
+
+  function exportPostings() {
+    if (!lastPostingRows.length) return;
+    var columns = ["company_name", "position_name", "location", "posting_date", "pay_min",
+      "pay_max", "pay_currency", "hidden", "hidden_reason", "first_seen_epoch",
+      "last_seen_epoch", "job_posting_url"];
+    var csv = [columns.map(csvCell).join(",")].concat(lastPostingRows.map(function (row) {
+      return columns.map(function (key) { return csvCell(row[key]); }).join(",");
+    })).join("\\r\\n");
+    var url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    var link = document.createElement("a");
+    link.href = url;
+    link.download = "openpostings-" + new Date().toISOString().slice(0, 10) + ".csv";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  var postingRequest = 0;
+  var lastPostingRows = [];
   function loadPostings() {
+    var request = ++postingRequest;
     var params = new URLSearchParams(readFilters()).toString();
+    var go = document.getElementById("posting-go");
+    go.disabled = true;
+    go.textContent = "Searching…";
+    document.getElementById("posting-count").textContent = "";
     document.getElementById("posting-out").innerHTML = '<p class="hint">Running&hellip;</p>';
     get("/db/search?" + params).then(function (data) {
+      if (request !== postingRequest) return;
       // Break the hidden count down the same way the pills do, so the summary and the rows
       // tell the same story rather than one saying "hidden" and the other "still listed".
       var staleDated = 0, delisted = 0;
@@ -542,7 +615,19 @@ ORDER BY n DESC</textarea>
       document.getElementById("posting-sqlout").textContent = data.sql;
       renderSortBar();
       document.getElementById("posting-out").innerHTML = postingList(data.rows);
-    }).catch(function (e) { fail("posting-out", e.message); });
+      lastPostingRows = data.rows || [];
+      document.getElementById("posting-export").disabled = !lastPostingRows.length;
+      Array.prototype.forEach.call(document.querySelectorAll("#posting-out .company-drill"), function (b) {
+        b.addEventListener("click", function () { drillToCompany(b.getAttribute("data-company"), true); });
+      });
+    }).catch(function (e) {
+      if (request === postingRequest) fail("posting-out", e.message);
+    }).finally(function () {
+      if (request === postingRequest) {
+        go.disabled = false;
+        go.textContent = "Search";
+      }
+    });
   }
 
   // Clicking a facet must NARROW the set, which is why title words go to title_all (AND)
@@ -571,7 +656,8 @@ ORDER BY n DESC</textarea>
     states: "State", cities: "City", countries: "Country", regions: "Region",
     location_any: "Location", location_none: "Location not",
     ats: "ATS", pay_min: "Pay \u2265", pay_max: "Pay \u2264",
-    seen_days: "Seen \u2264 d", found_days: "Found \u2264 d", visibility: "Show"
+    seen_days: "Seen \u2264 d", found_days: "Found \u2264 d", visibility: "Show",
+    remote_only: "Remote", has_pay: "Pay", include_unknown_pay: "Pay"
   };
 
   // The dropdowns are add-a-filter controls and reset to "any" after each run, which read
@@ -592,7 +678,9 @@ ORDER BY n DESC</textarea>
       var raw = state[key];
       if (!raw || key === "visibility" && raw === "all") return;
       String(raw).split(",").map(function (t) { return t.trim(); }).filter(Boolean).forEach(function (term) {
-        var shown = key === "visibility" ? (VIS_LABEL[term] || term) : term;
+        var shown = key === "visibility" ? (VIS_LABEL[term] || term) :
+          (key === "remote_only" ? "only" : key === "has_pay" ? "known only" :
+          key === "include_unknown_pay" ? "hide unknown" : term);
         parts.push('<button class="afchip" data-key="' + key + '" data-term="' + esc(term) + '">' +
           FILTER_LABEL[key] + ": <b>" + esc(shown) + "</b> &times;</button>");
       });
@@ -605,16 +693,22 @@ ORDER BY n DESC</textarea>
       b.addEventListener("click", function () {
         var key = b.getAttribute("data-key"), term = b.getAttribute("data-term");
         var id = Object.keys(FIELDS).filter(function (k) { return FIELDS[k] === key; })[0];
-        var el = document.getElementById(id);
-        var kept = el.value.split(",").map(function (t) { return t.trim(); })
-          .filter(function (t) { return t && t !== term; });
-        el.value = kept.join(", ");
+        if (id) {
+          var el = document.getElementById(id);
+          var kept = el.value.split(",").map(function (t) { return t.trim(); })
+            .filter(function (t) { return t && t !== term; });
+          el.value = key === "visibility" && !kept.length ? "all" : kept.join(", ");
+        } else {
+          var flagId = Object.keys(FLAGS).filter(function (k) { return FLAGS[k] === key; })[0];
+          if (flagId) document.getElementById(flagId).checked = false;
+          if (key === "include_unknown_pay") document.getElementById("f-nopay").checked = false;
+        }
         run();
       });
     });
     var clear = bar.querySelector("button.afclear");
     if (clear) clear.addEventListener("click", function () {
-      writeFilters({}); document.getElementById("f-limit").value = "200"; run();
+      writeFilters(DEFAULT_FILTERS); run();
     });
   }
 
@@ -629,9 +723,12 @@ ORDER BY n DESC</textarea>
     });
   }
 
+  var facetRequest = 0;
   function loadFacets() {
+    var request = ++facetRequest;
     var params = new URLSearchParams(readFilters()).toString();
     get("/db/facets?" + params).then(function (data) {
+      if (request !== facetRequest) return;
       var out = document.getElementById("facet-out");
 
       // State is always offered, from the fixed list of 51 rather than from counts: it is
@@ -673,15 +770,19 @@ ORDER BY n DESC</textarea>
       }).join("") + "</div>";
       out.innerHTML = summary + groups;
       wireFacetSelects(out);
-    }).catch(function (e) { document.getElementById("facet-out").innerHTML = '<p class="err">' + esc(e.message) + "</p>"; });
+    }).catch(function (e) {
+      if (request === facetRequest) {
+        document.getElementById("facet-out").innerHTML = '<p class="err">' + esc(e.message) + "</p>";
+      }
+    });
   }
 
   // Facets describe the matching set, which sorting cannot change -- verified identical
   // across sort orders. Re-fetching them on a sort click cost a multi-second recompute for
   // a guaranteed-identical answer, and re-rendering the dropdowns made it look as though
   // the selection had been wiped.
-  function run(resultsOnly) {
-    persist();
+  function run(resultsOnly, fromHistory) {
+    if (!fromHistory) persist();
     loadPostings();
     renderActiveFilters();
     if (!resultsOnly) loadFacets();
@@ -739,7 +840,7 @@ ORDER BY n DESC</textarea>
   document.getElementById("company-q").addEventListener("keydown", function (e) { if (e.key === "Enter") loadCompanies(); });
   document.getElementById("posting-go").addEventListener("click", run);
   document.getElementById("posting-clear").addEventListener("click", function () {
-    writeFilters({}); document.getElementById("f-limit").value = "200"; run();
+    writeFilters(DEFAULT_FILTERS); run();
   });
   document.getElementById("posting-save").addEventListener("click", function () {
     var name = prompt("Name this query:");
@@ -757,6 +858,20 @@ ORDER BY n DESC</textarea>
     var el = document.getElementById("posting-sqlout");
     el.hidden = !el.hidden;
   });
+  document.getElementById("posting-share").addEventListener("click", function () {
+    persist();
+    var notice = document.getElementById("posting-notice");
+    var url = location.href;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(function () {
+        notice.textContent = "Link copied";
+        setTimeout(function () { notice.textContent = ""; }, 2000);
+      }).catch(function () { prompt("Copy this query link:", url); });
+    } else {
+      prompt("Copy this query link:", url);
+    }
+  });
+  document.getElementById("posting-export").addEventListener("click", exportPostings);
   Object.keys(FIELDS).forEach(function (id) {
     document.getElementById(id).addEventListener("keydown", function (e) { if (e.key === "Enter") run(); });
   });
@@ -791,7 +906,7 @@ ORDER BY n DESC</textarea>
 
   // Back/forward should replay searches rather than leaving the form and the results
   // describing different queries.
-  window.addEventListener("popstate", function () { restore(); run(); });
+  window.addEventListener("popstate", function () { restore(true); run(false, true); });
 
   restore();
   populateStatePicker();

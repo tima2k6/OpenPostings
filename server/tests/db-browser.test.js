@@ -161,6 +161,16 @@ function testPostingsIsTheDefaultTab() {
   );
 }
 
+function testUsabilityControlsStayWired() {
+  assert.match(DB_BROWSER_PAGE, /var DEFAULT_FILTERS = \{ visibility: "open", sort: "last_seen", dir: "desc", limit: "200" \}/);
+  assert.match(DB_BROWSER_PAGE, /id="posting-share"/, "a filtered search should be easy to share");
+  assert.match(DB_BROWSER_PAGE, /history\.pushState/, "searches should create usable back-button history");
+  assert.match(DB_BROWSER_PAGE, /request !== postingRequest/, "an older response must not replace newer results");
+  assert.match(DB_BROWSER_PAGE, /id="posting-export"/, "current results should be exportable");
+  assert.match(DB_BROWSER_PAGE, /class="linkbtn company-drill"/, "company results should support drill-down");
+  assert.match(DB_BROWSER_PAGE, /replace\(\/"\/g, "&quot;"\)/, "database values used in attributes must escape quotes");
+}
+
 function main() {
   testWritesAreRefused();
   testSelectsAreAllowed();
@@ -172,6 +182,7 @@ function main() {
   testHiddenPillDistinguishesReasons();
   testEveryScriptReferenceResolves();
   testPostingsIsTheDefaultTab();
+  testUsabilityControlsStayWired();
   console.log("db-browser tests passed");
 }
 
