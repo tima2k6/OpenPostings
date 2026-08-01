@@ -134,12 +134,97 @@ const DB_BROWSER_PAGE = `<!doctype html>
   button.linkbtn:hover { text-decoration: underline; }
   .examples button { background: none; border: none; color: #1f6feb; cursor: pointer; font: inherit;
                      padding: 0; text-decoration: underline; font-size: 12px; }
+  .schema { margin-bottom: 12px; border: 1px solid #d3dae2; border-radius: 10px; padding: 8px 10px; }
+  @media (prefers-color-scheme: dark) { .schema { border-color: #26313d; } }
+  .schema summary { cursor: pointer; font-weight: 600; }
+  .schema-tools { margin: 9px 0; }
+  .schema-tools input { width: min(100%, 360px); }
+  .schema-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; }
+  .schema-table { border: 1px solid #e1e7ee; border-radius: 8px; padding: 8px; min-width: 0; }
+  @media (prefers-color-scheme: dark) { .schema-table { border-color: #26313d; } }
+  .schema-cols { color: #66798c; font: 11px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+                 overflow-wrap: anywhere; }
+  /* A warmer shell around the utilitarian controls: the data stays dense, but the page
+     should feel like a place to explore rather than a maintenance console. */
+  :root { --ink: #24302c; --muted-ink: #6d7b75; --accent: #176b5b; --accent-soft: #e7f3ef;
+          --paper: #fffdf9; --canvas: #f4f1e9; --line: #ddd8cc; --warm: #d48745; }
+  body { background:
+    radial-gradient(circle at 8% 0%, rgba(212,135,69,.12), transparent 28rem),
+    var(--canvas); color: var(--ink); }
+  .hero { background: linear-gradient(120deg, #183e38 0%, #176b5b 62%, #307c6c 100%);
+          color: #fff; padding: 30px max(22px, calc((100vw - 1180px) / 2)); border: 0;
+          display: block; }
+  .hero-inner { display: flex; justify-content: space-between; gap: 24px; align-items: end; }
+  .eyebrow { margin: 0 0 5px; color: #b9ded5; font-size: 11px; font-weight: 750;
+             letter-spacing: .12em; text-transform: uppercase; }
+  .hero h1 { font-family: Georgia, "Times New Roman", serif; font-size: clamp(26px, 4vw, 38px);
+             font-weight: 500; line-height: 1.12; letter-spacing: -.02em; }
+  .hero-copy { margin: 7px 0 0; max-width: 620px; color: #d8eee8; font-size: 14px; }
+  .read-only { flex: 0 0 auto; color: #e7f5f1; border: 1px solid rgba(255,255,255,.3);
+               border-radius: 999px; padding: 5px 10px; font-size: 11px; }
+  nav { max-width: 1180px; margin: 0 auto; padding: 16px 18px 0; }
+  nav button { background: transparent; border-color: transparent; font-weight: 650; padding: 7px 14px; }
+  nav button[aria-selected="true"] { background: var(--paper); color: var(--accent);
+    border-color: var(--line); box-shadow: 0 4px 14px rgba(37,48,44,.07); }
+  main { max-width: 1180px; margin: 0 auto; padding: 18px 18px 54px; }
+  footer { max-width: 1180px; margin: 0 auto; }
+  .panel-intro { margin-bottom: 14px; }
+  .panel-intro h2 { margin: 0 0 3px; font: 500 21px/1.25 Georgia, "Times New Roman", serif; }
+  .panel-intro p { margin: 0; color: var(--muted-ink); font-size: 13px; }
+  .search-card { padding: 16px; margin-bottom: 14px; background: rgba(255,253,249,.86);
+                 border: 1px solid var(--line); border-radius: 14px;
+                 box-shadow: 0 8px 25px rgba(47,55,48,.06); }
+  input[type=search], textarea, select, .quickbar input, .quickbar select {
+    background: var(--paper); border-color: #cfc9bc; }
+  input:focus, textarea:focus, select:focus { outline: 3px solid rgba(23,107,91,.16);
+                                             border-color: var(--accent); }
+  button.go { background: var(--accent); border-color: var(--accent); font-weight: 650;
+              box-shadow: 0 3px 9px rgba(23,107,91,.18); }
+  button.go:hover { background: #115a4c; }
+  .starter-row { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; margin-bottom: 13px; }
+  .starter-label { color: var(--muted-ink); font-size: 12px; font-weight: 650; }
+  button.starter { border: 1px solid #d7cbbd; background: #fff8ef; color: #70451f;
+                   border-radius: 999px; padding: 5px 10px; cursor: pointer; font: inherit;
+                   font-size: 12px; }
+  button.starter:hover { border-color: var(--warm); background: #fff2e2; }
+  .filter-help { margin: 0 0 13px; color: var(--muted-ink); }
+  .filter-help summary { cursor: pointer; font-size: 12px; }
+  .filter-help .hint { max-width: 950px; line-height: 1.65; }
+  .plist, .scroller { border-color: var(--line); border-radius: 14px; box-shadow: 0 7px 22px rgba(47,55,48,.05); }
+  .pitem { padding: 13px 15px; }
+  .pitem:hover { background: #fbf7ef; }
+  a, button.linkbtn, .examples button { color: var(--accent); }
+  button.sortbtn.on, nav button[aria-selected="true"] { border-color: var(--accent); }
+  button.sortbtn.on { background: var(--accent); }
+  button.afchip { border-color: #80aa9f; background: var(--accent-soft); color: #155c4f; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink: #e5e9e4; --muted-ink: #a7b3ad; --accent: #71c7b3; --accent-soft: #173d35;
+            --paper: #17201d; --canvas: #101613; --line: #33413c; --warm: #e0a268; }
+    body { background: radial-gradient(circle at 8% 0%, rgba(212,135,69,.09), transparent 28rem), var(--canvas); }
+    .hero { background: linear-gradient(120deg, #142f2b, #164d43); }
+    nav button[aria-selected="true"], .search-card { background: var(--paper); }
+    input[type=search], textarea, select, .quickbar input, .quickbar select { background: #121a17; border-color: #3b4a44; }
+    button.starter { background: #2d241b; border-color: #5c4937; color: #f0bf8e; }
+    .pitem:hover { background: #1b2723; }
+  }
+  @media (max-width: 640px) {
+    .hero { padding-top: 23px; padding-bottom: 23px; }
+    .hero-inner { align-items: start; flex-direction: column; gap: 12px; }
+    .pitem { grid-template-columns: 1fr; grid-template-areas: "title" "meta" "side"; }
+    .pside { align-items: flex-start; margin-top: 5px; }
+  }
 </style>
 </head>
 <body>
-<header>
-  <h1>OpenPostings DB</h1>
-  <span class="muted" id="dbmeta">read-only</span>
+<header class="hero">
+  <div class="hero-inner">
+    <div>
+      <p class="eyebrow">OpenPostings</p>
+      <h1>Find the signal in your job data.</h1>
+      <p class="hero-copy">Explore what is open, what changed, and which employers are worth a closer look.</p>
+    </div>
+    <span class="read-only" id="dbmeta">Read-only workspace</span>
+  </div>
 </header>
 <nav>
   <button id="tab-postings" aria-selected="true">Postings</button>
@@ -148,6 +233,7 @@ const DB_BROWSER_PAGE = `<!doctype html>
 </nav>
 <main>
   <section id="panel-companies" hidden>
+    <div class="panel-intro"><h2>Employer coverage</h2><p>See who is tracked, even when their current board is quiet.</p></div>
     <div class="row">
       <input type="search" id="company-q" placeholder="Company name or URL, e.g. booking">
       <button class="go" id="company-go">Search</button>
@@ -157,10 +243,18 @@ const DB_BROWSER_PAGE = `<!doctype html>
   </section>
 
   <section id="panel-postings">
+    <div class="panel-intro"><h2>Explore postings</h2><p>Start broad, then follow the details that look promising.</p></div>
     <!-- The controls that get touched on almost every search, kept out of the collapsed
          panel. State in particular was previously only reachable through a facet dropdown
          that reset after each run, so narrowing to one state meant re-picking it every
          time. -->
+    <div class="starter-row">
+      <span class="starter-label">A few good starting points</span>
+      <button class="starter" data-preset="fresh-remote">Fresh + remote</button>
+      <button class="starter" data-preset="new-week">New this week</button>
+      <button class="starter" data-preset="pay">Pay disclosed</button>
+    </div>
+    <div class="search-card">
     <div class="quickbar">
       <label class="qb-state">State
         <select id="f-states-pick"><option value="">— any —</option></select>
@@ -222,7 +316,11 @@ const DB_BROWSER_PAGE = `<!doctype html>
       <label>Max rows<input id="f-limit" type="number" value="200"></label>
     </div>
     </details>
-    <p class="hint">Terms are comma-separated. Within a box they are OR-ed; each box is AND-ed with the others &mdash; so <em>any</em>=manager,director with <em>none</em>=assistant gives (manager OR director) AND NOT assistant. <b>Still applyable</b> covers postings the app shows plus ones it hides only for being past the date window; those are still on the employer&rsquo;s board. <b>State</b>, <b>Country</b>, <b>Region</b> and <b>City</b> match parsed locations, not raw text &mdash; "WA" will not match Warwick, and "Kent, WA" will not match Kent in England or Kentucky. <b>Description</b> boxes scan the stored job text, which only postings that have been fetched will have, and are much slower than the title filters.</p>
+    </div>
+    <details class="filter-help">
+      <summary>How the filters work</summary>
+      <p class="hint">Terms are comma-separated. Within a box they are OR-ed; each box is AND-ed with the others &mdash; so <em>any</em>=manager,director with <em>none</em>=assistant gives (manager OR director) AND NOT assistant. <b>Still applyable</b> covers postings the app shows plus ones it hides only for being past the date window; those are still on the employer&rsquo;s board. <b>State</b>, <b>Country</b>, <b>Region</b> and <b>City</b> match parsed locations, not raw text. <b>Description</b> boxes scan stored job text and are slower than title filters.</p>
+    </details>
     <div class="row">
       <button id="posting-clear">Clear</button>
       <button id="posting-save">Save this query</button>
@@ -241,6 +339,12 @@ const DB_BROWSER_PAGE = `<!doctype html>
   </section>
 
   <section id="panel-sql" hidden>
+    <div class="panel-intro"><h2>Ask the database directly</h2><p>For the questions the guided search cannot quite express.</p></div>
+    <details class="schema" open>
+      <summary>Schema reference</summary>
+      <div class="schema-tools"><input type="search" id="schema-q" placeholder="Filter tables or columns"></div>
+      <div id="schema-out"><span class="hint">Open the SQL tab to load the schema.</span></div>
+    </details>
     <textarea id="sql" spellcheck="false">SELECT company_name, COUNT(*) AS n
 FROM Postings
 WHERE hidden = 0 AND location LIKE '%Seattle%'
@@ -282,12 +386,14 @@ ORDER BY n DESC</textarea>
   // as a missing feature.
   var ranPostings = false;
   var loadedCompanies = false;
+  var loadedSchema = false;
   TABS.forEach(function (t) {
     document.getElementById("tab-" + t).addEventListener("click", function () {
       show(t);
       if (t === "postings" && !ranPostings) { ranPostings = true; run(); }
       // Companies is no longer loaded on boot; fetch it the first time it is opened.
       if (t === "companies" && !loadedCompanies) { loadedCompanies = true; loadCompanies(); }
+      if (t === "sql" && !loadedSchema) { loadedSchema = true; loadSchema(); }
     });
   });
 
@@ -326,6 +432,43 @@ ORDER BY n DESC</textarea>
         return body;
       });
     });
+  }
+
+  var schemaCache = [];
+  function renderSchema() {
+    var term = document.getElementById("schema-q").value.trim().toLowerCase();
+    var tables = schemaCache.filter(function (table) {
+      if (!term) return true;
+      return table.name.toLowerCase().indexOf(term) !== -1 ||
+        table.columns.some(function (column) { return column.name.toLowerCase().indexOf(term) !== -1; });
+    });
+    var out = document.getElementById("schema-out");
+    if (!tables.length) {
+      out.innerHTML = '<p class="hint">No readable tables or columns match.</p>';
+      return;
+    }
+    out.innerHTML = '<div class="schema-list">' + tables.map(function (table) {
+      return '<div class="schema-table"><button class="linkbtn schema-pick" data-table="' +
+        esc(table.name) + '"><b>' + esc(table.name) + '</b></button><div class="schema-cols">' +
+        table.columns.map(function (column) {
+          return esc(column.name) + (column.type ? " <span>" + esc(column.type) + "</span>" : "") +
+            (column.primary_key ? " · PK" : "");
+        }).join("<br>") + "</div></div>";
+    }).join("") + "</div>";
+    Array.prototype.forEach.call(out.querySelectorAll(".schema-pick"), function (button) {
+      button.addEventListener("click", function () {
+        var name = button.getAttribute("data-table").replace(/"/g, '""');
+        document.getElementById("sql").value = 'SELECT * FROM "' + name + '" LIMIT 100';
+        document.getElementById("sql").focus();
+      });
+    });
+  }
+  function loadSchema() {
+    document.getElementById("schema-out").innerHTML = '<p class="hint">Loading schema&hellip;</p>';
+    get("/db/schema").then(function (data) {
+      schemaCache = data.tables || [];
+      renderSchema();
+    }).catch(function (e) { fail("schema-out", e.message); });
   }
 
   function loadCompanies() {
@@ -839,6 +982,24 @@ ORDER BY n DESC</textarea>
   document.getElementById("company-go").addEventListener("click", loadCompanies);
   document.getElementById("company-q").addEventListener("keydown", function (e) { if (e.key === "Enter") loadCompanies(); });
   document.getElementById("posting-go").addEventListener("click", run);
+  Array.prototype.forEach.call(document.querySelectorAll("button.starter"), function (button) {
+    button.addEventListener("click", function () {
+      var preset = button.getAttribute("data-preset");
+      var state = Object.assign({}, DEFAULT_FILTERS);
+      if (preset === "fresh-remote") {
+        state.remote_only = "1";
+        state.seen_days = "7";
+      } else if (preset === "new-week") {
+        state.found_days = "7";
+        state.sort = "first_seen";
+      } else if (preset === "pay") {
+        state.has_pay = "1";
+        state.sort = "pay";
+      }
+      writeFilters(state);
+      run();
+    });
+  });
   document.getElementById("posting-clear").addEventListener("click", function () {
     writeFilters(DEFAULT_FILTERS); run();
   });
@@ -876,6 +1037,7 @@ ORDER BY n DESC</textarea>
     document.getElementById(id).addEventListener("keydown", function (e) { if (e.key === "Enter") run(); });
   });
   document.getElementById("sql-go").addEventListener("click", runSql);
+  document.getElementById("schema-q").addEventListener("input", renderSchema);
   Array.prototype.forEach.call(document.querySelectorAll(".examples button"), function (b) {
     b.addEventListener("click", function () { document.getElementById("sql").value = b.getAttribute("data-sql"); runSql(); });
   });
@@ -920,6 +1082,7 @@ ORDER BY n DESC</textarea>
   show(startTab);
   if (startTab === "postings") { ranPostings = true; run(); }
   else if (startTab === "companies") { loadedCompanies = true; loadCompanies(); }
+  else if (startTab === "sql") { loadedSchema = true; loadSchema(); }
 })();
 </script>
 </body>

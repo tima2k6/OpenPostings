@@ -26,6 +26,11 @@ const QUERY_TIMEOUT_MS = 15000;
 // rest; it belongs on this list for the same reason PersonalInformation does.
 const DENIED_TABLES = ["mcpsettings", "personalinformation", "applicant_documents", "application_answers"];
 
+function isReadableTableName(name) {
+  const normalized = String(name || "").toLowerCase();
+  return Boolean(normalized) && !normalized.startsWith("sqlite_") && !DENIED_TABLES.includes(normalized);
+}
+
 let readOnlyDb = null;
 
 async function getReadOnlyDb() {
@@ -79,6 +84,34 @@ async function runReadOnlyQuery(sql) {
 
   const truncated = rows.length > MAX_ROWS;
   return { rows: truncated ? rows.slice(0, MAX_ROWS) : rows, truncated };
+}
+
+// A discoverable schema makes the SQL console usable without exposing the names or
+// columns of protected tables. Table names originate from sqlite_master, then are quoted
+// before being passed to SQLite's table_info pragma.
+async function listReadableSchema() {
+  const db = await getReadOnlyDb();
+  const tables = await db.all(
+    `SELECT name
+     FROM sqlite_master
+     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+     ORDER BY LOWER(name)`
+  );
+  const visible = tables.filter((row) => isReadableTableName(row.name));
+  return Promise.all(
+    visible.map(async (row) => {
+      const quoted = String(row.name).replace(/"/g, '""');
+      const columns = await db.all(`PRAGMA table_info("${quoted}")`);
+      return {
+        name: row.name,
+        columns: columns.map((column) => ({
+          name: column.name,
+          type: column.type || "",
+          primary_key: Boolean(column.pk)
+        }))
+      };
+    })
+  );
 }
 
 // Companies matter most when they have NO visible postings, which is exactly the case the
@@ -150,4 +183,13 @@ async function findPostings({ search, hiddenState }) {
   );
 }
 
-module.exports = { findCompanies, findPostings, runReadOnlyQuery, rejectUnsafeQuery, getReadOnlyDb, MAX_ROWS };
+module.exports = {
+  findCompanies,
+  findPostings,
+  runReadOnlyQuery,
+  listReadableSchema,
+  isReadableTableName,
+  rejectUnsafeQuery,
+  getReadOnlyDb,
+  MAX_ROWS
+};

@@ -5,7 +5,7 @@
 // pulling the whole table through a single-threaded API.
 const assert = require("assert");
 
-const { rejectUnsafeQuery } = require("../services/db-browser.js");
+const { rejectUnsafeQuery, isReadableTableName } = require("../services/db-browser.js");
 const { DB_BROWSER_PAGE } = require("../services/db-browser-page.js");
 
 function testWritesAreRefused() {
@@ -77,6 +77,14 @@ function testEmptyIsRefused() {
   assert.ok(rejectUnsafeQuery(""));
   assert.ok(rejectUnsafeQuery("   "));
   assert.ok(rejectUnsafeQuery(null));
+}
+
+function testSchemaHidesProtectedTables() {
+  assert.strictEqual(isReadableTableName("Postings"), true);
+  assert.strictEqual(isReadableTableName("companies"), true);
+  for (const name of ["McpSettings", "PersonalInformation", "applicant_documents", "application_answers", "sqlite_sequence"]) {
+    assert.strictEqual(isReadableTableName(name), false, `schema must hide ${name}`);
+  }
 }
 
 // The whole browser page is emitted from a template literal that contains the page's own
@@ -169,6 +177,10 @@ function testUsabilityControlsStayWired() {
   assert.match(DB_BROWSER_PAGE, /id="posting-export"/, "current results should be exportable");
   assert.match(DB_BROWSER_PAGE, /class="linkbtn company-drill"/, "company results should support drill-down");
   assert.match(DB_BROWSER_PAGE, /replace\(\/"\/g, "&quot;"\)/, "database values used in attributes must escape quotes");
+  assert.match(DB_BROWSER_PAGE, /id="schema-out"/, "SQL users should have an in-page schema reference");
+  assert.match(DB_BROWSER_PAGE, /get\("\/db\/schema"\)/, "the schema reference must load from the safe API");
+  assert.match(DB_BROWSER_PAGE, /data-preset="fresh-remote"/, "the page should offer approachable starting points");
+  assert.match(DB_BROWSER_PAGE, /Find the signal in your job data/, "the page should explain its purpose in human terms");
 }
 
 function main() {
@@ -178,6 +190,7 @@ function main() {
   testStatementStackingIsRefused();
   testFileReachingIsRefused();
   testEmptyIsRefused();
+  testSchemaHidesProtectedTables();
   testEmittedPageScriptParses();
   testHiddenPillDistinguishesReasons();
   testEveryScriptReferenceResolves();

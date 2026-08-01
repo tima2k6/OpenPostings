@@ -107,7 +107,7 @@ const path = require("path");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const { openDatabase, getSqliteReadOnlyMode } = require("./db/open-database.js");
-const { findCompanies, findPostings, runReadOnlyQuery, rejectUnsafeQuery, MAX_ROWS } = require("./services/db-browser.js");
+const { findCompanies, findPostings, runReadOnlyQuery, listReadableSchema, rejectUnsafeQuery, MAX_ROWS } = require("./services/db-browser.js");
 const { DB_BROWSER_PAGE } = require("./services/db-browser-page.js");
 const { runQuery: runPostingQuery } = require("./services/db-query.js");
 const { computeFacets } = require("./services/db-facets.js");
@@ -1343,6 +1343,14 @@ function createServer() {
       res.json(await runReadOnlyQuery(sql));
     } catch (error) {
       res.status(400).json({ error: String(error?.message || error) });
+    }
+  });
+
+  app.get("/db/schema", async (_req, res) => {
+    try {
+      res.json({ tables: await listReadableSchema() });
+    } catch (error) {
+      res.status(500).json({ error: String(error?.message || error) });
     }
   });
 
