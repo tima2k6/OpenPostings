@@ -2248,37 +2248,53 @@ function createServer() {
   });
 
   app.get("/postings", async (req, res) => {
-    const result = await listPostingsWithFilters({
-      search: String(req.query.search || "").trim(),
-      limit: Number(req.query.limit || 500),
-      offset: Number(req.query.offset || 0),
-      sort_by: String(req.query.sort_by || "").trim(),
-      ats: parseCsvParam(req.query.ats),
-      industries: parseCsvParam(req.query.industries),
-      compensation_types: parseCsvParam(req.query.compensation_types),
-      pay_periods: parseCsvParam(req.query.pay_periods),
-      pay_min: req.query.pay_min,
-      pay_max: req.query.pay_max,
-      education_levels: parseCsvParam(req.query.education_levels),
-      states: parseCsvParam(req.query.states),
-      counties: parseCsvParam(req.query.counties),
-      cities: parseCsvParam(req.query.cities),
-      countries: parseCsvParam(req.query.countries),
-      regions: parseCsvParam(req.query.regions),
-      remote: req.query.remote,
-      hide_no_date: normalizeBoolean(req.query.hide_no_date, false),
-      include_applied: normalizeBoolean(req.query.include_applied, true),
-      include_ignored: normalizeBoolean(req.query.include_ignored, false),
-      include_descriptions: normalizeBoolean(req.query.include_descriptions, true),
-      review_queue: String(req.query.review_queue || "").trim()
-    });
+    const abortController = new AbortController();
+    const abortDisconnectedRequest = () => {
+      if (!res.writableEnded) abortController.abort();
+    };
+    req.once("aborted", abortDisconnectedRequest);
+    res.once("close", abortDisconnectedRequest);
+    try {
+      const result = await listPostingsWithFilters({
+        search: String(req.query.search || "").trim(),
+        limit: Number(req.query.limit || 500),
+        offset: Number(req.query.offset || 0),
+        sort_by: String(req.query.sort_by || "").trim(),
+        ats: parseCsvParam(req.query.ats),
+        industries: parseCsvParam(req.query.industries),
+        compensation_types: parseCsvParam(req.query.compensation_types),
+        pay_periods: parseCsvParam(req.query.pay_periods),
+        pay_min: req.query.pay_min,
+        pay_max: req.query.pay_max,
+        education_levels: parseCsvParam(req.query.education_levels),
+        states: parseCsvParam(req.query.states),
+        counties: parseCsvParam(req.query.counties),
+        cities: parseCsvParam(req.query.cities),
+        countries: parseCsvParam(req.query.countries),
+        regions: parseCsvParam(req.query.regions),
+        remote: req.query.remote,
+        hide_no_date: normalizeBoolean(req.query.hide_no_date, false),
+        include_applied: normalizeBoolean(req.query.include_applied, true),
+        include_ignored: normalizeBoolean(req.query.include_ignored, false),
+        include_descriptions: normalizeBoolean(req.query.include_descriptions, true),
+        review_queue: String(req.query.review_queue || "").trim(),
+        signal: abortController.signal
+      });
 
-    res.json({
-      items: sanitizeFrontendValue(result.items),
-      count: result.count,
-      limit: result.limit,
-      offset: result.offset
-    });
+      if (abortController.signal.aborted || res.writableEnded) return;
+      res.json({
+        items: sanitizeFrontendValue(result.items),
+        count: result.count,
+        limit: result.limit,
+        offset: result.offset
+      });
+    } catch (error) {
+      if (error?.name === "AbortError" || abortController.signal.aborted) return;
+      throw error;
+    } finally {
+      req.off("aborted", abortDisconnectedRequest);
+      res.off("close", abortDisconnectedRequest);
+    }
   });
 
   return app;

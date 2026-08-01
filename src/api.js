@@ -4,6 +4,17 @@ const DEFAULT_API_BASE_URL =
   Platform.OS === "android" ? "http://127.0.0.1:8787" : "http://localhost:8787";
 
 const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
+const WEB_RUNTIME_API_BASE_URL = (() => {
+  if (Platform.OS !== "web") return "";
+  if (typeof window === "undefined" || !window.location) return "";
+  const protocol = window.location.protocol || "http:";
+  const hostname = String(window.location.hostname || "").trim();
+  if (!hostname) return "";
+  return `${protocol}//${hostname}:8787`;
+})();
+const API_BASE_URL_CANDIDATES = Array.from(
+  new Set([API_BASE_URL, WEB_RUNTIME_API_BASE_URL].filter((value) => String(value || "").trim()))
+);
 const IS_ANDROID_LOCAL_BACKEND =
   Platform.OS === "android" &&
   (API_BASE_URL.startsWith("http://127.0.0.1:") || API_BASE_URL.startsWith("http://localhost:"));
@@ -23,6 +34,22 @@ function isTransientAndroidLocalBackendError(errorValue) {
     message.includes("connection refused") ||
     message.includes("timed out")
   );
+}
+
+function isHostFallbackError(errorValue) {
+  const message = String(errorValue?.message || errorValue || "").toLowerCase();
+  if (!message) return false;
+  return (
+    message.includes("could not reach the api") ||
+    message.includes("network request failed") ||
+    message.includes("failed to fetch")
+  );
+}
+
+function createCanceledRequestError() {
+  const error = new Error("Request was canceled.");
+  error.name = "AbortError";
+  return error;
 }
 
 // Without this, a request that hangs never settles: the caller sits on the promise, its
@@ -60,43 +87,67 @@ function describeRequestError(errorValue, url) {
 }
 
 async function request(path, options = {}) {
-  const url = `${API_BASE_URL}${path}`;
+  const { signal: externalSignal, ...callerOptions } = options;
   const requestOptions = {
     headers: { "Content-Type": "application/json" },
-    ...options
+    ...callerOptions
   };
+  const method = String(requestOptions.method || "GET").trim().toUpperCase();
+  const mayTryAnotherHost = method === "GET" || method === "HEAD";
   let lastError;
 
-  for (let attempt = 0; attempt <= ANDROID_LOCAL_BACKEND_RETRY_DELAYS_MS.length; attempt += 1) {
-    // A controller cannot be reused once aborted, so each attempt gets its own.
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-    try {
-      const res = await fetch(url, { ...requestOptions, signal: controller.signal });
+  for (const baseUrl of API_BASE_URL_CANDIDATES) {
+    const url = `${baseUrl}${path}`;
+    for (let attempt = 0; attempt <= ANDROID_LOCAL_BACKEND_RETRY_DELAYS_MS.length; attempt += 1) {
+      if (externalSignal?.aborted) throw createCanceledRequestError();
+      // A controller cannot be reused once aborted, so each attempt gets its own.
+      const controller = new AbortController();
+      let timeoutTriggered = false;
+      const abortFromCaller = () => controller.abort();
+      externalSignal?.addEventListener?.("abort", abortFromCaller, { once: true });
+      const timeoutId = setTimeout(() => {
+        timeoutTriggered = true;
+        controller.abort();
+      }, REQUEST_TIMEOUT_MS);
+      try {
+        const res = await fetch(url, { ...requestOptions, signal: controller.signal });
 
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`HTTP ${res.status}: ${text}`);
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`HTTP ${res.status}: ${text}`);
+        }
+
+        return await res.json();
+      } catch (errorValue) {
+        if (externalSignal?.aborted && !timeoutTriggered) {
+          throw createCanceledRequestError();
+        }
+        const described = describeRequestError(errorValue, url);
+        lastError = described;
+        const shouldRetry =
+          IS_ANDROID_LOCAL_BACKEND &&
+          attempt < ANDROID_LOCAL_BACKEND_RETRY_DELAYS_MS.length &&
+          isTransientAndroidLocalBackendError(described);
+
+        if (!shouldRetry) {
+          break;
+        }
+
+        await sleep(ANDROID_LOCAL_BACKEND_RETRY_DELAYS_MS[attempt]);
+      } finally {
+        // Always cleared: leaving it pending would abort a later, unrelated request on a
+        // reused controller, and keeps a timer alive for every request the app makes.
+        clearTimeout(timeoutId);
+        externalSignal?.removeEventListener?.("abort", abortFromCaller);
       }
+    }
 
-      return await res.json();
-    } catch (errorValue) {
-      const described = describeRequestError(errorValue, url);
-      lastError = described;
-      const shouldRetry =
-        IS_ANDROID_LOCAL_BACKEND &&
-        attempt < ANDROID_LOCAL_BACKEND_RETRY_DELAYS_MS.length &&
-        isTransientAndroidLocalBackendError(described);
-
-      if (!shouldRetry) {
-        throw described;
-      }
-
-      await sleep(ANDROID_LOCAL_BACKEND_RETRY_DELAYS_MS[attempt]);
-    } finally {
-      // Always cleared: leaving it pending would abort a later, unrelated request on a
-      // reused controller, and keeps a timer alive for every request the app makes.
-      clearTimeout(timeoutId);
+    // A timeout proves only that this request was slow, not that the host is wrong. Retrying
+    // it doubles the wait and leaves another expensive server task behind. Mutations are
+    // never replayed against another address because the first server may have committed
+    // before its response was lost.
+    if (!mayTryAnotherHost || !isHostFallbackError(lastError)) {
+      throw lastError;
     }
   }
 
@@ -194,7 +245,7 @@ export function fetchPostings(search = "", limit = 500, offset = 0, filters = {}
     params.set("review_queue", String(filters.review_queue));
   }
 
-  return request(`/postings?${params.toString()}`);
+  return request(`/postings?${params.toString()}`, { signal: filters?.signal });
 }
 
 export function fetchPostingFilterOptions() {

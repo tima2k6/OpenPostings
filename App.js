@@ -1553,6 +1553,8 @@ export default function App() {
   const wasSyncRunningRef = useRef(false);
   const lastObservedNewPostingsRef = useRef(null);
   const postingsRequestSequenceRef = useRef(0);
+  const postingsRequestAbortControllerRef = useRef(null);
+  const postingsFilterRefreshInitializedRef = useRef(false);
   const applicationsRequestSequenceRef = useRef(0);
   const frontendLogQueueRef = useRef([]);
   const frontendLogFlushInFlightRef = useRef(false);
@@ -1842,6 +1844,12 @@ export default function App() {
     const filters = options.filters || postingsFiltersRef.current;
     const requestSequence = postingsRequestSequenceRef.current + 1;
     postingsRequestSequenceRef.current = requestSequence;
+    // Sequence checks kept stale responses out of state, but the superseded server scans
+    // continued running. Closing the prior request lets the API remove it from the scan
+    // queue before it consumes database, memory, and CPU time nobody is waiting for.
+    postingsRequestAbortControllerRef.current?.abort();
+    const requestAbortController = new AbortController();
+    postingsRequestAbortControllerRef.current = requestAbortController;
     if (!silent) {
       setLoading(true);
     }
@@ -1852,7 +1860,8 @@ export default function App() {
         review_queue: reviewQueue,
         include_applied: true,
         include_ignored: reviewQueue === "reviewed",
-        include_descriptions: showPostingDescriptionsRef.current
+        include_descriptions: showPostingDescriptionsRef.current,
+        signal: requestAbortController.signal
       });
       if (requestSequence !== postingsRequestSequenceRef.current) {
         return;
@@ -1862,6 +1871,7 @@ export default function App() {
       setPostingsHasMore(normalizedItems.length >= FRONTEND_POSTINGS_FETCH_LIMIT);
       lastPostingRefreshAtRef.current = Date.now();
     } catch (e) {
+      if (e?.name === "AbortError") return;
       if (requestSequence === postingsRequestSequenceRef.current) {
         setError(String(e.message || e));
         queueFrontendLog("error", "load_postings_failed", String(e?.stack || e?.message || e), {
@@ -1869,6 +1879,9 @@ export default function App() {
         });
       }
     } finally {
+      if (postingsRequestAbortControllerRef.current === requestAbortController) {
+        postingsRequestAbortControllerRef.current = null;
+      }
       if (!silent && requestSequence === postingsRequestSequenceRef.current) {
         setLoading(false);
       }
@@ -3081,6 +3094,13 @@ export default function App() {
 
   useEffect(() => {
     if (!filtersHydrated) return undefined;
+    // Bootstrap already loads the hydrated filters. Without this guard the independent
+    // debounce launches the same expensive posting query 1.8s later, often before the
+    // bootstrap request has finished.
+    if (!postingsFilterRefreshInitializedRef.current) {
+      postingsFilterRefreshInitializedRef.current = true;
+      return undefined;
+    }
     const timer = setTimeout(() => {
       loadPostings(search, { filters: postingsFilters });
     }, 1800);

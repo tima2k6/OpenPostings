@@ -3,6 +3,7 @@ const { normalizeSyncServiceSettingsInput } = require("../helpers/normalize-sync
 const { normalizeBoolean, getPostingFreshnessHours, POSTING_FRESHNESS_HOURS_DEFAULT, MIN_POSTING_FRESHNESS_HOURS, MAX_POSTING_FRESHNESS_HOURS } = require("../helpers/normalize-numbers")
 const {
   getDb,
+  getReadDb,
   setDb,
   getAtsRequestQueueConcurrency,
   setAtsRequestQueueConcurrency,
@@ -76,7 +77,7 @@ async function ensureSyncServiceSettingsTable() {
 
 
 async function getStoredSyncServiceSettings() {
-  const db = getDb();
+  const db = getReadDb();
   const row = await db.get(
     `
       SELECT

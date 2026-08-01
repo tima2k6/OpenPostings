@@ -1,5 +1,5 @@
 const { normalizeSyncEnabledAts, normalizeAtsFilterValue, inferPostingLocationFromJobUrl, ATS_FILTER_OPTIONS, ATS_FILTER_OPTION_ITEMS } = require("../helpers/normalize-ats");
-const { getSyncPromise, setSyncPromise, getDb, setDb, getPostingLocationByJobUrl, setPostingLocationByJobUrl, getSyncEnabledAts, getSyncDownloadJobDescriptions, getAtsRequestQueueConcurrency, runInWriteTransaction } = require("./runtime-context.js");
+const { getSyncPromise, setSyncPromise, getDb, getReadDb, setDb, getPostingLocationByJobUrl, setPostingLocationByJobUrl, getSyncEnabledAts, getSyncDownloadJobDescriptions, getAtsRequestQueueConcurrency, runInWriteTransaction } = require("./runtime-context.js");
 const { nowEpochSeconds, getPostingFreshnessWindowSeconds, shouldStorePostingByDate } = require("../helpers/normalize-numbers")
 const { normalizeCompensationType, serializeEducationLevels, normalizeCompensationCurrencyCode, normalizeCompensationPayPeriod } = require("../helpers/description-filters")
 const { parsePostingLocation, serializeLocationsJson } = require("../helpers/parse-location.js")
@@ -770,7 +770,7 @@ async function recordSyncWriteHeartbeat(epoch = nowEpochSeconds()) {
 
 async function getLastSyncWriteEpoch() {
   try {
-    const db = getDb();
+    const db = getReadDb();
     if (!db) return 0;
     const row = await db.get(`SELECT wrote_at_epoch FROM sync_write_heartbeat WHERE id = 1;`);
     return Number(row?.wrote_at_epoch || 0);
@@ -780,7 +780,7 @@ async function getLastSyncWriteEpoch() {
 }
 
 async function getSyncCoverageStats(withinSeconds = 24 * 60 * 60) {
-  const db = getDb();
+  const db = getReadDb();
   if (!db) return null;
 
   const enabled = normalizeSyncEnabledAts(Array.from(getSyncEnabledAts()));
@@ -1943,7 +1943,7 @@ async function rebuildPostingsTableStorage() {
 
 
 async function getSyncScopeStats() {
-  const db = getDb()
+  const db = getReadDb()
 
   const rows = await db.all(
     `

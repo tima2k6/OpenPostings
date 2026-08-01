@@ -9,7 +9,7 @@ const vm = require("vm");
 
 // src/api.js is an ES module consumed by Metro and it imports from react-native, so it is
 // loaded here with that import replaced by a stub and its export keywords rewritten.
-function loadApiModule({ fetchImpl, onTimerScheduled }) {
+function loadApiModule({ fetchImpl, onTimerScheduled, windowValue, apiBaseUrl = "http://api.test:8787" }) {
   const source = fs.readFileSync(path.join(__dirname, "..", "..", "src", "api.js"), "utf8");
   const cjsSource = source
     .replace(/^import \{ Platform \} from "react-native";$/m, "")
@@ -21,7 +21,7 @@ function loadApiModule({ fetchImpl, onTimerScheduled }) {
   const sandboxModule = { exports: {} };
   const context = {
     Platform: { OS: "web" },
-    process: { env: { EXPO_PUBLIC_API_BASE_URL: "http://api.test:8787" } },
+    process: { env: { EXPO_PUBLIC_API_BASE_URL: apiBaseUrl } },
     fetch: fetchImpl,
     AbortController,
     // The real delay is 30s. The test records it, then fires immediately so the abort
@@ -37,6 +37,7 @@ function loadApiModule({ fetchImpl, onTimerScheduled }) {
     module: sandboxModule,
     console
   };
+  if (windowValue !== undefined) context.window = windowValue;
 
   vm.runInNewContext(
     `${cjsSource}\nmodule.exports = { request, REQUEST_TIMEOUT_MS, describeRequestError };`,
@@ -114,11 +115,72 @@ async function testSuccessClearsTheTimer() {
   assert.ok(api.clearedTimers.length > 0, "a successful request must not leave its abort timer pending");
 }
 
+async function testGetFallsBackAfterConnectivityFailure() {
+  const calls = [];
+  const api = loadApiModule({
+    windowValue: { location: { protocol: "http:", hostname: "runtime.test" } },
+    fetchImpl: (url) => {
+      calls.push(url);
+      if (url.startsWith("http://api.test:8787")) {
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: true }) });
+    },
+    onTimerScheduled: () => {}
+  });
+
+  assert.deepStrictEqual(await api.request("/postings"), { ok: true });
+  assert.deepStrictEqual(
+    calls,
+    ["http://api.test:8787/postings", "http://runtime.test:8787/postings"],
+    "a read may fall back to the browser host after a genuine connectivity failure"
+  );
+}
+
+async function testMutationIsNeverReplayedOnAnotherHost() {
+  let calls = 0;
+  const api = loadApiModule({
+    windowValue: { location: { protocol: "http:", hostname: "runtime.test" } },
+    fetchImpl: () => {
+      calls += 1;
+      return Promise.reject(new TypeError("Failed to fetch"));
+    },
+    onTimerScheduled: () => {}
+  });
+
+  await assert.rejects(() => api.request("/applications", { method: "POST" }), /could not reach/i);
+  assert.strictEqual(calls, 1, "a mutation may have committed before its response was lost and must not be replayed");
+}
+
+async function testTimeoutDoesNotTryAnotherHost() {
+  let calls = 0;
+  const api = loadApiModule({
+    windowValue: { location: { protocol: "http:", hostname: "runtime.test" } },
+    fetchImpl: (_url, options) => {
+      calls += 1;
+      return new Promise((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => {
+          const error = new Error("Aborted");
+          error.name = "AbortError";
+          reject(error);
+        });
+      });
+    },
+    onTimerScheduled: () => {}
+  });
+
+  await assert.rejects(() => api.request("/postings"), /timed out/i);
+  assert.strictEqual(calls, 1, "a slow server request must not become a second 30-second request");
+}
+
 async function main() {
   await testHangingRequestTimesOut();
   await testUnreachableApiIsNamed();
   await testHttpErrorPassesThrough();
   await testSuccessClearsTheTimer();
+  await testGetFallsBackAfterConnectivityFailure();
+  await testMutationIsNeverReplayedOnAnotherHost();
+  await testTimeoutDoesNotTryAnotherHost();
   console.log("api-request-errors tests passed");
 }
 

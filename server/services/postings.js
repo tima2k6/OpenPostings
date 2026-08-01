@@ -382,7 +382,22 @@ let wideScanActive = false;
 let wideScanQueued = 0;
 let wideScanPeakQueued = 0;
 
-function runExclusiveWideScan(task) {
+function createRequestAbortedError() {
+  const error = new Error("Request was canceled before the posting scan completed.");
+  error.name = "AbortError";
+  return error;
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw createRequestAbortedError();
+}
+
+function yieldToEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+function runExclusiveWideScan(task, signal) {
+  if (signal?.aborted) return Promise.reject(createRequestAbortedError());
   wideScanQueued += 1;
   if (wideScanQueued > wideScanPeakQueued) wideScanPeakQueued = wideScanQueued;
   if (wideScanActive) {
@@ -393,6 +408,7 @@ function runExclusiveWideScan(task) {
     async () => {
       wideScanActive = true;
       try {
+        throwIfAborted(signal);
         return await task();
       } finally {
         wideScanActive = false;
@@ -403,6 +419,7 @@ function runExclusiveWideScan(task) {
       // The previous scan failed; that must not stop this one from running.
       wideScanActive = true;
       try {
+        throwIfAborted(signal);
         return await task();
       } finally {
         wideScanActive = false;
@@ -469,6 +486,8 @@ async function listPostingsWithFilters(options = {}) {
   // database connection"). WAL lets a separate reader see committed data without taking a
   // lock, so it neither blocks the sync nor waits on it.
   const db = getReadDb();
+  const signal = options?.signal;
+  throwIfAborted(signal);
   const classificationNowEpoch = nowEpochSeconds();
   const classificationWindowSeconds = getPostingFreshnessWindowSeconds();
   const classificationOptions = {
@@ -558,6 +577,7 @@ async function listPostingsWithFilters(options = {}) {
 
   const runPostingsQuery = async () => {
   let rows = [];
+  let candidateQuery = null;
   if (!search && !hasStructuredFilters && !reviewQueue) {
     if (includeApplied && includeIgnored) {
       rows = await db.all(
@@ -651,8 +671,8 @@ async function listPostingsWithFilters(options = {}) {
     const reviewVisibilityParams = reviewQueue === "shortlisted" || reviewQueue === "reviewed"
       ? []
       : [freshnessCutoffEpoch];
-    rows = await db.all(
-      `
+    candidateQuery = {
+      sql: `
         SELECT p.id, p.company_name, p.position_name, p.job_posting_url, p.posting_date,
                p.location, p.locations_json, p.status, p.location_conflict,
                p.requires_account, p.hidden, p.hidden_reason, p.compensation_type,
@@ -670,21 +690,23 @@ async function listPostingsWithFilters(options = {}) {
         )
         ${reviewStateSql}
         ${prefilter.sql}
-        ORDER BY ${orderByClause};
+        ORDER BY ${orderByClause}
       `,
-      [...reviewVisibilityParams, ...prefilter.params]
-    );
+      params: [...reviewVisibilityParams, ...prefilter.params]
+    };
   }
 
-  const companyAtsByNormalizedName = new Map();
-  const normalizedCompanyNames = Array.from(
-    new Set(
-      rows
-        .map((row) => normalizeLikeText(row?.company_name))
-        .filter(Boolean)
-    )
-  );
-  if (normalizedCompanyNames.length > 0) {
+  const loadCompanyAtsByNormalizedName = async (candidateRows) => {
+    const companyAtsByNormalizedName = new Map();
+    const normalizedCompanyNames = Array.from(
+      new Set(
+        candidateRows
+          .map((row) => normalizeLikeText(row?.company_name))
+          .filter(Boolean)
+      )
+    );
+    if (normalizedCompanyNames.length === 0) return companyAtsByNormalizedName;
+
     const placeholders = normalizedCompanyNames.map(() => "?").join(", ");
     const companyRows = await db.all(
       `
@@ -702,14 +724,15 @@ async function listPostingsWithFilters(options = {}) {
         companyAtsByNormalizedName.set(normalizedCompanyName, normalizedAts);
       }
     }
-  }
+    return companyAtsByNormalizedName;
+  };
 
   // Split in two on purpose. Everything the filters read is computed for every candidate;
   // everything only the response needs -- the posting_date label above all, which parses
   // and reformats a date per row -- is deferred to buildPostingDisplayFields and runs on
   // the returned page instead. Profiling the filtered branch at 650k rows attributed
   // ~1.3s to date-label construction alone, all of it on rows about to be discarded.
-  const enrichRowForFiltering = (row) => {
+  const enrichRowForFiltering = (row, companyAtsByNormalizedName) => {
     const normalizedCompanyName = normalizeLikeText(row?.company_name);
     const companyAts = normalizedCompanyName ? companyAtsByNormalizedName.get(normalizedCompanyName) : "";
     const ats = normalizeAtsFilterValue(companyAts || inferAtsFromJobPostingUrl(row?.job_posting_url));
@@ -806,26 +829,10 @@ async function listPostingsWithFilters(options = {}) {
     )
   });
 
-  let enrichedRows = rows.map(enrichRowForFiltering);
-  if (reviewQueue === "new") {
-    enrichedRows = enrichedRows.filter((row) => {
-      const key = classifyPosting(row, classificationOptions).freshness.key;
-      return key === "confirmed_recent" || key === "newly_discovered";
-    });
-  }
-  if (hideNoDate) {
-    enrichedRows = enrichedRows.map(withHasRealSourcePostingDate);
-  }
-
   const searchTerms = search.toLowerCase().split(/\s+/).filter(Boolean);
   const industryMatchersByKey = await buildIndustryMatchersByKey(industryKeys);
 
-  let items = enrichedRows;
-  if (hideNoDate) {
-    items = items.filter((row) => Boolean(row?._has_real_source_posting_date));
-  }
-  if (search || hasStructuredFilters || reviewQueue) {
-    items = enrichedRows.filter((row) => {
+  const rowMatchesRequestedFilters = (row) => {
       const companyName = String(row?.company_name || "").toLowerCase();
       const positionName = String(row?.position_name || "").toLowerCase();
       const location = String(row?.location || "").toLowerCase();
@@ -888,8 +895,62 @@ async function listPostingsWithFilters(options = {}) {
       if (hideNoDate && !Boolean(row?._has_real_source_posting_date)) return false;
 
       return true;
-    });
-    items = items.slice(offset, offset + limit);
+  };
+
+  const prepareCandidateRows = async (candidateRows) => {
+    throwIfAborted(signal);
+    const companyAtsByNormalizedName = await loadCompanyAtsByNormalizedName(candidateRows);
+    let enrichedRows = candidateRows.map((row) =>
+      enrichRowForFiltering(row, companyAtsByNormalizedName)
+    );
+    if (reviewQueue === "new") {
+      enrichedRows = enrichedRows.filter((row) => {
+        const key = classifyPosting(row, classificationOptions).freshness.key;
+        return key === "confirmed_recent" || key === "newly_discovered";
+      });
+    }
+    if (hideNoDate) {
+      enrichedRows = enrichedRows.map(withHasRealSourcePostingDate);
+    }
+    if (search || hasStructuredFilters || reviewQueue) {
+      enrichedRows = enrichedRows.filter(rowMatchesRequestedFilters);
+    }
+    return enrichedRows;
+  };
+
+  let items;
+  if (candidateQuery) {
+    // The old wide branch materialised every SQL candidate before applying the exact JS
+    // predicates. On the production database that meant hundreds of MB per request and a
+    // queue of already-timed-out scans. Walk the same stable ordering in bounded chunks and
+    // stop once this page is full. Results and offset semantics stay the same; peak memory
+    // is now proportional to the chunk rather than to the database.
+    const targetMatchCount = offset + limit;
+    const chunkSize = Math.max(250, Math.min(1000, limit * 4));
+    const matchingRows = [];
+    let candidateOffset = 0;
+
+    while (matchingRows.length < targetMatchCount) {
+      throwIfAborted(signal);
+      const candidateRows = await db.all(
+        `${candidateQuery.sql} LIMIT ? OFFSET ?;`,
+        [...candidateQuery.params, chunkSize, candidateOffset]
+      );
+      if (candidateRows.length === 0) break;
+      candidateOffset += candidateRows.length;
+
+      const filteredRows = await prepareCandidateRows(candidateRows);
+      const remaining = targetMatchCount - matchingRows.length;
+      matchingRows.push(...filteredRows.slice(0, remaining));
+      if (candidateRows.length < chunkSize) break;
+
+      // Let status and other lightweight requests run between chunks. SQLite work is
+      // asynchronous, but the classification/filter loop above is CPU-bound JavaScript.
+      await yieldToEventLoop();
+    }
+    items = matchingRows.slice(offset, targetMatchCount);
+  } else {
+    items = await prepareCandidateRows(rows);
   }
 
   // Only now, on the page that is actually being returned, is it worth building the
@@ -902,6 +963,7 @@ async function listPostingsWithFilters(options = {}) {
   items = includeDescriptions
     ? await hydrateJobDescriptions(db, items)
     : items.map((item) => ({ ...item, job_description: null }));
+  throwIfAborted(signal);
   items = await enrichPostingsWithApplicationState(items);
 
   if (!includeApplied) {
@@ -952,11 +1014,11 @@ async function listPostingsWithFilters(options = {}) {
   // Bounded queries read a single page and are cheap, so they are not made to wait
   // behind a wide scan.
   if (!needsWideScan) return runPostingsQuery();
-  return runExclusiveWideScan(runPostingsQuery);
+  return runExclusiveWideScan(runPostingsQuery, signal);
 }
 
 async function enrichPostingsWithApplicationState(items) {
-  const db = getDb()
+  const db = getReadDb()
   const rows = Array.isArray(items) ? items : [];
   const urls = rows
     .map((row) => String(row?.job_posting_url || "").trim())
@@ -1014,7 +1076,7 @@ async function enrichPostingsWithApplicationState(items) {
 // filters and treats the description as a cost to avoid, while screening is exactly the
 // moment the description is the point.
 async function getPostingsByUrls(jobPostingUrls) {
-  const db = getDb()
+  const db = getReadDb()
   const urls = Array.from(
     new Set(
       (Array.isArray(jobPostingUrls) ? jobPostingUrls : [])

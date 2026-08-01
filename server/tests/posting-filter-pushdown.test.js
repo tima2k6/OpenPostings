@@ -397,6 +397,46 @@ async function testFilteredRowsCarryDisplayFields() {
   });
 }
 
+async function testFilteredPageStopsAfterBoundedChunk() {
+  const postings = Array.from({ length: 600 }, (_, index) => ({
+    url: `https://x/bounded-${index}`,
+    position: `Engineer ${index}`,
+    location: "Seattle, WA"
+  }));
+  await withDb(postings, async (db) => {
+    const originalAll = db.all.bind(db);
+    let candidateQueryCalls = 0;
+    let largestCandidateBatch = 0;
+    db.all = async (sql, ...params) => {
+      const result = await originalAll(sql, ...params);
+      if (/FROM Postings p[\s\S]*ORDER BY[\s\S]*LIMIT \? OFFSET \?/i.test(String(sql))) {
+        candidateQueryCalls += 1;
+        largestCandidateBatch = Math.max(largestCandidateBatch, result.length);
+      }
+      return result;
+    };
+
+    const result = await listPostingsWithFilters({ search: "engineer", limit: 10 });
+    assert.strictEqual(result.items.length, 10);
+    assert.strictEqual(candidateQueryCalls, 1, "the first page must stop after its first matching chunk");
+    assert.ok(
+      largestCandidateBatch <= 250,
+      `a filtered request must not materialize the whole candidate set (saw ${largestCandidateBatch})`
+    );
+  });
+}
+
+async function testAbortedFilteredRequestNeverEntersQueue() {
+  await withDb([{ url: "https://x/abort", position: "Engineer" }], async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      () => listPostingsWithFilters({ search: "engineer", signal: controller.signal }),
+      (error) => error?.name === "AbortError"
+    );
+  });
+}
+
 async function main() {
   testLikeMetacharactersAreEscapedInGeneratedSql();
   await testLikeMetacharactersInSearchAreLiteral();
@@ -412,6 +452,8 @@ async function main() {
   await testStatePrefilterMatchesOnStateName();
   await testStateProjectionKeepsSecondaryLocations();
   await testFilteredRowsCarryDisplayFields();
+  await testFilteredPageStopsAfterBoundedChunk();
+  await testAbortedFilteredRequestNeverEntersQueue();
   console.log("posting-filter-pushdown tests passed");
 }
 
