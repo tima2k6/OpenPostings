@@ -1508,6 +1508,9 @@ export default function App() {
   const [documentUploading, setDocumentUploading] = useState("");
   const [documentNotice, setDocumentNotice] = useState("");
   const [applicationAnswers, setApplicationAnswers] = useState([]);
+  const [applicationAnswersLoading, setApplicationAnswersLoading] = useState(false);
+  const [applicationAnswersLoaded, setApplicationAnswersLoaded] = useState(false);
+  const [applicationAnswersError, setApplicationAnswersError] = useState("");
   const [answersSaving, setAnswersSaving] = useState(false);
   const [answersNotice, setAnswersNotice] = useState("");
   const [settingsLoading, setSettingsLoading] = useState(false);
@@ -1984,13 +1987,18 @@ export default function App() {
       setApplicantDocuments([]);
     }
 
-    // Same rule: a server that predates the answers table is not an error here, it just
-    // renders no questions.
+    setApplicationAnswersLoading(true);
+    setApplicationAnswersError("");
     try {
       const answersResponse = await fetchApplicationAnswers();
       setApplicationAnswers(Array.isArray(answersResponse?.items) ? answersResponse.items : []);
-    } catch {
-      setApplicationAnswers([]);
+      setApplicationAnswersLoaded(true);
+    } catch (answersError) {
+      // Preserve any already-loaded edits and make the request failure visible. Replacing
+      // them with [] made a temporary outage look like the catalog had been deleted.
+      setApplicationAnswersError(String(answersError?.message || answersError));
+    } finally {
+      setApplicationAnswersLoading(false);
     }
   }, []);
 
@@ -3159,6 +3167,13 @@ export default function App() {
     loadApplications({ silent: false });
   }, [effectiveActivePage, loadApplications]);
 
+  // Settings may have bootstrapped while the API was restarting. Reload on entry so a
+  // transient failure cannot leave the page stuck on empty defaults for the whole session.
+  useEffect(() => {
+    if (effectiveActivePage !== PAGE_KEYS.SETTINGS_APPLICANTEE) return;
+    loadPersonalInformation({ silent: false });
+  }, [effectiveActivePage, loadPersonalInformation]);
+
   useEffect(() => {
     if (effectiveActivePage !== PAGE_KEYS.POSTINGS) return;
     loadStatus();
@@ -3707,11 +3722,20 @@ export default function App() {
                 under your name. Use Notes for context you want considered but not pasted into a form.
               </Text>
 
-              {applicationAnswers.length === 0 ? (
+              {applicationAnswersLoading ? (
+                <ActivityIndicator size="small" style={styles.settingsLoader} />
+              ) : applicationAnswersError ? (
+                <View>
+                  <Text style={styles.error}>{applicationAnswersError}</Text>
+                  <Pressable onPress={() => loadPersonalInformation({ silent: true })} style={styles.settingsSecondaryButton}>
+                    <Text style={styles.settingsSecondaryButtonText}>Retry Loading Questions</Text>
+                  </Pressable>
+                </View>
+              ) : applicationAnswersLoaded && applicationAnswers.length === 0 ? (
                 <Text style={styles.documentRowMeta}>
-                  No questions loaded. This needs a server with the application-answers store.
+                  No application questions are configured.
                 </Text>
-              ) : (
+              ) : applicationAnswers.length > 0 ? (
                 <>
                   <Text style={styles.documentRowMeta}>
                     {`${applicationAnswers.filter((item) => String(item?.value || "").trim()).length} of ${applicationAnswers.length} answered`}
@@ -3767,7 +3791,7 @@ export default function App() {
                     </Text>
                   </Pressable>
                 </>
-              )}
+              ) : null}
             </View>
 
             {settingsNotice ? <Text style={styles.settingsNotice}>{settingsNotice}</Text> : null}
