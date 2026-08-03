@@ -85,6 +85,7 @@ function isAppForeground() {
 const PAGE_KEYS = {
   POSTINGS: "postings",
   APPLICATIONS: "applications",
+  SCRAPER_PERFORMANCE: "scraper_performance",
   SETTINGS_APPLICANTEE: "settings_applicantee_information",
   SETTINGS_SYNC: "settings_sync",
   SETTINGS_MCP: "settings_mcp"
@@ -93,6 +94,7 @@ const PAGE_KEYS = {
 const PAGE_TITLES = {
   [PAGE_KEYS.POSTINGS]: "Postings",
   [PAGE_KEYS.APPLICATIONS]: "Applications",
+  [PAGE_KEYS.SCRAPER_PERFORMANCE]: "Scraper Performance",
   [PAGE_KEYS.SETTINGS_APPLICANTEE]: "Settings / Applicantee Information",
   [PAGE_KEYS.SETTINGS_SYNC]: "Settings / Sync Settings",
   [PAGE_KEYS.SETTINGS_MCP]: "Settings / MCP Settings"
@@ -224,6 +226,8 @@ const POSTING_REVIEW_QUEUES = Object.freeze([
 ]);
 const MIN_SYNC_INTERVAL_SECONDS = 60;
 const MAX_SYNC_INTERVAL_SECONDS = 24 * 60 * 60;
+const SYNC_PERFORMANCE_SAMPLE_INTERVAL_MS = 15 * 1000;
+const MAX_SYNC_PERFORMANCE_SAMPLES = 40;
 const DEFAULT_ATS_REQUEST_QUEUE_CONCURRENCY = 1;
 const MIN_ATS_REQUEST_QUEUE_CONCURRENCY = 1;
 const MAX_ATS_REQUEST_QUEUE_CONCURRENCY = 20;
@@ -1450,6 +1454,56 @@ function ToggleRow({ label, value, onValueChange }) {
   );
 }
 
+function PerformanceMetric({ label, value, hint, tone = "neutral" }) {
+  const toneStyle =
+    tone === "good"
+      ? styles.performanceMetricGood
+      : tone === "warning"
+        ? styles.performanceMetricWarning
+        : tone === "critical"
+          ? styles.performanceMetricCritical
+          : null;
+  return (
+    <View style={[styles.performanceMetric, toneStyle]}>
+      <Text style={styles.performanceMetricLabel}>{label}</Text>
+      <Text style={styles.performanceMetricValue}>{value}</Text>
+      {hint ? <Text style={styles.performanceMetricHint}>{hint}</Text> : null}
+    </View>
+  );
+}
+
+function RateSparkline({ samples }) {
+  const recent = Array.isArray(samples) ? samples.slice(-32) : [];
+  const rates = recent.map((sample) => Math.max(0, Number(sample?.rate || 0)));
+  const maximum = Math.max(1, ...rates);
+  if (recent.length < 2) {
+    return <Text style={styles.performanceEmptyText}>Collecting rate history…</Text>;
+  }
+  return (
+    <View>
+      <View style={styles.performanceSparkline} accessibilityLabel="Recent sync throughput trend">
+        {recent.map((sample, index) => {
+          const rate = Math.max(0, Number(sample?.rate || 0));
+          return (
+            <View
+              key={`${sample.at}-${index}`}
+              style={[
+                styles.performanceSparkBar,
+                { height: Math.max(4, Math.round((rate / maximum) * 52)) }
+              ]}
+            />
+          );
+        })}
+      </View>
+      <View style={styles.performanceSparkLegend}>
+        <Text style={styles.performanceMetricHint}>{`${rates[0].toFixed(1)}/min`}</Text>
+        <Text style={styles.performanceMetricHint}>{`Peak ${maximum.toFixed(1)}/min`}</Text>
+        <Text style={styles.performanceMetricHint}>{`${rates[rates.length - 1].toFixed(1)}/min`}</Text>
+      </View>
+    </View>
+  );
+}
+
 export default function App() {
   const [activePage, setActivePage] = useState(PAGE_KEYS.POSTINGS);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -1503,6 +1557,7 @@ export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState("");
   const [status, setStatus] = useState(null);
+  const [syncPerformanceHistory, setSyncPerformanceHistory] = useState([]);
   const [personalInformation, setPersonalInformation] = useState(createEmptyPersonalInformation);
   const [applicantDocuments, setApplicantDocuments] = useState([]);
   const [documentUploading, setDocumentUploading] = useState("");
@@ -1552,6 +1607,8 @@ export default function App() {
   const lastPostingRefreshAtRef = useRef(0);
   const wasSyncRunningRef = useRef(false);
   const lastObservedNewPostingsRef = useRef(null);
+  const syncPerformanceStartedAtRef = useRef("");
+  const lastSyncPerformanceSampleAtRef = useRef(0);
   const postingsRequestSequenceRef = useRef(0);
   const postingsRequestAbortControllerRef = useRef(null);
   const postingsFilterRefreshInitializedRef = useRef(false);
@@ -1802,6 +1859,87 @@ export default function App() {
     if (!(total > 0)) return 0;
     return Math.max(0, Math.min(1, current / total));
   }, [status]);
+
+  useEffect(() => {
+    if (!status?.running || !status?.progress) return;
+    const startedAt = String(status.started_at || "");
+    const now = Date.now();
+    const isNewPass = startedAt !== syncPerformanceStartedAtRef.current;
+    if (!isNewPass && now - lastSyncPerformanceSampleAtRef.current < SYNC_PERFORMANCE_SAMPLE_INTERVAL_MS) return;
+
+    const sample = {
+      at: now,
+      started_at: startedAt,
+      rate: Number(status.progress.targets_per_minute || 0),
+      eta_seconds: Number(status.progress.eta_seconds || 0),
+      current: Number(status.progress.current || 0),
+      write_age_seconds: Number(status.last_write_age_seconds || 0),
+      rss_mb: Number(status.process_memory?.rss_mb ?? status.memory?.rss_mb ?? 0)
+    };
+    syncPerformanceStartedAtRef.current = startedAt;
+    lastSyncPerformanceSampleAtRef.current = now;
+    setSyncPerformanceHistory((previous) => {
+      const base = isNewPass ? [] : previous;
+      return [...base, sample].slice(-MAX_SYNC_PERFORMANCE_SAMPLES);
+    });
+  }, [status]);
+
+  const scraperDashboard = useMemo(() => {
+    const progress = status?.progress || {};
+    const queue = status?.scraper_request_queue || {};
+    const memory = status?.process_memory || status?.memory || {};
+    const coverage = status?.sync_coverage || {};
+    const activeTargets = Array.isArray(status?.active_targets) ? status.active_targets : [];
+    const rate = Number(progress.targets_per_minute || 0);
+    const progressAge = Number(status?.last_progress_age_seconds || 0);
+    const writeAge = Number(status?.last_write_age_seconds || 0);
+    const elapsedSeconds = status?.started_at
+      ? Math.max(0, Math.floor((Date.now() - Date.parse(status.started_at)) / 1000))
+      : 0;
+    const issueCount =
+      Number(queue.timeouts || 0) +
+      Number(queue.aborted || 0) +
+      Number(queue.failures || 0);
+
+    let health = { label: status?.running ? "Healthy" : "Idle", tone: status?.running ? "good" : "neutral" };
+    if (status?.running && (progressAge >= 300 || Number(status?.flush_failures || 0) > 0)) {
+      health = { label: "Critical", tone: "critical" };
+    } else if (
+      status?.running &&
+      (progressAge >= 120 ||
+        Number(queue.queued || 0) > 0 ||
+        Number(status?.target_timeouts || 0) > 0 ||
+        (elapsedSeconds >= 300 && rate > 0 && rate < 40))
+    ) {
+      health = { label: "Degraded", tone: "warning" };
+    } else if (status?.last_error && !status?.running) {
+      health = { label: "Needs attention", tone: "critical" };
+    }
+
+    const coverageEnabled = Number(coverage.enabled_companies || 0);
+    const coverageSynced = Number(coverage.synced_within_window || 0);
+    const coveragePercent = coverageEnabled > 0 ? (coverageSynced / coverageEnabled) * 100 : 0;
+    const firstRate = Number(syncPerformanceHistory[0]?.rate || 0);
+    const rateDelta = syncPerformanceHistory.length > 1 ? rate - firstRate : 0;
+
+    return {
+      progress,
+      queue,
+      memory,
+      activeTargets,
+      rate,
+      progressAge,
+      writeAge,
+      elapsedSeconds,
+      issueCount,
+      health,
+      coverageEnabled,
+      coverageSynced,
+      coveragePercent,
+      rateDelta,
+      queueHotspots: Array.isArray(queue.top_keys) ? queue.top_keys : []
+    };
+  }, [status, syncPerformanceHistory]);
 
   const failedCompaniesByAtsList = useMemo(() => {
     const summary = status?.last_sync_summary || {};
@@ -3206,6 +3344,11 @@ export default function App() {
     loadCodeStatus();
   }, [effectiveActivePage, loadCodeStatus]);
 
+  useEffect(() => {
+    if (effectiveActivePage !== PAGE_KEYS.SCRAPER_PERFORMANCE) return;
+    loadStatus();
+  }, [effectiveActivePage, loadStatus]);
+
   const renderPostingsPage = () => (
     <>
       <View style={styles.controls}>
@@ -3831,16 +3974,22 @@ export default function App() {
     </ScrollView>
   );
 
-  const renderSyncSettingsPage = () => (
+  const renderSyncAreaPage = () => (
     <ScrollView contentContainerStyle={styles.settingsContent}>
       <View style={styles.settingsCard}>
-        <Text style={styles.settingsTitle}>Settings</Text>
-        <Text style={styles.settingsSubsection}>Sync Settings</Text>
+        <Text style={styles.settingsTitle}>
+          {effectiveActivePage === PAGE_KEYS.SCRAPER_PERFORMANCE ? "Scraper Performance" : "Settings"}
+        </Text>
+        <Text style={styles.settingsSubsection}>
+          {effectiveActivePage === PAGE_KEYS.SCRAPER_PERFORMANCE ? "Live operations" : "Sync Settings"}
+        </Text>
         <Text style={styles.settingsDescription}>
-          Configure automatic posting sync timing. Wi-Fi-only gating applies only on Android.
+          {effectiveActivePage === PAGE_KEYS.SCRAPER_PERFORMANCE
+            ? "Monitor scraper throughput, worker activity, request health, memory, writes, and coverage without crowding the postings feed."
+            : "Configure automatic posting sync timing. Wi-Fi-only gating applies only on Android."}
         </Text>
 
-        {codeStatus?.restart_supported && codeStatus.restart_required ? (
+        {effectiveActivePage === PAGE_KEYS.SETTINGS_SYNC && codeStatus?.restart_supported && codeStatus.restart_required ? (
           <View style={styles.updateFlag}>
             <Text style={styles.updateFlagText}>
               {`Update pending — ${codeStatus.changed_files.length} file(s) changed since the server started. Apply it under "Server code" below.`}
@@ -3848,6 +3997,189 @@ export default function App() {
           </View>
         ) : null}
 
+        <View
+          style={[
+            styles.performanceDashboard,
+            effectiveActivePage !== PAGE_KEYS.SCRAPER_PERFORMANCE ? styles.performanceDashboardHidden : null
+          ]}
+        >
+          <View style={styles.performanceDashboardHeader}>
+            <View style={styles.performanceDashboardHeading}>
+              <Text style={styles.performanceDashboardTitle}>Live telemetry</Text>
+              <Text style={styles.performanceDashboardSubtitle}>
+                Live service telemetry. Rate history is sampled every 15 seconds for the current pass.
+              </Text>
+            </View>
+            <View
+              style={[
+                styles.performanceHealthBadge,
+                scraperDashboard.health.tone === "good"
+                  ? styles.performanceHealthGood
+                  : scraperDashboard.health.tone === "warning"
+                    ? styles.performanceHealthWarning
+                    : scraperDashboard.health.tone === "critical"
+                      ? styles.performanceHealthCritical
+                      : styles.performanceHealthNeutral
+              ]}
+            >
+              <Text style={styles.performanceHealthText}>{scraperDashboard.health.label}</Text>
+            </View>
+          </View>
+
+          <View style={styles.performanceMetricGrid}>
+            <PerformanceMetric
+              label="Throughput"
+              value={`${scraperDashboard.rate.toFixed(1)}/min`}
+              hint={
+                syncPerformanceHistory.length > 1
+                  ? `${scraperDashboard.rateDelta >= 0 ? "+" : ""}${scraperDashboard.rateDelta.toFixed(1)} since pass sample`
+                  : "Waiting for trend"
+              }
+              tone={scraperDashboard.rate >= 80 ? "good" : scraperDashboard.rate >= 40 ? "warning" : "critical"}
+            />
+            <PerformanceMetric
+              label="ETA"
+              value={status?.running ? formatDurationCompact(scraperDashboard.progress.eta_seconds) : "Idle"}
+              hint={`${Number(scraperDashboard.progress.current || 0).toLocaleString()} of ${Number(scraperDashboard.progress.total || 0).toLocaleString()} targets`}
+            />
+            <PerformanceMetric
+              label="Last progress"
+              value={`${formatDurationCompact(scraperDashboard.progressAge)} ago`}
+              hint={`Pass age ${formatDurationCompact(scraperDashboard.elapsedSeconds)}`}
+              tone={scraperDashboard.progressAge < 60 ? "good" : scraperDashboard.progressAge < 180 ? "warning" : "critical"}
+            />
+            <PerformanceMetric
+              label="Last write"
+              value={`${formatDurationCompact(scraperDashboard.writeAge)} ago`}
+              hint={`${Number(status?.postings_stored || 0).toLocaleString()} rows written this pass`}
+              tone={scraperDashboard.writeAge < 120 ? "good" : scraperDashboard.writeAge < 600 ? "warning" : "critical"}
+            />
+            <PerformanceMetric
+              label="Memory"
+              value={`${Number(scraperDashboard.memory.rss_mb || 0).toLocaleString()} MB`}
+              hint={`${Number(scraperDashboard.memory.heap_used_mb || 0).toLocaleString()} MB JS heap`}
+              tone={
+                Number(scraperDashboard.memory.rss_mb || 0) < 1536
+                  ? "good"
+                  : Number(scraperDashboard.memory.rss_mb || 0) < 3584
+                    ? "warning"
+                    : "critical"
+              }
+            />
+            <PerformanceMetric
+              label="Request queue"
+              value={`${Number(scraperDashboard.queue.active || 0)} active / ${Number(scraperDashboard.queue.queued || 0)} queued`}
+              hint={`${Number(scraperDashboard.queue.cooldown_keys || 0)} ATS cooling down`}
+              tone={Number(scraperDashboard.queue.queued || 0) === 0 ? "good" : "warning"}
+            />
+            <PerformanceMetric
+              label="24h coverage"
+              value={`${scraperDashboard.coveragePercent.toFixed(1)}%`}
+              hint={`${scraperDashboard.coverageSynced.toLocaleString()} of ${scraperDashboard.coverageEnabled.toLocaleString()} companies`}
+              tone={scraperDashboard.coveragePercent >= 99 ? "good" : scraperDashboard.coveragePercent >= 90 ? "warning" : "critical"}
+            />
+            <PerformanceMetric
+              label="Transport issues"
+              value={scraperDashboard.issueCount.toLocaleString()}
+              hint={`${Number(scraperDashboard.queue.timeouts || 0)} timeout, ${Number(scraperDashboard.queue.aborted || 0)} aborted, ${Number(scraperDashboard.queue.failures || 0)} failed`}
+              tone={scraperDashboard.issueCount === 0 ? "good" : "warning"}
+            />
+          </View>
+
+          <View style={styles.performanceSection}>
+            <View style={styles.performanceSectionTitleRow}>
+              <Text style={styles.performanceSectionTitle}>Pass progress</Text>
+              <Text style={styles.performanceSectionValue}>
+                {`${Number(scraperDashboard.progress.percent || 0).toFixed(1)}%`}
+              </Text>
+            </View>
+            <View style={styles.performanceProgressTrack}>
+              <View
+                style={[
+                  styles.performanceProgressFill,
+                  { width: `${Math.max(0.5, Math.min(100, Number(scraperDashboard.progress.percent || 0)))}%` }
+                ]}
+              />
+            </View>
+            <Text style={styles.performanceMetricHint}>
+              {`${Number(status?.new_postings || 0).toLocaleString()} new, ${Number(status?.refreshed_postings || 0).toLocaleString()} refreshed, ${Number(scraperDashboard.progress.total_collected || 0).toLocaleString()} collected`}
+            </Text>
+          </View>
+
+          <View style={styles.performanceSection}>
+            <View style={styles.performanceSectionTitleRow}>
+              <Text style={styles.performanceSectionTitle}>Throughput trend</Text>
+              <Text style={styles.performanceSectionValue}>{`${syncPerformanceHistory.length} samples`}</Text>
+            </View>
+            <RateSparkline samples={syncPerformanceHistory} />
+          </View>
+
+          <View style={styles.performanceSplitRow}>
+            <View style={styles.performanceDetailPanel}>
+              <Text style={styles.performanceSectionTitle}>
+                {`Active workers (${scraperDashboard.activeTargets.length}/${Number(status?.worker_concurrency || 0)})`}
+              </Text>
+              {scraperDashboard.activeTargets.length > 0 ? (
+                scraperDashboard.activeTargets.map((target) => (
+                  <View key={`worker-${target.worker}`} style={styles.performanceWorkerRow}>
+                    <Text style={styles.performanceWorkerNumber}>{`W${target.worker}`}</Text>
+                    <View style={styles.performanceWorkerInfo}>
+                      <Text style={styles.performanceWorkerCompany} numberOfLines={1}>
+                        {sanitizeDisplayText(target.company_name, "Unknown target")}
+                      </Text>
+                      <Text style={styles.performanceMetricHint}>
+                        {`${sanitizeDisplayText(target.ats_name, "unknown")} · ${formatDurationCompact(target.age_seconds)}`}
+                      </Text>
+                    </View>
+                  </View>
+                ))
+              ) : (
+                <Text style={styles.performanceEmptyText}>{status?.running ? "Workers are starting…" : "No active sync."}</Text>
+              )}
+            </View>
+
+            <View style={styles.performanceDetailPanel}>
+              <Text style={styles.performanceSectionTitle}>Request health</Text>
+              <Text style={styles.performanceDetailText}>
+                {`${Number(scraperDashboard.queue.responses_completed || 0).toLocaleString()} responses / ${Number(scraperDashboard.queue.requests_started || 0).toLocaleString()} requests`}
+              </Text>
+              <Text style={styles.performanceDetailText}>
+                {`${Number(scraperDashboard.queue.http_errors || 0)} HTTP errors · ${Number(scraperDashboard.queue.failures || 0)} network/body failures`}
+              </Text>
+              <Text style={styles.performanceDetailText}>
+                {`${Number(status?.target_timeouts || 0)} target timeouts · ${Number(status?.stall_recoveries || 0)} watchdog recoveries`}
+              </Text>
+              <Text style={styles.performanceDetailText}>
+                {`${Number(status?.flush_failures || 0)} write failures · service up ${formatDurationCompact(status?.service_uptime_seconds)}`}
+              </Text>
+            </View>
+          </View>
+
+          {scraperDashboard.queueHotspots.length > 0 ? (
+            <View style={styles.performanceSection}>
+              <Text style={styles.performanceSectionTitle}>ATS queue hot spots</Text>
+              <View style={styles.performanceHotspotList}>
+                {scraperDashboard.queueHotspots.slice(0, 8).map((item) => (
+                  <View key={`queue-${item.key}`} style={styles.performanceHotspotRow}>
+                    <Text style={styles.performanceHotspotName}>{sanitizeDisplayText(item.key, "unknown")}</Text>
+                    <Text style={styles.performanceHotspotStats}>
+                      {`${Number(item.active || 0)} active · ${Number(item.queued || 0)} queued · ${Number(item.timeouts || 0)} timeout · ${Number(item.aborted || 0)} aborted · ${Number(item.rate_limited || 0)} 429`}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            </View>
+          ) : null}
+
+          {status?.last_error ? (
+            <View style={styles.performanceAlert}>
+              <Text style={styles.performanceAlertTitle}>Latest sync issue</Text>
+              <Text style={styles.performanceAlertText}>{sanitizeDisplayText(status.last_error, "Unknown sync error")}</Text>
+            </View>
+          ) : null}
+        </View>
+
+        <View style={effectiveActivePage !== PAGE_KEYS.SETTINGS_SYNC ? styles.performanceDashboardHidden : null}>
         {failedCompaniesByAtsList.length > 0 ? (
           <View style={styles.formGroup}>
             <Text style={styles.fieldLabel}>Failed companies by ATS (last sync)</Text>
@@ -4095,12 +4427,13 @@ export default function App() {
             {restartNotice ? <Text style={styles.settingsInlineHint}>{restartNotice}</Text> : null}
           </View>
         ) : null}
+        </View>
       </View>
 
       <Modal
         animationType="fade"
         transparent
-        visible={migrationModalOpen}
+        visible={effectiveActivePage === PAGE_KEYS.SETTINGS_SYNC && migrationModalOpen}
         onRequestClose={() => {
           if (migrationRunning) return;
           setMigrationModalOpen(false);
@@ -4436,8 +4769,9 @@ export default function App() {
 
   const renderActivePage = () => {
     if (effectiveActivePage === PAGE_KEYS.APPLICATIONS) return renderApplicationsPage();
+    if (effectiveActivePage === PAGE_KEYS.SCRAPER_PERFORMANCE) return renderSyncAreaPage();
     if (effectiveActivePage === PAGE_KEYS.SETTINGS_APPLICANTEE) return renderApplicanteeSettingsPage();
-    if (effectiveActivePage === PAGE_KEYS.SETTINGS_SYNC) return renderSyncSettingsPage();
+    if (effectiveActivePage === PAGE_KEYS.SETTINGS_SYNC) return renderSyncAreaPage();
     if (effectiveActivePage === PAGE_KEYS.SETTINGS_MCP) return renderMcpSettingsPage();
     return renderPostingsPage();
   };
@@ -4490,6 +4824,11 @@ export default function App() {
               label="Applications"
               selected={effectiveActivePage === PAGE_KEYS.APPLICATIONS}
               onPress={handleOpenApplicationsPage}
+            />
+            <DrawerItem
+              label="Scraper Performance"
+              selected={effectiveActivePage === PAGE_KEYS.SCRAPER_PERFORMANCE}
+              onPress={() => navigateToPage(PAGE_KEYS.SCRAPER_PERFORMANCE)}
             />
 
             <Text style={styles.drawerHeading}>Settings</Text>
@@ -5189,6 +5528,251 @@ const styles = StyleSheet.create({
     marginTop: 6,
     fontSize: 12,
     color: "#52606d"
+  },
+  performanceDashboard: {
+    marginTop: 14,
+    borderWidth: 1,
+    borderColor: "#cbd5e1",
+    borderRadius: 12,
+    backgroundColor: "#f8fafc",
+    padding: 12
+  },
+  performanceDashboardHidden: {
+    display: "none"
+  },
+  performanceDashboardHeader: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: 12
+  },
+  performanceDashboardHeading: {
+    flex: 1
+  },
+  performanceDashboardTitle: {
+    color: "#102a43",
+    fontSize: 16,
+    fontWeight: "700"
+  },
+  performanceDashboardSubtitle: {
+    marginTop: 3,
+    color: "#52606d",
+    fontSize: 11
+  },
+  performanceHealthBadge: {
+    borderRadius: 999,
+    paddingHorizontal: 11,
+    paddingVertical: 6
+  },
+  performanceHealthGood: {
+    backgroundColor: "#0b6e4f"
+  },
+  performanceHealthWarning: {
+    backgroundColor: "#b45309"
+  },
+  performanceHealthCritical: {
+    backgroundColor: "#b42318"
+  },
+  performanceHealthNeutral: {
+    backgroundColor: "#52606d"
+  },
+  performanceHealthText: {
+    color: "#ffffff",
+    fontSize: 11,
+    fontWeight: "700"
+  },
+  performanceMetricGrid: {
+    marginTop: 12,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8
+  },
+  performanceMetric: {
+    flexGrow: 1,
+    flexBasis: "22%",
+    minWidth: 145,
+    minHeight: 88,
+    borderWidth: 1,
+    borderColor: "#dbe2ea",
+    borderRadius: 10,
+    backgroundColor: "#ffffff",
+    paddingVertical: 9,
+    paddingHorizontal: 10
+  },
+  performanceMetricGood: {
+    borderColor: "#86c5ad",
+    backgroundColor: "#f0fdf7"
+  },
+  performanceMetricWarning: {
+    borderColor: "#f1c27d",
+    backgroundColor: "#fffaf0"
+  },
+  performanceMetricCritical: {
+    borderColor: "#f0a7a1",
+    backgroundColor: "#fff5f4"
+  },
+  performanceMetricLabel: {
+    color: "#52606d",
+    fontSize: 10,
+    fontWeight: "700",
+    textTransform: "uppercase"
+  },
+  performanceMetricValue: {
+    marginTop: 4,
+    color: "#102a43",
+    fontSize: 18,
+    fontWeight: "700"
+  },
+  performanceMetricHint: {
+    marginTop: 3,
+    color: "#627d98",
+    fontSize: 10
+  },
+  performanceSection: {
+    marginTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: "#dbe2ea",
+    paddingTop: 10
+  },
+  performanceSectionTitleRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 8
+  },
+  performanceSectionTitle: {
+    color: "#334e68",
+    fontSize: 12,
+    fontWeight: "700"
+  },
+  performanceSectionValue: {
+    color: "#52606d",
+    fontSize: 11,
+    fontWeight: "600"
+  },
+  performanceProgressTrack: {
+    marginTop: 7,
+    height: 9,
+    borderRadius: 999,
+    overflow: "hidden",
+    backgroundColor: "#dbe2ea"
+  },
+  performanceProgressFill: {
+    height: "100%",
+    borderRadius: 999,
+    backgroundColor: "#0b6e4f"
+  },
+  performanceSparkline: {
+    height: 58,
+    marginTop: 8,
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: 2,
+    borderBottomWidth: 1,
+    borderBottomColor: "#cbd5e1"
+  },
+  performanceSparkBar: {
+    flex: 1,
+    maxWidth: 18,
+    minWidth: 3,
+    borderTopLeftRadius: 2,
+    borderTopRightRadius: 2,
+    backgroundColor: "#168a68"
+  },
+  performanceSparkLegend: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    gap: 8
+  },
+  performanceSplitRow: {
+    marginTop: 12,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8
+  },
+  performanceDetailPanel: {
+    flexGrow: 1,
+    flexBasis: "47%",
+    minWidth: 240,
+    borderWidth: 1,
+    borderColor: "#dbe2ea",
+    borderRadius: 10,
+    backgroundColor: "#ffffff",
+    padding: 10
+  },
+  performanceWorkerRow: {
+    marginTop: 7,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  performanceWorkerNumber: {
+    width: 30,
+    color: "#0b6e4f",
+    fontSize: 11,
+    fontWeight: "700"
+  },
+  performanceWorkerInfo: {
+    flex: 1
+  },
+  performanceWorkerCompany: {
+    color: "#334e68",
+    fontSize: 11,
+    fontWeight: "600"
+  },
+  performanceDetailText: {
+    marginTop: 7,
+    color: "#52606d",
+    fontSize: 11
+  },
+  performanceEmptyText: {
+    marginTop: 8,
+    color: "#7b8794",
+    fontSize: 11,
+    fontStyle: "italic"
+  },
+  performanceHotspotList: {
+    marginTop: 5
+  },
+  performanceHotspotRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    paddingVertical: 6,
+    borderBottomWidth: 1,
+    borderBottomColor: "#edf2f7"
+  },
+  performanceHotspotName: {
+    flex: 1,
+    color: "#334e68",
+    fontSize: 11,
+    fontWeight: "700"
+  },
+  performanceHotspotStats: {
+    flex: 2,
+    color: "#627d98",
+    fontSize: 10,
+    textAlign: "right"
+  },
+  performanceAlert: {
+    marginTop: 12,
+    borderLeftWidth: 3,
+    borderLeftColor: "#b42318",
+    borderRadius: 6,
+    backgroundColor: "#fff5f4",
+    paddingVertical: 8,
+    paddingHorizontal: 10
+  },
+  performanceAlertTitle: {
+    color: "#8a1c13",
+    fontSize: 11,
+    fontWeight: "700"
+  },
+  performanceAlertText: {
+    marginTop: 3,
+    color: "#8a1c13",
+    fontSize: 10
   },
   settingsLoader: {
     marginTop: 12

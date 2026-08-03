@@ -127,7 +127,9 @@ const syncStatus = {
   last_write_at: null,
   flush_failures: 0,
   last_flush_error: null,
-  last_flush_error_at: null
+  last_flush_error_at: null,
+  active_targets: [],
+  target_timeouts: 0
 };
 
 // runAtsSync hands back the in-flight promise so passes cannot overlap. These track
@@ -142,6 +144,7 @@ const SYNC_TARGET_TIMEOUT_MS = Number(process.env.SYNC_TARGET_TIMEOUT_MS || 10 *
 let syncGeneration = 0;
 let lastSyncProgressAtMs = 0;
 let activeSyncAbortController = null;
+const activeSyncTargetsByWorker = new Map();
 
 const SYNC_WORKER_CONCURRENCY_RAW = Number(process.env.SYNC_WORKER_CONCURRENCY || 4);
 const SYNC_WORKER_CONCURRENCY =
@@ -150,6 +153,12 @@ const SYNC_WORKER_CONCURRENCY =
     : 4;
 
 const SYNC_POSTING_FLUSH_BATCH_SIZE = Number(process.env.SYNC_POSTING_FLUSH_BATCH_SIZE || 100); 
+
+function publishActiveSyncTargets() {
+  syncStatus.active_targets = Array.from(activeSyncTargetsByWorker.values()).sort(
+    (a, b) => Number(a.worker || 0) - Number(b.worker || 0)
+  );
+}
 
 
 async function collectPostingsForCompany(company, options = {}) {
@@ -1051,6 +1060,11 @@ async function runAtsSyncInternal() {
   syncStatus.flush_failures = 0;
   syncStatus.last_flush_error = null;
   syncStatus.last_flush_error_at = null;
+  syncStatus.active_targets = [];
+  syncStatus.target_timeouts = 0;
+  syncStatus.worker_concurrency = SYNC_WORKER_CONCURRENCY;
+  syncStatus.target_timeout_seconds = Math.round(SYNC_TARGET_TIMEOUT_MS / 1000);
+  activeSyncTargetsByWorker.clear();
 
   try {
     const companies = await getCompaniesForSync();
@@ -1190,7 +1204,7 @@ async function runAtsSyncInternal() {
 
     const queueFlushPendingPostings = createSerialFlushQueue(flushPendingPostings);
 
-    const runSyncWorker = async () => {
+    const runSyncWorker = async (workerIndex) => {
       while (true) {
         // This pass was abandoned as stalled; stop rather than compete with its
         // replacement for targets, memory and DB writes.
@@ -1200,6 +1214,14 @@ async function runAtsSyncInternal() {
         nextCompanyIndex += 1;
 
         const company = syncTargets[currentIndex];
+        const workerNumber = workerIndex + 1;
+        activeSyncTargetsByWorker.set(workerNumber, {
+          worker: workerNumber,
+          company_name: String(company?.company_name || ""),
+          ats_name: String(company?.ATS_name || ""),
+          started_at: new Date().toISOString()
+        });
+        publishActiveSyncTargets();
         const targetAbortController = new AbortController();
         const abortTargetFromPass = () => {
           targetAbortController.abort(
@@ -1209,6 +1231,8 @@ async function runAtsSyncInternal() {
         if (passAbortController.signal.aborted) abortTargetFromPass();
         else passAbortController.signal.addEventListener("abort", abortTargetFromPass, { once: true });
         const targetTimeout = setTimeout(() => {
+          if (targetAbortController.signal.aborted) return;
+          syncStatus.target_timeouts = Number(syncStatus.target_timeouts || 0) + 1;
           const error = new Error(
             `Sync target timed out after ${Math.round(SYNC_TARGET_TIMEOUT_MS / 1000)}s: ` +
               `${company.company_name} (${company.ATS_name || "unknown"})`
@@ -1260,6 +1284,8 @@ async function runAtsSyncInternal() {
         } finally {
           clearTimeout(targetTimeout);
           passAbortController.signal.removeEventListener("abort", abortTargetFromPass);
+          activeSyncTargetsByWorker.delete(workerNumber);
+          publishActiveSyncTargets();
           // Marked on completion whether or not it succeeded. A company that always fails
           // must not stay at the head of the queue forever, starving everything behind it --
           // it gets its turn again on the next lap like everything else.
@@ -1319,7 +1345,7 @@ async function runAtsSyncInternal() {
     };
 
     if (syncTargets.length > 0) {
-      await Promise.all(Array.from({ length: workerCount }, () => runSyncWorker()));
+      await Promise.all(Array.from({ length: workerCount }, (_value, workerIndex) => runSyncWorker(workerIndex)));
     }
 
     try {
@@ -1478,6 +1504,8 @@ function recoverStalledSync() {
       new Error(`Sync pass abandoned after ${Math.round(stalledForMs / 1000)}s without progress (${progressLabel})`)
     );
   }
+  activeSyncTargetsByWorker.clear();
+  publishActiveSyncTargets();
   syncStatus.stall_recoveries = Number(syncStatus.stall_recoveries || 0) + 1;
   syncStatus.last_stall_recovery_at = new Date().toISOString();
   syncStatus.last_error = `Sync abandoned after ${Math.round(stalledForMs / 1000)}s without progress (${progressLabel}).`;

@@ -85,12 +85,16 @@ async function fetchWithAtsRateLimit(rateLimitKey, fallbackWaitMs, url, init = {
 
     const requestSignal = init.signal || getRequestSignal();
     await acquireAtsRequestSlot(rateLimitKey, requestSignal);
+    const telemetry = getAtsRateLimitState(rateLimitKey);
+    telemetry.requests_started += 1;
+    telemetry.last_request_at = new Date().toISOString();
     const controller = new AbortController();
     const abortFromRequest = () => controller.abort(requestSignal?.reason || abortError(requestSignal));
     if (requestSignal?.aborted) abortFromRequest();
     else requestSignal?.addEventListener("abort", abortFromRequest, { once: true });
 
     let timeout = null;
+    let timedOut = false;
     try {
       await waitForAtsCooldown(rateLimitKey, {
         max_cooldown_ms: ATS_RATE_LIMIT_MAX_COOLDOWN_MS,
@@ -99,6 +103,7 @@ async function fetchWithAtsRateLimit(rateLimitKey, fallbackWaitMs, url, init = {
       throwIfAborted(requestSignal);
 
       timeout = setTimeout(() => {
+        timedOut = true;
         const error = new Error(
           `ATS request timed out after ${FETCH_TIMEOUT_MS}ms for '${String(rateLimitKey || "unknown")}'`
         );
@@ -114,6 +119,7 @@ async function fetchWithAtsRateLimit(rateLimitKey, fallbackWaitMs, url, init = {
 
       if (res.status === 429) {
         rateLimitRetryCount += 1;
+        telemetry.rate_limited += 1;
         markAtsRateLimited(rateLimitKey, resolveAtsRateLimitWaitMs(res, fallbackWaitMs));
         try {
           await res.body?.cancel();
@@ -121,7 +127,18 @@ async function fetchWithAtsRateLimit(rateLimitKey, fallbackWaitMs, url, init = {
         continue;
       }
 
-      return await bufferResponse(res);
+      const buffered = await bufferResponse(res);
+      telemetry.responses_completed += 1;
+      telemetry.last_response_at = new Date().toISOString();
+      if (Number(res.status || 0) >= 400) telemetry.http_errors += 1;
+      return buffered;
+    } catch (error) {
+      if (timedOut) telemetry.timeouts += 1;
+      else if (requestSignal?.aborted) telemetry.aborted += 1;
+      else telemetry.failures += 1;
+      telemetry.last_error = String(error?.message || error);
+      telemetry.last_error_at = new Date().toISOString();
+      throw error;
     } finally {
       if (timeout) clearTimeout(timeout);
       requestSignal?.removeEventListener("abort", abortFromRequest);
@@ -200,7 +217,18 @@ function getAtsRateLimitState(rateLimitKey) {
     state = {
       active: 0,
       queue: [],
-      blockedUntilEpochMs: 0
+      blockedUntilEpochMs: 0,
+      requests_started: 0,
+      responses_completed: 0,
+      failures: 0,
+      timeouts: 0,
+      aborted: 0,
+      rate_limited: 0,
+      http_errors: 0,
+      last_request_at: null,
+      last_response_at: null,
+      last_error: null,
+      last_error_at: null
     };
     atsRateLimitStateByKey.set(normalizedKey, state);
   }
@@ -293,9 +321,94 @@ async function waitForAtsCooldown(rateLimitKey, options = {}) {
   }
 }
 
+function getAtsRequestQueueStats() {
+  const now = Date.now();
+  const keys = Array.from(atsRateLimitStateByKey.entries()).map(([key, state]) => ({
+    key,
+    active: Number(state.active || 0),
+    queued: Number(state.queue?.length || 0),
+    cooldown_seconds: Math.max(0, Math.ceil((Number(state.blockedUntilEpochMs || 0) - now) / 1000)),
+    requests_started: Number(state.requests_started || 0),
+    responses_completed: Number(state.responses_completed || 0),
+    failures: Number(state.failures || 0),
+    timeouts: Number(state.timeouts || 0),
+    aborted: Number(state.aborted || 0),
+    rate_limited: Number(state.rate_limited || 0),
+    http_errors: Number(state.http_errors || 0),
+    last_request_at: state.last_request_at || null,
+    last_response_at: state.last_response_at || null,
+    last_error: state.last_error || null,
+    last_error_at: state.last_error_at || null
+  }));
+  const totals = keys.reduce(
+    (result, item) => {
+      for (const field of [
+        "active",
+        "queued",
+        "requests_started",
+        "responses_completed",
+        "failures",
+        "timeouts",
+        "aborted",
+        "rate_limited",
+        "http_errors"
+      ]) {
+        result[field] += Number(item[field] || 0);
+      }
+      if (item.cooldown_seconds > 0) result.cooldown_keys += 1;
+      return result;
+    },
+    {
+      active: 0,
+      queued: 0,
+      cooldown_keys: 0,
+      requests_started: 0,
+      responses_completed: 0,
+      failures: 0,
+      timeouts: 0,
+      aborted: 0,
+      rate_limited: 0,
+      http_errors: 0
+    }
+  );
+
+  const topKeys = keys
+    .filter(
+      (item) =>
+        item.active > 0 ||
+        item.queued > 0 ||
+        item.cooldown_seconds > 0 ||
+        item.failures > 0 ||
+        item.timeouts > 0 ||
+        item.aborted > 0 ||
+        item.http_errors > 0 ||
+        item.rate_limited > 0
+    )
+    .sort(
+      (a, b) =>
+        b.queued - a.queued ||
+        b.active - a.active ||
+        b.timeouts - a.timeouts ||
+        b.aborted - a.aborted ||
+        b.rate_limited - a.rate_limited ||
+        b.failures - a.failures ||
+        b.http_errors - a.http_errors ||
+        String(a.key).localeCompare(String(b.key))
+    )
+    .slice(0, 12);
+
+  return {
+    concurrency_per_ats: getAtsRequestQueueConcurrency(),
+    tracked_keys: keys.length,
+    ...totals,
+    top_keys: topKeys
+  };
+}
+
 module.exports = {
   sleep,
   fetchWithAtsRateLimit,
+  getAtsRequestQueueStats,
   runWithRequestSignal,
   waitForAtsFixedInterval,
   normalizeAtsRequestQueueConcurrency,

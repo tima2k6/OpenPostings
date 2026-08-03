@@ -5,7 +5,11 @@
 const assert = require("assert");
 
 const { setAtsRequestQueueConcurrency } = require("../services/runtime-context.js");
-const { fetchWithAtsRateLimit, runWithRequestSignal } = require("../services/queue.js");
+const {
+  fetchWithAtsRateLimit,
+  getAtsRequestQueueStats,
+  runWithRequestSignal
+} = require("../services/queue.js");
 
 const originalFetch = global.fetch;
 
@@ -67,6 +71,12 @@ async function testAbortCancelsAHangingBodyAndReleasesItsSlot() {
     "https://hang.example/recovered"
   );
   assert.strictEqual(await recovered.text(), "recovered", "an aborted body must release the ATS slot");
+  const telemetry = getAtsRequestQueueStats();
+  const hangingKey = telemetry.top_keys.find((item) => item.key === "test-hanging-body");
+  assert.ok(hangingKey, "problematic ATS keys should be visible in queue telemetry");
+  assert.strictEqual(hangingKey.aborted, 1, "abandoned pass requests should be counted");
+  assert.strictEqual(hangingKey.active, 0, "settled requests must not remain active");
+  assert.strictEqual(hangingKey.queued, 0, "settled requests must not remain queued");
 }
 
 async function testAbortRemovesAQueuedRequest() {

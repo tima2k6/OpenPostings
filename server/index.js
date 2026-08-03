@@ -104,6 +104,7 @@ const { extractDocumentText, getApplicantDocument, saveApplicantDocument, listAp
 const { ensureApplicationAnswersTable, listApplicationAnswers, setApplicationAnswers, clearApplicationAnswer } = require("./services/application-answers.js");
 const { ensureErrorLogTable, recordError, listErrors, acknowledgeErrors } = require("./services/error-log.js");
 const { getDb, setDb, setReaderDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
+const { getAtsRequestQueueStats } = require("./services/queue.js");
 
 const cors = require("cors");
 const express = require("express");
@@ -1491,8 +1492,28 @@ function createServer() {
         getLastSyncWriteEpoch()
       ]);
       const durableLastWriteEpoch = Number(lastWriteEpoch || 0);
+      const nowEpoch = Math.floor(Date.now() / 1000);
+      const processMemory = process.memoryUsage();
       const payload = sanitizeFrontendValue({
         ...syncStatus,
+        active_targets: (syncStatus.active_targets || []).map((target) => ({
+          ...target,
+          age_seconds: target?.started_at
+            ? Math.max(0, Math.floor((Date.now() - Date.parse(target.started_at)) / 1000))
+            : null
+        })),
+        last_progress_age_seconds: syncStatus.last_progress_at
+          ? Math.max(0, Math.floor((Date.now() - Date.parse(syncStatus.last_progress_at)) / 1000))
+          : null,
+        service_uptime_seconds: Math.floor(process.uptime()),
+        process_memory: {
+          rss_mb: Math.round(processMemory.rss / 1048576),
+          heap_used_mb: Math.round(processMemory.heapUsed / 1048576),
+          heap_total_mb: Math.round(processMemory.heapTotal / 1048576),
+          external_mb: Math.round(processMemory.external / 1048576),
+          array_buffers_mb: Math.round((processMemory.arrayBuffers || 0) / 1048576)
+        },
+        scraper_request_queue: getAtsRequestQueueStats(),
         ...syncScopeStats,
         filtered_query_queue: getWideScanStats(),
         sync_coverage: coverage,
@@ -1504,7 +1525,7 @@ function createServer() {
           syncStatus.last_write_at ||
           (durableLastWriteEpoch > 0 ? new Date(durableLastWriteEpoch * 1000).toISOString() : null),
         last_write_age_seconds:
-          durableLastWriteEpoch > 0 ? Math.max(0, Math.floor(Date.now() / 1000) - durableLastWriteEpoch) : null,
+          durableLastWriteEpoch > 0 ? Math.max(0, nowEpoch - durableLastWriteEpoch) : null,
         ...counts
       });
       return res.json(payload);
