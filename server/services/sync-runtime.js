@@ -4,6 +4,7 @@ const { nowEpochSeconds, getPostingFreshnessWindowSeconds, shouldStorePostingByD
 const { normalizeCompensationType, serializeEducationLevels, normalizeCompensationCurrencyCode, normalizeCompensationPayPeriod } = require("../helpers/description-filters")
 const { parsePostingLocation, serializeLocationsJson } = require("../helpers/parse-location.js")
 const { recordError } = require("./error-log.js")
+const { runWithRequestSignal } = require("./queue.js");
 
 const { collectPostingsForWorkdayCompany } = require("../ats/workday/service.js");
 const { collectPostingsForAshbyCompany } = require("../ats/ashby/service.js");
@@ -129,17 +130,18 @@ const syncStatus = {
   last_flush_error_at: null
 };
 
-// runAtsSync hands back the in-flight promise so passes cannot overlap. If a pass
-// never settles — a wedged await that the per-request fetch timeout does not cover —
-// that cached promise is returned forever and syncing is dead until the process is
-// restarted. These track forward progress so a wedged pass can be abandoned.
+// runAtsSync hands back the in-flight promise so passes cannot overlap. These track
+// forward progress and give both individual targets and the watchdog a way to cancel
+// every queued wait and in-flight response body before a replacement pass starts.
 const SYNC_STALL_TIMEOUT_MS = Number(process.env.SYNC_STALL_TIMEOUT_MS || 15 * 60 * 1000);
 const SYNC_WATCHDOG_INTERVAL_MS = Number(process.env.SYNC_WATCHDOG_INTERVAL_MS || 60 * 1000);
+const SYNC_TARGET_TIMEOUT_MS = Number(process.env.SYNC_TARGET_TIMEOUT_MS || 10 * 60 * 1000);
 // Bumped when a pass is abandoned. Workers compare against the value they started
 // with and exit, so an abandoned pass stops consuming targets and memory instead of
 // racing the replacement pass.
 let syncGeneration = 0;
 let lastSyncProgressAtMs = 0;
+let activeSyncAbortController = null;
 
 const SYNC_WORKER_CONCURRENCY_RAW = Number(process.env.SYNC_WORKER_CONCURRENCY || 4);
 const SYNC_WORKER_CONCURRENCY =
@@ -1033,6 +1035,8 @@ function createSerialFlushQueue(flush) {
 
 async function runAtsSyncInternal() {
   const passGeneration = syncGeneration;
+  const passAbortController = new AbortController();
+  activeSyncAbortController = passAbortController;
   const syncReferenceEpoch = nowEpochSeconds();
   lastSyncProgressAtMs = Date.now();
   syncStatus.running = true;
@@ -1196,6 +1200,23 @@ async function runAtsSyncInternal() {
         nextCompanyIndex += 1;
 
         const company = syncTargets[currentIndex];
+        const targetAbortController = new AbortController();
+        const abortTargetFromPass = () => {
+          targetAbortController.abort(
+            passAbortController.signal.reason || new Error("Sync pass was abandoned")
+          );
+        };
+        if (passAbortController.signal.aborted) abortTargetFromPass();
+        else passAbortController.signal.addEventListener("abort", abortTargetFromPass, { once: true });
+        const targetTimeout = setTimeout(() => {
+          const error = new Error(
+            `Sync target timed out after ${Math.round(SYNC_TARGET_TIMEOUT_MS / 1000)}s: ` +
+              `${company.company_name} (${company.ATS_name || "unknown"})`
+          );
+          error.name = "TimeoutError";
+          targetAbortController.abort(error);
+        }, SYNC_TARGET_TIMEOUT_MS);
+        if (typeof targetTimeout.unref === "function") targetTimeout.unref();
         try {
           const companyAts = normalizeAtsFilterValue(company?.ATS_name);
           const currentlyEnabledAts = new Set(normalizeSyncEnabledAts(Array.from(getSyncEnabledAts())));
@@ -1203,9 +1224,11 @@ async function runAtsSyncInternal() {
             continue;
           }
 
-          const postings = await collectPostingsForCompany(company, {
-            downloadJobDescriptions: getSyncDownloadJobDescriptions()
-          });
+          const postings = await runWithRequestSignal(targetAbortController.signal, () =>
+            collectPostingsForCompany(company, {
+              downloadJobDescriptions: getSyncDownloadJobDescriptions()
+            })
+          );
           for (const posting of postings) {
             if (!shouldStorePostingByDate(posting?.posting_date, syncReferenceEpoch)) {
               excludedByPostingDate += 1;
@@ -1235,6 +1258,8 @@ async function runAtsSyncInternal() {
             message: String(error?.message || error)
           });
         } finally {
+          clearTimeout(targetTimeout);
+          passAbortController.signal.removeEventListener("abort", abortTargetFromPass);
           // Marked on completion whether or not it succeeded. A company that always fails
           // must not stay at the head of the queue forever, starving everything behind it --
           // it gets its turn again on the next lap like everything else.
@@ -1419,6 +1444,9 @@ async function runAtsSyncInternal() {
       syncStatus.last_error = String(error?.message || error);
     }
   } finally {
+    if (activeSyncAbortController === passAbortController) {
+      activeSyncAbortController = null;
+    }
     // An abandoned pass may settle long after its replacement started; it must not
     // report that pass as finished or wipe its progress.
     if (syncGeneration === passGeneration) {
@@ -1428,10 +1456,8 @@ async function runAtsSyncInternal() {
   }
 }
 
-// Abandons a pass that has stopped making progress, so the next scheduled tick can
-// start a fresh one. The wedged pass is not killable — its pending awaits may never
-// settle — but bumping the generation makes its workers exit at their next iteration
-// and stops it from publishing results.
+// Abandons a pass that has stopped making progress, aborting its queue waits and in-flight
+// response bodies before the next scheduled tick starts a replacement.
 function recoverStalledSync() {
   if (!syncStatus.running) return false;
   const stalledForMs = Date.now() - lastSyncProgressAtMs;
@@ -1445,6 +1471,13 @@ function recoverStalledSync() {
   );
 
   syncGeneration += 1;
+  const stalledController = activeSyncAbortController;
+  activeSyncAbortController = null;
+  if (stalledController && !stalledController.signal.aborted) {
+    stalledController.abort(
+      new Error(`Sync pass abandoned after ${Math.round(stalledForMs / 1000)}s without progress (${progressLabel})`)
+    );
+  }
   syncStatus.stall_recoveries = Number(syncStatus.stall_recoveries || 0) + 1;
   syncStatus.last_stall_recovery_at = new Date().toISOString();
   syncStatus.last_error = `Sync abandoned after ${Math.round(stalledForMs / 1000)}s without progress (${progressLabel}).`;

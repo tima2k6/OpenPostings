@@ -104,7 +104,7 @@ async function fetchPeopleforceJobsPage(config) {
     Pragma: "no-cache"
   };
 
-  const res = await fetch(config.jobsUrl, {
+  const res = await fetchWithAtsRateLimit("peopleforce", 60 * 1000, config.jobsUrl, {
     method: "GET",
     headers
   });

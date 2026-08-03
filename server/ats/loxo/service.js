@@ -1,5 +1,5 @@
 const { parseUrl, decodeHtmlEntities } = require("../../helpers/normalize-strings");
-const { sleep } = require("../../services/queue");
+const { fetchWithAtsRateLimit, sleep } = require("../../services/queue");
 const LOXO_RATE_LIMIT_WAIT_MS = 5 * 1000;
 
 async function collectPostingsForLoxoCompany(company) {
@@ -106,7 +106,7 @@ async function fetchLoxoJobsPage(config) {
   };
 
   const doRequest = async () =>
-    fetch(config.boardUrl, {
+    fetchWithAtsRateLimit("loxo", LOXO_RATE_LIMIT_WAIT_MS, config.boardUrl, {
       method: "GET",
       headers
     });
