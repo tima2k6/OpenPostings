@@ -4,7 +4,7 @@ const { nowEpochSeconds, getPostingFreshnessWindowSeconds, shouldStorePostingByD
 const { normalizeCompensationType, serializeEducationLevels, normalizeCompensationCurrencyCode, normalizeCompensationPayPeriod } = require("../helpers/description-filters")
 const { parsePostingLocation, serializeLocationsJson } = require("../helpers/parse-location.js")
 const { recordError } = require("./error-log.js")
-const { runWithRequestSignal } = require("./queue.js");
+const { raceWithAbortSignal, runWithRequestSignal } = require("./queue.js");
 
 const { collectPostingsForWorkdayCompany } = require("../ats/workday/service.js");
 const { collectPostingsForAshbyCompany } = require("../ats/ashby/service.js");
@@ -129,7 +129,8 @@ const syncStatus = {
   last_flush_error: null,
   last_flush_error_at: null,
   active_targets: [],
-  target_timeouts: 0
+  target_timeouts: 0,
+  last_target_timeout_at: null
 };
 
 // runAtsSync hands back the in-flight promise so passes cannot overlap. These track
@@ -1062,6 +1063,7 @@ async function runAtsSyncInternal() {
   syncStatus.last_flush_error_at = null;
   syncStatus.active_targets = [];
   syncStatus.target_timeouts = 0;
+  syncStatus.last_target_timeout_at = null;
   syncStatus.worker_concurrency = SYNC_WORKER_CONCURRENCY;
   syncStatus.target_timeout_seconds = Math.round(SYNC_TARGET_TIMEOUT_MS / 1000);
   activeSyncTargetsByWorker.clear();
@@ -1233,6 +1235,7 @@ async function runAtsSyncInternal() {
         const targetTimeout = setTimeout(() => {
           if (targetAbortController.signal.aborted) return;
           syncStatus.target_timeouts = Number(syncStatus.target_timeouts || 0) + 1;
+          syncStatus.last_target_timeout_at = new Date().toISOString();
           const error = new Error(
             `Sync target timed out after ${Math.round(SYNC_TARGET_TIMEOUT_MS / 1000)}s: ` +
               `${company.company_name} (${company.ATS_name || "unknown"})`
@@ -1248,11 +1251,12 @@ async function runAtsSyncInternal() {
             continue;
           }
 
-          const postings = await runWithRequestSignal(targetAbortController.signal, () =>
+          const collectionPromise = runWithRequestSignal(targetAbortController.signal, () =>
             collectPostingsForCompany(company, {
               downloadJobDescriptions: getSyncDownloadJobDescriptions()
             })
           );
+          const postings = await raceWithAbortSignal(collectionPromise, targetAbortController.signal);
           for (const posting of postings) {
             if (!shouldStorePostingByDate(posting?.posting_date, syncReferenceEpoch)) {
               excludedByPostingDate += 1;

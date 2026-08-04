@@ -1890,9 +1890,23 @@ export default function App() {
     const memory = status?.process_memory || status?.memory || {};
     const coverage = status?.sync_coverage || {};
     const activeTargets = Array.isArray(status?.active_targets) ? status.active_targets : [];
+    const queueHotspots = Array.isArray(queue.top_keys) ? queue.top_keys : [];
     const rate = Number(progress.targets_per_minute || 0);
     const progressAge = Number(status?.last_progress_age_seconds || 0);
     const writeAge = Number(status?.last_write_age_seconds || 0);
+    const targetTimeoutSeconds = Math.max(1, Number(status?.target_timeout_seconds || 600));
+    const oldestTargetAge = activeTargets.reduce(
+      (oldest, target) => Math.max(oldest, Number(target?.age_seconds || 0)),
+      0
+    );
+    const lastTargetTimeoutAge = status?.last_target_timeout_at
+      ? Math.max(0, Math.floor((Date.now() - Date.parse(status.last_target_timeout_at)) / 1000))
+      : Number.POSITIVE_INFINITY;
+    const hasStalledQueue = queueHotspots.some((item) => {
+      if (Number(item?.queued || 0) <= 0 || Number(item?.active || 0) <= 0) return false;
+      const lastResponseAt = Date.parse(String(item?.last_response_at || ""));
+      return !Number.isFinite(lastResponseAt) || Date.now() - lastResponseAt >= 120000;
+    });
     const elapsedSeconds = status?.started_at
       ? Math.max(0, Math.floor((Date.now() - Date.parse(status.started_at)) / 1000))
       : 0;
@@ -1902,13 +1916,18 @@ export default function App() {
       Number(queue.failures || 0);
 
     let health = { label: status?.running ? "Healthy" : "Idle", tone: status?.running ? "good" : "neutral" };
-    if (status?.running && (progressAge >= 300 || Number(status?.flush_failures || 0) > 0)) {
+    if (
+      status?.running &&
+      (progressAge >= 300 ||
+        Number(status?.flush_failures || 0) > 0 ||
+        oldestTargetAge >= targetTimeoutSeconds + 60)
+    ) {
       health = { label: "Critical", tone: "critical" };
     } else if (
       status?.running &&
       (progressAge >= 120 ||
-        Number(queue.queued || 0) > 0 ||
-        Number(status?.target_timeouts || 0) > 0 ||
+        hasStalledQueue ||
+        lastTargetTimeoutAge <= 300 ||
         (elapsedSeconds >= 300 && rate > 0 && rate < 40))
     ) {
       health = { label: "Degraded", tone: "warning" };
@@ -1937,7 +1956,7 @@ export default function App() {
       coverageSynced,
       coveragePercent,
       rateDelta,
-      queueHotspots: Array.isArray(queue.top_keys) ? queue.top_keys : []
+      queueHotspots
     };
   }, [status, syncPerformanceHistory]);
 

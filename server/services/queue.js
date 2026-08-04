@@ -40,6 +40,31 @@ function runWithRequestSignal(signal, task) {
   return requestSignalContext.run({ signal: signal || null }, task);
 }
 
+// AbortController is advisory: most promises that receive its signal reject promptly,
+// but a buggy transport or body stream can ignore it forever. Keep cancellation as a
+// hard boundary for the caller even in that case. Attaching both handlers to the source
+// promise also prevents a late rejection from becoming unhandled after the abort wins.
+function raceWithAbortSignal(sourcePromise, signal) {
+  if (!signal) return Promise.resolve(sourcePromise);
+  if (signal.aborted) return Promise.reject(abortError(signal));
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (handler, value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      handler(value);
+    };
+    const onAbort = () => finish(reject, abortError(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(sourcePromise).then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error)
+    );
+  });
+}
+
 // Collectors consume the Response after this helper returns. Buffering here keeps the
 // AbortController and queue slot alive through response.text()/json(), rather than timing
 // out only the headers and allowing a stalled body to strand a sync worker forever.
@@ -112,10 +137,13 @@ async function fetchWithAtsRateLimit(rateLimitKey, fallbackWaitMs, url, init = {
       }, FETCH_TIMEOUT_MS);
       if (typeof timeout.unref === "function") timeout.unref();
 
-      const res = await fetch(url, {
-        ...init,
-        signal: controller.signal
-      });
+      const res = await raceWithAbortSignal(
+        fetch(url, {
+          ...init,
+          signal: controller.signal
+        }),
+        controller.signal
+      );
 
       if (res.status === 429) {
         rateLimitRetryCount += 1;
@@ -127,7 +155,7 @@ async function fetchWithAtsRateLimit(rateLimitKey, fallbackWaitMs, url, init = {
         continue;
       }
 
-      const buffered = await bufferResponse(res);
+      const buffered = await raceWithAbortSignal(bufferResponse(res), controller.signal);
       telemetry.responses_completed += 1;
       telemetry.last_response_at = new Date().toISOString();
       if (Number(res.status || 0) >= 400) telemetry.http_errors += 1;
@@ -409,6 +437,7 @@ module.exports = {
   sleep,
   fetchWithAtsRateLimit,
   getAtsRequestQueueStats,
+  raceWithAbortSignal,
   runWithRequestSignal,
   waitForAtsFixedInterval,
   normalizeAtsRequestQueueConcurrency,

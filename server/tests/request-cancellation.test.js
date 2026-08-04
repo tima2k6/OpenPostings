@@ -79,6 +79,46 @@ async function testAbortCancelsAHangingBodyAndReleasesItsSlot() {
   assert.strictEqual(hangingKey.queued, 0, "settled requests must not remain queued");
 }
 
+async function testAbortReleasesSlotWhenBodyIgnoresTheSignal() {
+  setAtsRequestQueueConcurrency(1);
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return responseWithUrl(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("partial"));
+            // Deliberately never close and never observe the request signal. This
+            // reproduces the production failure where abort() did not settle a body.
+          }
+        }),
+        "https://uncooperative.example/jobs",
+        { status: 200 }
+      );
+    }
+    return responseWithUrl("recovered", "https://uncooperative.example/recovered", { status: 200 });
+  };
+
+  const controller = new AbortController();
+  const hanging = runWithRequestSignal(controller.signal, () =>
+    fetchWithAtsRateLimit("test-uncooperative-body", 0, "https://uncooperative.example/jobs")
+  );
+  setTimeout(() => controller.abort(new Error("hard deadline reached")), 20);
+
+  await assert.rejects(hanging, /hard deadline reached/);
+  const recovered = await fetchWithAtsRateLimit(
+    "test-uncooperative-body",
+    0,
+    "https://uncooperative.example/recovered"
+  );
+  assert.strictEqual(await recovered.text(), "recovered", "hard abort must release the occupied ATS slot");
+  const key = getAtsRequestQueueStats().top_keys.find((item) => item.key === "test-uncooperative-body");
+  assert.strictEqual(key?.active, 0);
+  assert.strictEqual(key?.queued, 0);
+  assert.strictEqual(key?.aborted, 1);
+}
+
 async function testAbortRemovesAQueuedRequest() {
   setAtsRequestQueueConcurrency(1);
   let releaseFirstFetch;
@@ -119,6 +159,7 @@ async function main() {
   try {
     await testBodyIsBufferedInsideTheRequestBoundary();
     await testAbortCancelsAHangingBodyAndReleasesItsSlot();
+    await testAbortReleasesSlotWhenBodyIgnoresTheSignal();
     await testAbortRemovesAQueuedRequest();
     console.log("request-cancellation tests passed");
   } finally {
