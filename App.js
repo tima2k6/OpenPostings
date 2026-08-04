@@ -1899,9 +1899,17 @@ export default function App() {
       (oldest, target) => Math.max(oldest, Number(target?.age_seconds || 0)),
       0
     );
-    const lastTargetTimeoutAge = status?.last_target_timeout_at
-      ? Math.max(0, Math.floor((Date.now() - Date.parse(status.last_target_timeout_at)) / 1000))
-      : Number.POSITIVE_INFINITY;
+    // A single recent timeout is not a signal on its own: individual ATS platforms (Workday,
+    // Ashby) hit their own bounded deadline occasionally as a matter of course, so "one
+    // happened in the last 5 minutes" is true almost continuously during otherwise-healthy
+    // operation. A burst -- several within that window -- is what actually distinguishes a
+    // real problem from that background noise.
+    const recentTargetTimeoutEpochsMs = Array.isArray(status?.recent_target_timeout_epochs_ms)
+      ? status.recent_target_timeout_epochs_ms
+      : [];
+    const recentTargetTimeoutCount = recentTargetTimeoutEpochsMs.filter(
+      (epochMs) => Date.now() - Number(epochMs || 0) <= 300000
+    ).length;
     const hasStalledQueue = queueHotspots.some((item) => {
       if (Number(item?.queued || 0) <= 0 || Number(item?.active || 0) <= 0) return false;
       const lastResponseAt = Date.parse(String(item?.last_response_at || ""));
@@ -1927,7 +1935,7 @@ export default function App() {
       status?.running &&
       (progressAge >= 120 ||
         hasStalledQueue ||
-        lastTargetTimeoutAge <= 300 ||
+        recentTargetTimeoutCount >= 3 ||
         (elapsedSeconds >= 300 && rate > 0 && rate < 40))
     ) {
       health = { label: "Degraded", tone: "warning" };

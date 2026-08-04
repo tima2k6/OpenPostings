@@ -130,8 +130,19 @@ const syncStatus = {
   last_flush_error_at: null,
   active_targets: [],
   target_timeouts: 0,
-  last_target_timeout_at: null
+  last_target_timeout_at: null,
+  // A rolling window, not just the single most recent timestamp: individual ATS platforms
+  // (Workday, Ashby) hit their own bounded deadline occasionally as a matter of course, so
+  // "one timeout happened recently" is true almost continuously during otherwise-healthy
+  // operation. What actually distinguishes a real problem is a burst -- several in a short
+  // window -- which needs more than one timestamp to detect.
+  recent_target_timeout_epochs_ms: []
 };
+
+// How far back recent_target_timeout_epochs_ms is allowed to look. Generous relative to the
+// 5-minute window the dashboard actually checks, so that window is never shortchanged by
+// this pruning running slightly late.
+const RECENT_TARGET_TIMEOUT_WINDOW_MS = 10 * 60 * 1000;
 
 // runAtsSync hands back the in-flight promise so passes cannot overlap. These track
 // forward progress and give both individual targets and the watchdog a way to cancel
@@ -1064,6 +1075,7 @@ async function runAtsSyncInternal() {
   syncStatus.active_targets = [];
   syncStatus.target_timeouts = 0;
   syncStatus.last_target_timeout_at = null;
+  syncStatus.recent_target_timeout_epochs_ms = [];
   syncStatus.worker_concurrency = SYNC_WORKER_CONCURRENCY;
   syncStatus.target_timeout_seconds = Math.round(SYNC_TARGET_TIMEOUT_MS / 1000);
   activeSyncTargetsByWorker.clear();
@@ -1236,6 +1248,12 @@ async function runAtsSyncInternal() {
           if (targetAbortController.signal.aborted) return;
           syncStatus.target_timeouts = Number(syncStatus.target_timeouts || 0) + 1;
           syncStatus.last_target_timeout_at = new Date().toISOString();
+          const nowMs = Date.now();
+          const cutoffMs = nowMs - RECENT_TARGET_TIMEOUT_WINDOW_MS;
+          syncStatus.recent_target_timeout_epochs_ms = [
+            ...(syncStatus.recent_target_timeout_epochs_ms || []).filter((epochMs) => epochMs >= cutoffMs),
+            nowMs
+          ];
           const error = new Error(
             `Sync target timed out after ${Math.round(SYNC_TARGET_TIMEOUT_MS / 1000)}s: ` +
               `${company.company_name} (${company.ATS_name || "unknown"})`
