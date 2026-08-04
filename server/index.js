@@ -127,6 +127,15 @@ const BACKEND_DATA_ROOT = path.dirname(DB_PATH);
 const BACKEND_LOG_DIRECTORY_PATH = path.join(BACKEND_DATA_ROOT, "logs");
 const FRONTEND_LOG_PATH = path.join(BACKEND_LOG_DIRECTORY_PATH, "frontend-client.log");
 const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS || 10 * 60 * 1000);
+// wal_autocheckpoint and journal_size_limit (set in initDb) bound how large the WAL can grow
+// and passively reclaim its *content* into the main file, but neither ever shrinks the file
+// itself back down. A connection that briefly holds an older snapshot open (an MCP client,
+// a slow reader) can let the WAL grow all the way to journal_size_limit, and once nothing is
+// left to reclaim it just sits at that size forever -- every later read and write pays the
+// cost of a much bigger file with nothing gained. A periodic TRUNCATE checkpoint is safe to
+// call at any time: if something still holds an old snapshot it just reports busy and does
+// nothing, so this cannot make anything worse than not calling it at all.
+const WAL_CHECKPOINT_TRUNCATE_INTERVAL_MS = Number(process.env.WAL_CHECKPOINT_TRUNCATE_INTERVAL_MS || 5 * 60 * 1000);
 
 
 
@@ -2329,6 +2338,22 @@ function createServer() {
   return app;
 }
 
+// See WAL_CHECKPOINT_TRUNCATE_INTERVAL_MS above for why this exists: PASSIVE auto-checkpoints
+// reclaim WAL content but never shrink the file, so this is what actually bounds it back down.
+function startWalCheckpointTruncateTask() {
+  const timer = setInterval(async () => {
+    try {
+      const db = getDb();
+      if (!db) return;
+      await db.all("PRAGMA wal_checkpoint(TRUNCATE);");
+    } catch (error) {
+      console.error("[OpenPostings API] periodic WAL truncate checkpoint failed:", error?.message || error);
+    }
+  }, WAL_CHECKPOINT_TRUNCATE_INTERVAL_MS);
+  if (typeof timer.unref === "function") timer.unref();
+  return timer;
+}
+
 async function start() {
   await initDb();
 
@@ -2367,6 +2392,7 @@ async function start() {
   // Watches for a pass that stops making progress and abandons it, so a wedged sync
   // does not leave the cached promise in place and stop syncing until a restart.
   startSyncStallWatchdog();
+  startWalCheckpointTruncateTask();
 
   // Fetching posting pages and keeping the semantic index current run on their own
   // clocks, deliberately not tied to a sync pass finishing.
