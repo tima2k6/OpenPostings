@@ -29,6 +29,7 @@
     "test:backend:write-transaction": "node server/tests/write-transaction.test.js",
     "test:backend:write-liveness": "node server/tests/write-liveness.test.js",
     "test:backend:request-cancellation": "node server/tests/request-cancellation.test.js",
+    "test:backend:sync-target-hard-deadline": "node server/tests/sync-target-hard-deadline.test.js",
     "test:backend:sync-resume": "node server/tests/sync-resume.test.js",
     "test:filter-normalize": "node server/tests/filter-normalize.test.js",
     "test:backend:api-request-errors": "node server/tests/api-request-errors.test.js",

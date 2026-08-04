@@ -20,6 +20,34 @@ function responseWithUrl(body, url, init = {}) {
   return response;
 }
 
+// Every test above simulates a caller cancelling a pass or a target -- that forwarded abort
+// is what actually unblocks the hanging body. In production nothing external cancels a single
+// stuck request within FETCH_TIMEOUT_MS; the request-level deadline has to fire on its own.
+// Loading queue.js fresh with a short FETCH_TIMEOUT_MS is the only way to exercise that timer
+// without waiting out the real 12s default.
+function loadQueueModuleWithFetchTimeout(fetchTimeoutMs) {
+  const modulePath = require.resolve("../services/queue.js");
+  const previousEnv = process.env.FETCH_TIMEOUT_MS;
+  process.env.FETCH_TIMEOUT_MS = String(fetchTimeoutMs);
+  delete require.cache[modulePath];
+  const freshQueue = require("../services/queue.js");
+  delete require.cache[modulePath];
+  if (previousEnv === undefined) delete process.env.FETCH_TIMEOUT_MS;
+  else process.env.FETCH_TIMEOUT_MS = previousEnv;
+  return freshQueue;
+}
+
+// A safety net for the assertion below, not part of the mechanism under test: if the
+// self-firing deadline regresses back to a plain unbounded await, this fails fast with a
+// clear message instead of hanging the test process forever.
+function withTestDeadline(promise, ms, message) {
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
 async function testBodyIsBufferedInsideTheRequestBoundary() {
   global.fetch = async () =>
     responseWithUrl(JSON.stringify({ ok: true }), "https://final.example/jobs", {
@@ -119,6 +147,57 @@ async function testAbortReleasesSlotWhenBodyIgnoresTheSignal() {
   assert.strictEqual(key?.aborted, 1);
 }
 
+async function testFetchTimeoutReleasesSlotWithNoExternalAbort() {
+  const shortTimeoutQueue = loadQueueModuleWithFetchTimeout(50);
+  setAtsRequestQueueConcurrency(1);
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return responseWithUrl(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("partial"));
+            // Deliberately never closes and never observes any signal. No caller ever
+            // calls abort() in this test -- only FETCH_TIMEOUT_MS itself can rescue the slot.
+          }
+        }),
+        "https://no-caller-abort.example/jobs",
+        { status: 200 }
+      );
+    }
+    return responseWithUrl("recovered", "https://no-caller-abort.example/recovered", { status: 200 });
+  };
+
+  // No runWithRequestSignal, no AbortController, no init.signal -- called exactly as it
+  // would be if nothing upstream ever cancels it.
+  const hanging = shortTimeoutQueue.fetchWithAtsRateLimit(
+    "test-no-caller-abort",
+    0,
+    "https://no-caller-abort.example/jobs"
+  );
+
+  await assert.rejects(
+    () => withTestDeadline(hanging, 2000, "self-firing deadline never fired within 2s"),
+    /timed out after 50ms/,
+    "the internal deadline must fire on its own, with no caller ever aborting"
+  );
+
+  const recovered = await shortTimeoutQueue.fetchWithAtsRateLimit(
+    "test-no-caller-abort",
+    0,
+    "https://no-caller-abort.example/recovered"
+  );
+  assert.strictEqual(await recovered.text(), "recovered", "the internal deadline must release the ATS slot");
+
+  const key = shortTimeoutQueue
+    .getAtsRequestQueueStats()
+    .top_keys.find((item) => item.key === "test-no-caller-abort");
+  assert.strictEqual(key?.active, 0, "settled requests must not remain active");
+  assert.strictEqual(key?.queued, 0, "settled requests must not remain queued");
+  assert.strictEqual(key?.timeouts, 1, "an unabandoned request that overran must count as a timeout, not a generic failure");
+}
+
 async function testAbortRemovesAQueuedRequest() {
   setAtsRequestQueueConcurrency(1);
   let releaseFirstFetch;
@@ -160,6 +239,7 @@ async function main() {
     await testBodyIsBufferedInsideTheRequestBoundary();
     await testAbortCancelsAHangingBodyAndReleasesItsSlot();
     await testAbortReleasesSlotWhenBodyIgnoresTheSignal();
+    await testFetchTimeoutReleasesSlotWithNoExternalAbort();
     await testAbortRemovesAQueuedRequest();
     console.log("request-cancellation tests passed");
   } finally {
