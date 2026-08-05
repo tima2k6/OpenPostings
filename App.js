@@ -53,6 +53,7 @@ import {
   triggerWorkdaySync,
   unblockCompany,
   updateApplicationStatus,
+  updateApplicationFit,
   uploadApplicantDocument
 } from "./src/api";
 import {
@@ -220,6 +221,7 @@ const APPLICATION_STATUS_OPTIONS = [
   "withdrawn",
   "denied"
 ];
+const APPLICATION_FIT_OPTIONS = ["good fit", "stretch", "overqualified", "underqualified"];
 const DEFAULT_SYNC_INTERVAL_SECONDS = 3600;
 const FRONTEND_POSTINGS_FETCH_LIMIT = 50;
 const POSTING_REVIEW_QUEUES = Object.freeze([
@@ -544,6 +546,7 @@ function normalizeApplicationItem(item) {
     company_name: sanitizeDisplayText(source.company_name, ""),
     position_name: sanitizeDisplayText(source.position_name, ""),
     status: sanitizeDisplayText(source.status, "applied"),
+    fit_assessment: sanitizeDisplayText(source.fit_assessment, ""),
     applied_by_label: sanitizeDisplayText(source.applied_by_label, "")
   };
 }
@@ -1564,6 +1567,8 @@ export default function App() {
   const [updatingApplicationIds, setUpdatingApplicationIds] = useState({});
   const [deletingApplicationIds, setDeletingApplicationIds] = useState({});
   const [openApplicationStatusForId, setOpenApplicationStatusForId] = useState(null);
+  const [openApplicationFitForId, setOpenApplicationFitForId] = useState(null);
+  const [updatingApplicationFitIds, setUpdatingApplicationFitIds] = useState({});
   const [initializing, setInitializing] = useState(true);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
@@ -2941,6 +2946,36 @@ export default function App() {
     }
   }, []);
 
+  const handleUpdateApplicationFit = useCallback(async (applicationId, nextFitAssessment) => {
+    setUpdatingApplicationFitIds((prev) => ({
+      ...prev,
+      [applicationId]: true
+    }));
+    setError("");
+    try {
+      const response = await updateApplicationFit(applicationId, nextFitAssessment);
+      const item = response?.item;
+      if (item) {
+        setApplications((prev) =>
+          prev.map((application) =>
+            application.id === applicationId ? normalizeApplicationItem({ ...application, ...item }) : application
+          )
+        );
+      }
+      setApplicationsNotice(
+        nextFitAssessment ? `Marked application as "${nextFitAssessment}".` : "Cleared fit assessment."
+      );
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      setUpdatingApplicationFitIds((prev) => ({
+        ...prev,
+        [applicationId]: false
+      }));
+      setOpenApplicationFitForId(null);
+    }
+  }, []);
+
   const handleDeleteApplication = useCallback(async (applicationId) => {
     setDeletingApplicationIds((prev) => ({
       ...prev,
@@ -3841,13 +3876,16 @@ export default function App() {
 
         {applications.map((application) => {
           const statusMenuOpen = openApplicationStatusForId === application.id;
+          const fitMenuOpen = openApplicationFitForId === application.id;
           const isUpdatingStatus = Boolean(updatingApplicationIds[application.id]);
+          const isUpdatingFit = Boolean(updatingApplicationFitIds[application.id]);
           const isDeleting = Boolean(deletingApplicationIds[application.id]);
           const appliedDate = formatApplicationDate(application?.application_date);
           const positionName = sanitizeDisplayText(application?.position_name, "Unknown position");
           const companyName = sanitizeDisplayText(application?.company_name, "Unknown company");
           const appliedByLabel = sanitizeDisplayText(application?.applied_by_label, "Manually applied by user");
           const statusLabel = sanitizeDisplayText(application?.status, "applied");
+          const fitLabel = sanitizeDisplayText(application?.fit_assessment, "");
 
           return (
             <View key={application.id} style={styles.applicationCard}>
@@ -3893,6 +3931,49 @@ export default function App() {
                   ) : null}
                 </View>
 
+                <View style={styles.applicationStatusWrap}>
+                  <Pressable
+                    onPress={() => setOpenApplicationFitForId((prev) => (prev === application.id ? null : application.id))}
+                    disabled={isUpdatingFit}
+                    style={styles.applicationStatusBtn}
+                  >
+                    <Text style={styles.applicationStatusBtnText}>
+                      {isUpdatingFit ? "Updating..." : `Fit: ${fitLabel || "not assessed"}`}
+                    </Text>
+                  </Pressable>
+
+                  {fitMenuOpen ? (
+                    <View style={styles.applicationStatusMenu}>
+                      {APPLICATION_FIT_OPTIONS.map((fitOption) => (
+                        <Pressable
+                          key={`${application.id}-${fitOption}`}
+                          onPress={() => handleUpdateApplicationFit(application.id, fitOption)}
+                          style={[
+                            styles.applicationStatusMenuItem,
+                            application.fit_assessment === fitOption ? styles.applicationStatusMenuItemActive : null
+                          ]}
+                        >
+                          <Text
+                            style={[
+                              styles.applicationStatusMenuItemText,
+                              application.fit_assessment === fitOption ? styles.applicationStatusMenuItemTextActive : null
+                            ]}
+                          >
+                            {fitOption}
+                          </Text>
+                        </Pressable>
+                      ))}
+                      <Pressable
+                        key={`${application.id}-clear-fit`}
+                        onPress={() => handleUpdateApplicationFit(application.id, "")}
+                        style={styles.applicationStatusMenuItem}
+                      >
+                        <Text style={styles.applicationStatusMenuItemText}>Clear</Text>
+                      </Pressable>
+                    </View>
+                  ) : null}
+                </View>
+
                 <Pressable
                   onPress={() => handleDeleteApplication(application.id)}
                   disabled={isDeleting}
@@ -3920,6 +4001,10 @@ export default function App() {
       : [];
     const timeToDenial = applicationStats?.time_to_denial || {};
     const timeToDenialSampleSize = Number(timeToDenial?.sample_size || 0);
+    const byFit = Array.isArray(applicationStats?.by_fit) ? applicationStats.by_fit : [];
+    const jobFitSummary = applicationStats?.job_fit_summary || {};
+    const jobFitSampleSize =
+      Number(jobFitSummary?.denied_sample_size || 0) + Number(jobFitSummary?.not_denied_sample_size || 0);
 
     const statusRows = APPLICATION_STATUS_OPTIONS.map((status) => {
       const count = Number(byStatus[status] || 0);
@@ -3993,6 +4078,50 @@ export default function App() {
                 )}
               </View>
 
+              <View style={styles.performanceSection}>
+                <View style={styles.performanceSectionTitleRow}>
+                  <Text style={styles.performanceSectionTitle}>Job description match</Text>
+                  <Text style={styles.performanceSectionValue}>
+                    {jobFitSampleSize > 0 ? `${jobFitSampleSize} scored` : "0 scored"}
+                  </Text>
+                </View>
+                {jobFitSampleSize > 0 ? (
+                  <>
+                    <View style={styles.performanceMetricGrid}>
+                      <PerformanceMetric
+                        label="Denied applications"
+                        value={
+                          jobFitSummary.denied_avg_match_percent !== null
+                            ? `${Number(jobFitSummary.denied_avg_match_percent).toFixed(0)}% match`
+                            : "no data"
+                        }
+                        hint={`${jobFitSummary.denied_sample_size || 0} scored`}
+                      />
+                      <PerformanceMetric
+                        label="Other applications"
+                        value={
+                          jobFitSummary.not_denied_avg_match_percent !== null
+                            ? `${Number(jobFitSummary.not_denied_avg_match_percent).toFixed(0)}% match`
+                            : "no data"
+                        }
+                        hint={`${jobFitSummary.not_denied_sample_size || 0} scored`}
+                      />
+                    </View>
+                    <Text style={styles.performanceMetricHint}>
+                      Match % is the share of a posting's stated requirements that show up
+                      (by keyword) somewhere in your resume. A denied group scoring much
+                      lower than the rest is a sign those postings were a stretch on paper,
+                      not just an unlucky outcome.
+                    </Text>
+                  </>
+                ) : (
+                  <Text style={styles.performanceEmptyText}>
+                    No application has both a linked posting with a stored description and an
+                    uploaded resume to compare against yet.
+                  </Text>
+                )}
+              </View>
+
               {byCompany.length > 0 ? (
                 <View style={styles.performanceSection}>
                   <Text style={styles.performanceSectionTitle}>Denials by company</Text>
@@ -4011,27 +4140,64 @@ export default function App() {
                 </View>
               ) : null}
 
+              {byFit.length > 0 ? (
+                <View style={styles.performanceSection}>
+                  <Text style={styles.performanceSectionTitle}>Denials by fit assessment</Text>
+                  <View style={styles.performanceHotspotList}>
+                    {byFit.map((row) => (
+                      <View key={row.fit_assessment} style={styles.performanceHotspotRow}>
+                        <Text style={styles.performanceHotspotName} numberOfLines={1}>
+                          {row.fit_assessment}
+                        </Text>
+                        <Text style={styles.performanceHotspotStats}>
+                          {`${row.denied}/${row.total} denied (${Number(row.denial_rate || 0).toFixed(1)}%)`}
+                        </Text>
+                      </View>
+                    ))}
+                  </View>
+                </View>
+              ) : (
+                <Text style={styles.performanceEmptyText}>
+                  Tag applications as good fit / stretch / overqualified / underqualified from
+                  the Applications page to see denial rate broken down by fit here.
+                </Text>
+              )}
+
               {deniedApplications.length > 0 ? (
                 <View style={styles.performanceSection}>
                   <Text style={styles.performanceSectionTitle}>Denied applications</Text>
                   <View style={styles.performanceHotspotList}>
-                    {deniedApplications.map((item) => (
-                      <View key={item.id} style={styles.performanceHotspotRow}>
-                        <View style={styles.performanceWorkerInfo}>
-                          <Text style={styles.performanceHotspotName} numberOfLines={1}>
-                            {`${sanitizeDisplayText(item.position_name, "Unknown position")} — ${sanitizeDisplayText(item.company_name, "Unknown company")}`}
-                          </Text>
-                          <Text style={styles.performanceMetricHint}>
-                            {`Applied ${formatApplicationDate(item.application_date)}`}
+                    {deniedApplications.map((item) => {
+                      const jobFit = item.job_fit || {};
+                      const missingKeywords = Array.isArray(jobFit.unmatched_requirements)
+                        ? jobFit.unmatched_requirements.slice(0, 2)
+                        : [];
+                      const hintParts = [`Applied ${formatApplicationDate(item.application_date)}`];
+                      if (item.fit_assessment) hintParts.push(sanitizeDisplayText(item.fit_assessment, ""));
+                      if (jobFit.match_percent !== null && jobFit.match_percent !== undefined) {
+                        hintParts.push(`${Number(jobFit.match_percent).toFixed(0)}% JD match`);
+                      }
+                      return (
+                        <View key={item.id} style={styles.performanceHotspotRow}>
+                          <View style={styles.performanceWorkerInfo}>
+                            <Text style={styles.performanceHotspotName} numberOfLines={1}>
+                              {`${sanitizeDisplayText(item.position_name, "Unknown position")} — ${sanitizeDisplayText(item.company_name, "Unknown company")}`}
+                            </Text>
+                            <Text style={styles.performanceMetricHint}>{hintParts.join(" · ")}</Text>
+                            {missingKeywords.length > 0 ? (
+                              <Text style={styles.performanceMetricHint} numberOfLines={1}>
+                                {`Unmet: ${missingKeywords.join(" / ")}`}
+                              </Text>
+                            ) : null}
+                          </View>
+                          <Text style={styles.performanceHotspotStats}>
+                            {item.days_to_denial !== null && item.days_to_denial !== undefined
+                              ? formatDaysCompact(item.days_to_denial)
+                              : "time unknown"}
                           </Text>
                         </View>
-                        <Text style={styles.performanceHotspotStats}>
-                          {item.days_to_denial !== null && item.days_to_denial !== undefined
-                            ? formatDaysCompact(item.days_to_denial)
-                            : "time unknown"}
-                        </Text>
-                      </View>
-                    ))}
+                      );
+                    })}
                   </View>
                 </View>
               ) : null}

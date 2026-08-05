@@ -302,6 +302,13 @@ export function updateApplicationStatus(applicationId, status) {
   });
 }
 
+export function updateApplicationFit(applicationId, fitAssessment) {
+  return request(`/applications/${applicationId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ fit_assessment: fitAssessment })
+  });
+}
+
 export function deleteApplication(applicationId) {
   return request(`/applications/${applicationId}`, {
     method: "DELETE"

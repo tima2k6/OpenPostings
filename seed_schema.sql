@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS applications (
 	position_name TEXT NOT NULL,
 	application_date INTEGER NOT NULL,
 	status TEXT
-);
+, job_posting_url TEXT NOT NULL DEFAULT '', fit_assessment TEXT NOT NULL DEFAULT '');
 
 -- application_status_history
 CREATE TABLE IF NOT EXISTS application_status_history (

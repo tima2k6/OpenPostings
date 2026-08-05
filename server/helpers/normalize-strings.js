@@ -7,6 +7,7 @@ const APPLICATION_STATUS_OPTIONS = new Set([
   "withdrawn",
   "denied"
 ]);
+const APPLICATION_FIT_OPTIONS = new Set(["good fit", "stretch", "overqualified", "underqualified"]);
 const DEFAULT_BROWSER_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -234,6 +235,13 @@ function normalizeApplicationStatus(value) {
   return "applied";
 }
 
+// Unlike status, blank is a real value here -- "not yet assessed" -- so anything not in
+// the option set collapses to "" rather than to a guessed default.
+function normalizeApplicationFit(value) {
+  const normalized = normalizeLikeText(value);
+  return APPLICATION_FIT_OPTIONS.has(normalized) ? normalized : "";
+}
+
 function normalizeAppliedByType(value) {
   const normalized = normalizeLikeText(value);
   if (normalized === "ai" || normalized === "agent") return normalized;
@@ -267,4 +275,4 @@ function normalizePostingSort(value) {
 }
 
 
-module.exports = { parseUrl, parseCsvParam, parseJsonArray, escapeRegExp, normalizeGeoText, normalizeStringArray, normalizeSourceUrlString, urljoin, normalizeLikeText, toTitleCase, decodeHtmlEntities, cleanHtmlText, cleanText, toCleanString, stripHtml, extractCompanyNameFromUrlString, extractCookieHeaderFromResponse, decodeBase64Utf8, normalizeApplicationStatus, normalizeAppliedByType, normalizeAppliedByLabel, normalizeIgnoredByLabel, normalizePostingSort, APPLICATION_STATUS_OPTIONS, DEFAULT_BROWSER_USER_AGENT };
+module.exports = { parseUrl, parseCsvParam, parseJsonArray, escapeRegExp, normalizeGeoText, normalizeStringArray, normalizeSourceUrlString, urljoin, normalizeLikeText, toTitleCase, decodeHtmlEntities, cleanHtmlText, cleanText, toCleanString, stripHtml, extractCompanyNameFromUrlString, extractCookieHeaderFromResponse, decodeBase64Utf8, normalizeApplicationStatus, normalizeApplicationFit, normalizeAppliedByType, normalizeAppliedByLabel, normalizeIgnoredByLabel, normalizePostingSort, APPLICATION_STATUS_OPTIONS, APPLICATION_FIT_OPTIONS, DEFAULT_BROWSER_USER_AGENT };

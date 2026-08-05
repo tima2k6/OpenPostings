@@ -1,6 +1,8 @@
-const { normalizeLikeText, normalizeApplicationStatus, normalizeAppliedByType, normalizeAppliedByLabel, APPLICATION_STATUS_OPTIONS } = require("../helpers/normalize-strings");
+const { normalizeLikeText, normalizeApplicationStatus, normalizeApplicationFit, normalizeAppliedByType, normalizeAppliedByLabel, APPLICATION_STATUS_OPTIONS } = require("../helpers/normalize-strings");
 const { parseNonNegativeInteger, nowEpochSeconds } = require("../helpers/normalize-numbers");
 const { markPostingAppliedState } = require("./postings.js");
+const { buildCoverLetterBrief } = require("./cover-letter.js");
+const { getApplicantDocument } = require("./applicant-documents.js");
 const { getDb, setDb, runInWriteTransaction } = require("../services/runtime-context")
 
 async function resolveCompanyIdForApplication(companyName) {
@@ -95,6 +97,8 @@ function mapApplicationRow(row) {
     position_name: String(row?.position_name || "").trim(),
     application_date: Number(row?.application_date || 0),
     status,
+    job_posting_url: String(row?.job_posting_url || "").trim(),
+    fit_assessment: normalizeApplicationFit(row?.fit_assessment),
     applied_by_type: appliedByType,
     applied_by_label: normalizeAppliedByLabel(row?.applied_by_label, appliedByType)
   };
@@ -111,6 +115,8 @@ async function getApplicationById(applicationId) {
         a.position_name,
         a.application_date,
         a.status,
+        a.job_posting_url,
+        a.fit_assessment,
         attr.applied_by_type,
         attr.applied_by_label
       FROM applications a
@@ -143,6 +149,8 @@ async function listApplications(options = {}) {
           a.position_name,
           a.application_date,
           a.status,
+          a.job_posting_url,
+          a.fit_assessment,
           attr.applied_by_type,
           attr.applied_by_label
         FROM applications a
@@ -166,6 +174,8 @@ async function listApplications(options = {}) {
           a.position_name,
           a.application_date,
           a.status,
+          a.job_posting_url,
+          a.fit_assessment,
           attr.applied_by_type,
           attr.applied_by_label
         FROM applications a
@@ -224,6 +234,7 @@ async function createApplication(input) {
   }
 
   const status = normalizeApplicationStatus(input?.status);
+  const fitAssessment = normalizeApplicationFit(input?.fit_assessment);
   const applicationDate = parseNonNegativeInteger(input?.application_date) || nowEpochSeconds();
   const appliedByType = normalizeAppliedByType(input?.applied_by_type);
   const appliedByLabel = normalizeAppliedByLabel(input?.applied_by_label, appliedByType);
@@ -237,12 +248,14 @@ async function createApplication(input) {
           company_name,
           position_name,
           application_date,
-          status
-        ) VALUES (?, ?, ?, ?, ?);
+          status,
+          job_posting_url,
+          fit_assessment
+        ) VALUES (?, ?, ?, ?, ?, ?, ?);
       `,
       // company_id is best-effort now; company_name is what actually has to survive, since
       // an application to an employer outside the crawl table is still an application.
-      [company?.id ?? null, resolvedCompanyName, positionName, applicationDate, status]
+      [company?.id ?? null, resolvedCompanyName, positionName, applicationDate, status, jobPostingUrl, fitAssessment]
     );
 
     await handle.run(
@@ -328,6 +341,25 @@ async function updateApplicationStatus(applicationId, statusValue) {
   });
 
   if (!changed) return null;
+  return getApplicationById(applicationId);
+}
+
+// Empty string is a legitimate value here ("clear the assessment"), so this writes
+// whatever normalizeApplicationFit returns rather than treating a falsy result as "no
+// update" the way updateApplicationStatus would.
+async function updateApplicationFit(applicationId, fitValue) {
+  const fitAssessment = normalizeApplicationFit(fitValue);
+  const db = getDb();
+  const result = await db.run(
+    `
+      UPDATE applications
+      SET fit_assessment = ?
+      WHERE id = ?;
+    `,
+    [fitAssessment, applicationId]
+  );
+
+  if (Number(result?.changes || 0) === 0) return null;
   return getApplicationById(applicationId);
 }
 
@@ -455,6 +487,69 @@ function average(values) {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
+// Reuses the cover-letter brief's requirement extraction and resume-overlap matching
+// (server/services/cover-letter.js) rather than building a second keyword comparison --
+// "does the JD match the resume" is exactly what that module already computes to write a
+// letter, and a requirement with no keyword support in the resume is the same signal
+// whether it feeds a denial dashboard or a cover letter.
+async function computeJobFitByApplicationId(applicationRows) {
+  const db = getDb();
+  const fitByApplicationId = new Map();
+
+  const jobPostingUrls = Array.from(
+    new Set(applicationRows.map((row) => String(row?.job_posting_url || "").trim()).filter(Boolean))
+  );
+
+  const descriptionByUrl = new Map();
+  if (jobPostingUrls.length > 0) {
+    const placeholders = jobPostingUrls.map(() => "?").join(", ");
+    const descriptionRows = await db.all(
+      `SELECT job_posting_url, job_description FROM Postings WHERE job_posting_url IN (${placeholders});`,
+      jobPostingUrls
+    );
+    for (const row of descriptionRows) {
+      descriptionByUrl.set(String(row.job_posting_url || ""), String(row.job_description || ""));
+    }
+  }
+
+  const resumeDocument = await getApplicantDocument("resume");
+  const resumeText = String(resumeDocument?.text || "").trim();
+
+  for (const row of applicationRows) {
+    const applicationId = Number(row?.id || 0);
+    const jobPostingUrl = String(row?.job_posting_url || "").trim();
+    const description = jobPostingUrl ? String(descriptionByUrl.get(jobPostingUrl) || "").trim() : "";
+
+    if (!description || !resumeText) {
+      fitByApplicationId.set(applicationId, {
+        available: false,
+        reason: !jobPostingUrl
+          ? "This application has no linked posting (applied before job_posting_url was tracked, or logged by hand)."
+          : !description
+            ? "No stored job description for this posting."
+            : "No resume uploaded to compare against."
+      });
+      continue;
+    }
+
+    const brief = buildCoverLetterBrief({ description, resume_text: resumeText, posting: row });
+    const requirementsTotal = brief.requirements.length;
+    const requirementsUnmatched = brief.unmatched_requirements.length;
+
+    fitByApplicationId.set(applicationId, {
+      available: requirementsTotal > 0,
+      reason: requirementsTotal > 0 ? null : "Description had no detectable requirements section.",
+      requirements_total: requirementsTotal,
+      requirements_matched: Math.max(0, requirementsTotal - requirementsUnmatched),
+      match_percent: requirementsTotal > 0 ? ((requirementsTotal - requirementsUnmatched) / requirementsTotal) * 100 : null,
+      unmatched_requirements: brief.unmatched_requirements.slice(0, 5),
+      overlap_terms: brief.overlap_terms.slice(0, 10).map((entry) => entry.term)
+    });
+  }
+
+  return fitByApplicationId;
+}
+
 function median(values) {
   if (values.length === 0) return null;
   const sorted = [...values].sort((a, b) => a - b);
@@ -471,12 +566,16 @@ async function getApplicationDenialStats() {
         COALESCE(NULLIF(TRIM(c.company_name), ''), a.company_name) AS company_name,
         a.position_name,
         a.application_date,
-        a.status
+        a.status,
+        a.job_posting_url,
+        a.fit_assessment
       FROM applications a
       LEFT JOIN companies c
         ON c.id = a.company_id;
     `
   );
+
+  const jobFitByApplicationId = await computeJobFitByApplicationId(rows);
 
   // Only a transition with a real previous_status marks an observed denial moment --
   // the seed row every application gets (previous_status NULL) is a backfilled stand-in
@@ -500,8 +599,10 @@ async function getApplicationDenialStats() {
   }
 
   const companyTotals = new Map();
+  const fitTotals = new Map();
   const deniedApplications = [];
   const daysToDenialSamples = [];
+  const matchPercentByOutcome = { denied: [], not_denied: [] };
 
   let total = 0;
   let other = 0;
@@ -514,15 +615,29 @@ async function getApplicationDenialStats() {
     } else {
       other += 1;
     }
+    const isDenied = bucket === "denied";
 
     const companyName = String(row?.company_name || "").trim() || "Unknown company";
     const companyEntry = companyTotals.get(companyName) || { company_name: companyName, total: 0, denied: 0 };
     companyEntry.total += 1;
-    if (bucket === "denied") companyEntry.denied += 1;
+    if (isDenied) companyEntry.denied += 1;
     companyTotals.set(companyName, companyEntry);
 
-    if (bucket === "denied") {
-      const applicationId = Number(row?.id || 0);
+    const fitAssessment = normalizeApplicationFit(row?.fit_assessment);
+    if (fitAssessment) {
+      const fitEntry = fitTotals.get(fitAssessment) || { fit_assessment: fitAssessment, total: 0, denied: 0 };
+      fitEntry.total += 1;
+      if (isDenied) fitEntry.denied += 1;
+      fitTotals.set(fitAssessment, fitEntry);
+    }
+
+    const applicationId = Number(row?.id || 0);
+    const jobFit = jobFitByApplicationId.get(applicationId) || { available: false };
+    if (jobFit.match_percent !== null && jobFit.match_percent !== undefined) {
+      matchPercentByOutcome[isDenied ? "denied" : "not_denied"].push(jobFit.match_percent);
+    }
+
+    if (isDenied) {
       const applicationDate = Number(row?.application_date || 0);
       const deniedAtEpoch = deniedAtByApplicationId.get(applicationId) ?? null;
       const daysToDenial =
@@ -537,7 +652,9 @@ async function getApplicationDenialStats() {
         position_name: String(row?.position_name || "").trim() || "Unknown position",
         application_date: applicationDate,
         denied_at_epoch: deniedAtEpoch,
-        days_to_denial: daysToDenial
+        days_to_denial: daysToDenial,
+        fit_assessment: fitAssessment,
+        job_fit: jobFit
       });
     }
   }
@@ -550,6 +667,10 @@ async function getApplicationDenialStats() {
     .map((entry) => ({ ...entry, denial_rate: entry.total > 0 ? (entry.denied / entry.total) * 100 : 0 }))
     .sort((a, b) => b.denied - a.denied || b.total - a.total || a.company_name.localeCompare(b.company_name));
 
+  const byFit = Array.from(fitTotals.values())
+    .map((entry) => ({ ...entry, denial_rate: entry.total > 0 ? (entry.denied / entry.total) * 100 : 0 }))
+    .sort((a, b) => b.denied - a.denied || b.total - a.total);
+
   deniedApplications.sort((a, b) => b.application_date - a.application_date);
 
   return {
@@ -559,13 +680,20 @@ async function getApplicationDenialStats() {
     by_status: byStatus,
     other,
     by_company: byCompany,
+    by_fit: byFit,
     denied_applications: deniedApplications,
     time_to_denial: {
       average_days: average(daysToDenialSamples),
       median_days: median(daysToDenialSamples),
       sample_size: daysToDenialSamples.length
+    },
+    job_fit_summary: {
+      denied_avg_match_percent: average(matchPercentByOutcome.denied),
+      denied_sample_size: matchPercentByOutcome.denied.length,
+      not_denied_avg_match_percent: average(matchPercentByOutcome.not_denied),
+      not_denied_sample_size: matchPercentByOutcome.not_denied.length
     }
   };
 }
 
-module.exports = { resolveCompanyIdForApplication, resolveCompanyIdFromPostingUrl, getExistingAppliedApplicationByPostingUrl, listApplications, createApplication, updateApplicationStatus, deleteApplicationById, getApplicationDenialStats };
+module.exports = { resolveCompanyIdForApplication, resolveCompanyIdFromPostingUrl, getExistingAppliedApplicationByPostingUrl, listApplications, createApplication, updateApplicationStatus, updateApplicationFit, deleteApplicationById, getApplicationDenialStats };

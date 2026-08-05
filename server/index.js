@@ -77,7 +77,7 @@ const { parseTaleoCompany } = require("./ats/taleonet/service.js");
 // import helpers
 const { nowEpochSeconds, parseNonNegativeInteger, normalizeBoolean, normalizePayFilterNumber, getPostingFreshnessWindowSeconds } = require("./helpers/normalize-numbers.js");
 const { inferAtsFromJobPostingUrl, normalizeAtsFilterValue, ATS_FILTER_OPTIONS, ATS_FILTER_OPTION_ITEMS } = require("./helpers/normalize-ats.js");
-const { parseCsvParam, normalizeStringArray, normalizeSourceUrlString, APPLICATION_STATUS_OPTIONS } = require("./helpers/normalize-strings.js");
+const { parseCsvParam, normalizeStringArray, normalizeSourceUrlString, APPLICATION_STATUS_OPTIONS, APPLICATION_FIT_OPTIONS } = require("./helpers/normalize-strings.js");
 const { normalizeRemoteFilter } = require("./helpers/description-filters.js");
 const { MCP_SETTINGS_DEFAULTS } = require("./helpers/normalize-mcp-settings.js")
 
@@ -88,7 +88,7 @@ const { ensurePersonalInformationTable, getPersonalInformation, upsertPersonalIn
 const { upsertSeededCompanySource } = require("./services/seeded-source.js");
 const { getMcpSettings, upsertMcpSettings, buildMcpRunbook } = require("./services/mcp.js");
 const { buildCoverLetterDraft, buildCoverLetterBrief } = require("./services/cover-letter.js");
-const { listApplications, createApplication, updateApplicationStatus, deleteApplicationById, getApplicationDenialStats } = require("./services/applications.js");
+const { listApplications, createApplication, updateApplicationStatus, updateApplicationFit, deleteApplicationById, getApplicationDenialStats } = require("./services/applications.js");
 const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable, ensurePostingLocationStateIndex, startSyncStallWatchdog, getSyncCoverageStats, getLastSyncWriteEpoch } = require("./services/sync-runtime.js");
 const {
   startEnrichmentLoops,
@@ -1207,6 +1207,19 @@ async function ensureApplicationsTable() {
   if (!applicationColumnNames.has("company_name")) {
     await db.exec(`ALTER TABLE applications ADD COLUMN company_name TEXT NOT NULL DEFAULT '';`);
   }
+  // Recorded so a denial dashboard can pull the posting's job_description back up later --
+  // previously job_posting_url was only ever used transiently at creation (to resolve the
+  // company and update posting_application_state) and then discarded, so there was no way
+  // to go from an existing application back to what it was actually applied to.
+  if (!applicationColumnNames.has("job_posting_url")) {
+    await db.exec(`ALTER TABLE applications ADD COLUMN job_posting_url TEXT NOT NULL DEFAULT '';`);
+  }
+  // A user's own read on how the role matched them -- independent of the posting/resume
+  // keyword comparison, since "overqualified" or "stretch" is a judgment the applicant
+  // makes, not something derivable from text overlap.
+  if (!applicationColumnNames.has("fit_assessment")) {
+    await db.exec(`ALTER TABLE applications ADD COLUMN fit_assessment TEXT NOT NULL DEFAULT '';`);
+  }
   const companyIdIsRequired = applicationColumns.some(
     (column) => String(column?.name) === "company_id" && Number(column?.notnull) === 1
   );
@@ -1220,13 +1233,16 @@ async function ensureApplicationsTable() {
           company_name TEXT NOT NULL DEFAULT '',
           position_name TEXT NOT NULL,
           application_date INTEGER NOT NULL,
-          status TEXT
+          status TEXT,
+          job_posting_url TEXT NOT NULL DEFAULT '',
+          fit_assessment TEXT NOT NULL DEFAULT ''
         );
-        INSERT INTO applications_migrated (id, company_id, company_name, position_name, application_date, status)
+        INSERT INTO applications_migrated (id, company_id, company_name, position_name, application_date, status, job_posting_url, fit_assessment)
         SELECT a.id, a.company_id,
                CASE WHEN TRIM(COALESCE(a.company_name, '')) <> '' THEN a.company_name
                     ELSE COALESCE(c.company_name, '') END,
-               a.position_name, a.application_date, a.status
+               a.position_name, a.application_date, a.status,
+               COALESCE(a.job_posting_url, ''), COALESCE(a.fit_assessment, '')
         FROM applications a
         LEFT JOIN companies c ON c.id = a.company_id;
         DROP TABLE applications;
@@ -1250,6 +1266,25 @@ async function ensureApplicationsTable() {
     WHERE NOT EXISTS (
       SELECT 1 FROM application_status_history h WHERE h.application_id = a.id
     );
+  `);
+
+  // job_posting_url is only recorded going forward (see createApplication), so existing
+  // applications get it filled in from the one place that already tracked the link:
+  // posting_application_state.last_application_id. That pointer only ever names the most
+  // recent application against a posting, so an application superseded by a later
+  // re-application to the same posting is not recoverable here and is left blank.
+  await db.run(`
+    UPDATE applications
+    SET job_posting_url = (
+      SELECT p.job_posting_url
+      FROM posting_application_state p
+      WHERE p.last_application_id = applications.id
+      LIMIT 1
+    )
+    WHERE TRIM(COALESCE(job_posting_url, '')) = ''
+      AND EXISTS (
+        SELECT 1 FROM posting_application_state p WHERE p.last_application_id = applications.id
+      );
   `);
 
   if (mcpSettingsColumnNames.has("agent_login_password")) {
@@ -2372,7 +2407,8 @@ function createServer() {
 
     res.json({
       ...payload,
-      status_options: Array.from(APPLICATION_STATUS_OPTIONS)
+      status_options: Array.from(APPLICATION_STATUS_OPTIONS),
+      fit_options: Array.from(APPLICATION_FIT_OPTIONS)
     });
   });
 
@@ -2421,12 +2457,34 @@ function createServer() {
       });
     }
 
-    const item = await updateApplicationStatus(applicationId, req.body?.status);
-    if (!item) {
-      return res.status(404).json({
+    const body = req.body || {};
+    const hasStatus = Object.prototype.hasOwnProperty.call(body, "status");
+    const hasFitAssessment = Object.prototype.hasOwnProperty.call(body, "fit_assessment");
+    if (!hasStatus && !hasFitAssessment) {
+      return res.status(400).json({
         ok: false,
-        error: "application not found"
+        error: "status or fit_assessment is required"
       });
+    }
+
+    let item = null;
+    if (hasStatus) {
+      item = await updateApplicationStatus(applicationId, body.status);
+      if (!item) {
+        return res.status(404).json({
+          ok: false,
+          error: "application not found"
+        });
+      }
+    }
+    if (hasFitAssessment) {
+      item = await updateApplicationFit(applicationId, body.fit_assessment);
+      if (!item) {
+        return res.status(404).json({
+          ok: false,
+          error: "application not found"
+        });
+      }
     }
 
     return res.json({
