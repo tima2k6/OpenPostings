@@ -132,10 +132,14 @@ const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS || 10 * 60 * 1000);
 // itself back down. A connection that briefly holds an older snapshot open (an MCP client,
 // a slow reader) can let the WAL grow all the way to journal_size_limit, and once nothing is
 // left to reclaim it just sits at that size forever -- every later read and write pays the
-// cost of a much bigger file with nothing gained. A periodic TRUNCATE checkpoint is safe to
-// call at any time: if something still holds an old snapshot it just reports busy and does
-// nothing, so this cannot make anything worse than not calling it at all.
+// cost of a much bigger file with nothing gained. A periodic TRUNCATE checkpoint reclaims
+// it: when it can't get the lock it just reports busy and no-ops, so the checkpoint attempt
+// itself is harmless -- but see the comment in initDb() on walCheckpointDb for why it must
+// not run on the shared write connection despite that.
 const WAL_CHECKPOINT_TRUNCATE_INTERVAL_MS = Number(process.env.WAL_CHECKPOINT_TRUNCATE_INTERVAL_MS || 5 * 60 * 1000);
+// Opened lazily in initDb(). Kept off the shared write connection deliberately -- see the
+// comment on startWalCheckpointTruncateTask for why sharing it caused SQLITE_BUSY elsewhere.
+let walCheckpointDb = null;
 
 
 
@@ -608,6 +612,22 @@ async function initDb() {
     console.log("[OpenPostings API] reader connection open (app reads do not queue behind sync writes)");
   } catch (error) {
     console.error("[OpenPostings API] reader connection unavailable, falling back to the shared one:", error?.message || error);
+  }
+
+  // A third connection, dedicated to the periodic WAL truncate checkpoint below. TRUNCATE
+  // mode needs to briefly block new writers while it acquires the checkpoint lock, and it
+  // retries for as long as its connection's busy_timeout allows -- if it ran on the shared
+  // write connection (30s busy_timeout), it queued up behind every other statement on that
+  // connection and every statement after it queued up behind the checkpoint's own retry
+  // loop, which is exactly the shape of the SQLITE_BUSY failures the sync's flush started
+  // hitting. Its own busy_timeout is short on purpose: a checkpoint that cannot get the
+  // lock quickly should skip this round and try again next interval, not hold anything up.
+  try {
+    walCheckpointDb = await openDatabase({ filename: DB_PATH });
+    await walCheckpointDb.exec("PRAGMA busy_timeout = 200;");
+  } catch (error) {
+    console.error("[OpenPostings API] WAL checkpoint connection unavailable, periodic truncation disabled:", error?.message || error);
+    walCheckpointDb = null;
   }
 
   const db = getDb();
@@ -2340,12 +2360,13 @@ function createServer() {
 
 // See WAL_CHECKPOINT_TRUNCATE_INTERVAL_MS above for why this exists: PASSIVE auto-checkpoints
 // reclaim WAL content but never shrink the file, so this is what actually bounds it back down.
+// Runs on walCheckpointDb, not the shared write connection -- see the comment where that
+// connection is opened in initDb().
 function startWalCheckpointTruncateTask() {
   const timer = setInterval(async () => {
     try {
-      const db = getDb();
-      if (!db) return;
-      await db.all("PRAGMA wal_checkpoint(TRUNCATE);");
+      if (!walCheckpointDb) return;
+      await walCheckpointDb.all("PRAGMA wal_checkpoint(TRUNCATE);");
     } catch (error) {
       console.error("[OpenPostings API] periodic WAL truncate checkpoint failed:", error?.message || error);
     }
