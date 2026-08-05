@@ -347,8 +347,9 @@ export function uploadApplicantDocument(payload) {
   });
 }
 
-export function fetchErrors(includeAcknowledged = false) {
-  return request(`/errors?limit=50&include_acknowledged=${includeAcknowledged ? "1" : "0"}`);
+export function fetchErrors(includeAcknowledged = false, sources = null) {
+  const sourceParam = Array.isArray(sources) && sources.length > 0 ? `&sources=${sources.join(",")}` : "";
+  return request(`/errors?limit=50&include_acknowledged=${includeAcknowledged ? "1" : "0"}${sourceParam}`);
 }
 
 export function acknowledgeErrors(ids) {

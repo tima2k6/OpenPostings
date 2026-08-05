@@ -2125,9 +2125,14 @@ export default function App() {
     }
   }, []);
 
+  // Scoped to application-submission failures ("api": POST /applications, "mcp": the agent's
+  // record_application_result) -- this banner is the Applications page's, not a general error
+  // feed. "sync" and "health" sourced rows are operational/infra warnings (WAL, host memory,
+  // wide-scan queue depth) surfaced on the Scraper Performance page instead; showing them here
+  // too just confused a page about tracking applications with an unrelated system warning.
   const loadSystemErrors = useCallback(async () => {
     try {
-      const response = await fetchErrors(false);
+      const response = await fetchErrors(false, ["api", "mcp"]);
       setSystemErrors(Array.isArray(response?.items) ? response.items : []);
     } catch {
       // A server too old or too broken to report errors must not itself break the page.

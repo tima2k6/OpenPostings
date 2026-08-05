@@ -115,11 +115,42 @@ async function testAcknowledgeHidesButKeeps() {
   assert.ok(withHistory.items.every((item) => item.acknowledged));
 }
 
+// Regression: a health/infra warning (source "health", e.g. the swap-usage watch check)
+// once showed up in the Applications page's error banner, which reads this same table but
+// exists to surface application-submission failures ("api", "mcp"). The banner now asks for
+// those sources explicitly, so this pins the filter it depends on.
+async function testSourcesFilterScopesToTheCallersConcern() {
+  await recordError({ source: "health", operation: "watch:swap_used", message: "swap high" });
+  await recordError({ source: "api", operation: "POST /applications", message: "could not log" });
+
+  const applicationsOnly = await listErrors({ sources: ["api", "mcp"] });
+  assert.ok(
+    applicationsOnly.items.every((item) => item.source === "api" || item.source === "mcp"),
+    "a health-sourced row must not appear when the caller asked for application sources only"
+  );
+  assert.ok(
+    applicationsOnly.items.some((item) => item.operation === "POST /applications"),
+    "the actual application failure must still appear"
+  );
+  assert.strictEqual(
+    applicationsOnly.unacknowledged_count,
+    applicationsOnly.items.length,
+    "the unacknowledged count must be scoped by the same filter, not the whole table"
+  );
+
+  const unfiltered = await listErrors({});
+  assert.ok(
+    unfiltered.items.some((item) => item.source === "health"),
+    "omitting sources must still return everything for a caller that wants the whole log"
+  );
+}
+
 async function main() {
   await withDb(async () => {
     await testRecordsWhatIsNeededToRecoverByHand();
     await testSurvivesTheRollbackItReports();
     await testNeverThrows();
+    await testSourcesFilterScopesToTheCallersConcern();
     await testAcknowledgeHidesButKeeps();
   });
   console.log("error-log tests passed");

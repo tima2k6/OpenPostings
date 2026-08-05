@@ -89,17 +89,30 @@ function mapRow(row) {
   };
 }
 
-async function listErrors({ limit = 50, include_acknowledged = false } = {}) {
+// `sources` scopes the result to a caller's concern -- the error_log table is shared by
+// application-submission failures ("api", "mcp") and operational/infra warnings ("sync",
+// "health"), and a caller for one must not surface the other. Omitting it returns everything,
+// for callers (or ad-hoc inspection) that genuinely want the whole log.
+async function listErrors({ limit = 50, include_acknowledged = false, sources = null } = {}) {
   await ensureErrorLogTable();
   const db = getDb();
   const bounded = Math.max(1, Math.min(500, Number(limit) || 50));
+  const sourceList = Array.isArray(sources)
+    ? sources.map((value) => String(value || "").trim()).filter(Boolean)
+    : [];
+  const sourceClause = sourceList.length > 0
+    ? `AND source IN (${sourceList.map(() => "?").join(", ")})`
+    : "";
   const rows = await db.all(
     include_acknowledged
-      ? `SELECT * FROM error_log ORDER BY occurred_at_epoch DESC, id DESC LIMIT ?;`
-      : `SELECT * FROM error_log WHERE acknowledged = 0 ORDER BY occurred_at_epoch DESC, id DESC LIMIT ?;`,
-    [bounded]
+      ? `SELECT * FROM error_log WHERE 1 = 1 ${sourceClause} ORDER BY occurred_at_epoch DESC, id DESC LIMIT ?;`
+      : `SELECT * FROM error_log WHERE acknowledged = 0 ${sourceClause} ORDER BY occurred_at_epoch DESC, id DESC LIMIT ?;`,
+    [...sourceList, bounded]
   );
-  const unacknowledged = await db.get(`SELECT COUNT(*) AS n FROM error_log WHERE acknowledged = 0;`);
+  const unacknowledged = await db.get(
+    `SELECT COUNT(*) AS n FROM error_log WHERE acknowledged = 0 ${sourceClause};`,
+    sourceList
+  );
   return {
     items: rows.map(mapRow),
     unacknowledged_count: Number(unacknowledged?.n || 0)

@@ -2088,9 +2088,14 @@ function createServer() {
   // count so a lost application cannot pass unnoticed the way the Amazon ones did.
   app.get("/errors", async (req, res) => {
     try {
+      const sources = String(req.query.sources || "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
       res.json(await listErrors({
         limit: parseNonNegativeInteger(req.query.limit) || 50,
-        include_acknowledged: normalizeBoolean(req.query.include_acknowledged, false)
+        include_acknowledged: normalizeBoolean(req.query.include_acknowledged, false),
+        sources: sources.length > 0 ? sources : null
       }));
     } catch (error) {
       res.status(500).json({ error: String(error?.message || error) });
