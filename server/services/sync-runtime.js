@@ -1699,12 +1699,36 @@ async function upsertPostingsBatch(postings, seenEpoch) {
   });
 }
 
+function isBusyPostingStorageError(error) {
+  return /SQLITE_BUSY/i.test(String(error?.message || error || ""));
+}
+
+// The connection's own busy_timeout (30s, see initDb) already retries internally before
+// this ever sees SQLITE_BUSY, so a collision that reaches here means something held the
+// write lock for the full 30s -- historically the periodic WAL TRUNCATE checkpoint on a
+// multi-GB database (see the comment on WAL_CHECKPOINT_PASSIVE_INTERVAL_MS in index.js).
+// That checkpoint now runs far less often and does far less work per run, so a collision
+// that does happen should clear within moments. One short-delay retry catches that case
+// instead of unconditionally dropping the batch; a second failure still falls through to
+// the existing "log it, drop it, let the next pass re-crawl these" handling below.
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function upsertPostings(postings, lastSeenEpoch) {
   if (!Array.isArray(postings) || postings.length === 0) return { inserted: 0, refreshed: 0 };
   const seenEpoch = Number(lastSeenEpoch || nowEpochSeconds());
   try {
     return await upsertPostingsBatch(postings, seenEpoch);
   } catch (error) {
+    if (isBusyPostingStorageError(error)) {
+      await sleep(500);
+      try {
+        return await upsertPostingsBatch(postings, seenEpoch);
+      } catch (retryError) {
+        error = retryError;
+      }
+    }
     if (!isRecoverablePostingStorageError(error)) {
       throw error;
     }

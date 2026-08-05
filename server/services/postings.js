@@ -187,6 +187,48 @@ function buildCandidatePrefilter({ searchTerms, payMinFilter, payMaxFilter, payP
   return { sql: clauses.join("\n"), params };
 }
 
+// Resumes the wide-scan candidate walk without SQL OFFSET. OFFSET has no bookmark: every
+// chunk call re-walks the ordering index from the start and re-discards everything before
+// it, so cost compounds across chunks whenever the JS-only filters don't converge in the
+// first one or two -- confirmed against production data (states=WA + review_queue=new),
+// this turned a 6s single scan into 45s of paging and is what was timing out real requests.
+// A `WHERE (sort key) < (last cursor)` predicate lets SQLite resume through the same
+// ordering index where the previous chunk stopped, so total cost across every chunk stays
+// proportional to the candidates scanned once, not to chunk_count * rows_already_skipped.
+function buildSeekPredicate(sortBy, cursor) {
+  if (!cursor) return { sql: "", params: [] };
+  if (sortBy === "company_asc") {
+    return {
+      sql: `AND (
+        p.company_name > ?
+        OR (p.company_name = ? AND p.position_name > ?)
+        OR (p.company_name = ? AND p.position_name = ? AND p.id > ?)
+      )`,
+      params: [
+        cursor.company_name, cursor.company_name, cursor.position_name,
+        cursor.company_name, cursor.position_name, cursor.id
+      ]
+    };
+  }
+  const column = sortBy === "first_seen_desc" ? "first_seen_epoch" : "last_seen_epoch";
+  return {
+    sql: `AND (
+      p.${column} < ?
+      OR (p.${column} = ? AND p.id < ?)
+    )`,
+    params: [cursor[column], cursor[column], cursor.id]
+  };
+}
+
+function extractSeekCursor(sortBy, row) {
+  if (!row) return null;
+  if (sortBy === "company_asc") {
+    return { company_name: row.company_name, position_name: row.position_name, id: row.id };
+  }
+  const column = sortBy === "first_seen_desc" ? "first_seen_epoch" : "last_seen_epoch";
+  return { [column]: row[column], id: row.id };
+}
+
 function formatEpochDateLabel(epochValue) {
   const epoch = Number(epochValue);
   if (!Number.isFinite(epoch) || epoch <= 0) return "";
@@ -671,6 +713,14 @@ async function listPostingsWithFilters(options = {}) {
     const reviewVisibilityParams = reviewQueue === "shortlisted" || reviewQueue === "reviewed"
       ? []
       : [freshnessCutoffEpoch];
+    // company_asc has no id tiebreak in getPostingsOrderByClause because the bounded (cheap)
+    // branch never needs one -- a single query with its own OFFSET is internally consistent
+    // either way. The wide-scan walk below resumes the same order across many separate
+    // queries, so ties between company_name+position_name have to be broken the same way
+    // every time or a row can be skipped or repeated at the chunk boundary.
+    const wideScanOrderByClause = sortBy === "company_asc"
+      ? "company_name ASC, position_name ASC, id ASC"
+      : orderByClause;
     candidateQuery = {
       sql: `
         SELECT p.id, p.company_name, p.position_name, p.job_posting_url, p.posting_date,
@@ -690,9 +740,11 @@ async function listPostingsWithFilters(options = {}) {
         )
         ${reviewStateSql}
         ${prefilter.sql}
-        ORDER BY ${orderByClause}
+        __SEEK_PREDICATE__
+        ORDER BY ${wideScanOrderByClause}
       `,
-      params: [...reviewVisibilityParams, ...prefilter.params]
+      params: [...reviewVisibilityParams, ...prefilter.params],
+      sortBy
     };
   }
 
@@ -924,20 +976,24 @@ async function listPostingsWithFilters(options = {}) {
     // predicates. On the production database that meant hundreds of MB per request and a
     // queue of already-timed-out scans. Walk the same stable ordering in bounded chunks and
     // stop once this page is full. Results and offset semantics stay the same; peak memory
-    // is now proportional to the chunk rather than to the database.
+    // is now proportional to the chunk rather than to the database. Chunks are resumed with
+    // a seek predicate (see buildSeekPredicate), not OFFSET -- OFFSET re-walks from the start
+    // of the index on every call, which made this loop quadratic whenever the JS-only filters
+    // didn't converge in the first chunk or two.
     const targetMatchCount = offset + limit;
     const chunkSize = Math.max(250, Math.min(1000, limit * 4));
     const matchingRows = [];
-    let candidateOffset = 0;
+    let cursor = null;
 
     while (matchingRows.length < targetMatchCount) {
       throwIfAborted(signal);
+      const seek = buildSeekPredicate(candidateQuery.sortBy, cursor);
       const candidateRows = await db.all(
-        `${candidateQuery.sql} LIMIT ? OFFSET ?;`,
-        [...candidateQuery.params, chunkSize, candidateOffset]
+        `${candidateQuery.sql.replace("__SEEK_PREDICATE__", seek.sql)} LIMIT ?;`,
+        [...candidateQuery.params, ...seek.params, chunkSize]
       );
       if (candidateRows.length === 0) break;
-      candidateOffset += candidateRows.length;
+      cursor = extractSeekCursor(candidateQuery.sortBy, candidateRows[candidateRows.length - 1]);
 
       const filteredRows = await prepareCandidateRows(candidateRows);
       const remaining = targetMatchCount - matchingRows.length;

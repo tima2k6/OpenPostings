@@ -409,9 +409,10 @@ async function testFilteredPageStopsAfterBoundedChunk() {
     let largestCandidateBatch = 0;
     db.all = async (sql, ...params) => {
       const result = await originalAll(sql, ...params);
-      if (/FROM Postings p[\s\S]*ORDER BY[\s\S]*LIMIT \? OFFSET \?/i.test(String(sql))) {
+      if (/FROM Postings p[\s\S]*ORDER BY[\s\S]*LIMIT \?;?$/i.test(String(sql).trim())) {
         candidateQueryCalls += 1;
         largestCandidateBatch = Math.max(largestCandidateBatch, result.length);
+        assert.ok(!/OFFSET/i.test(String(sql)), "the candidate walk must resume via a seek predicate, not OFFSET");
       }
       return result;
     };
@@ -422,6 +423,49 @@ async function testFilteredPageStopsAfterBoundedChunk() {
     assert.ok(
       largestCandidateBatch <= 250,
       `a filtered request must not materialize the whole candidate set (saw ${largestCandidateBatch})`
+    );
+  });
+}
+
+// Regression for the OFFSET->seek rewrite: candidates whose true match sits deep in the
+// scan (past several chunk boundaries) must still be found, and must not be skipped or
+// duplicated at a chunk boundary or across two separate paginated requests. Every posting
+// here has an empty stored location, so the SQL pre-filter admits all 600 as candidates
+// (the same bypass real Workday-style postings rely on) and only the JS-side location check
+// -- driven by the runtime map, invisible to SQL -- narrows it down. The 4 real matches are
+// seeded at the lowest ids, which the default sort returns last, forcing the walk through
+// nearly the whole 600-row candidate set across multiple chunkSize=250 chunks before it
+// finds any of them.
+async function testSeekPaginationFindsMatchesAcrossChunkBoundaries() {
+  const postings = Array.from({ length: 600 }, (_, index) => ({
+    url: `https://x/seek-${index}`,
+    position: `Engineer ${index}`
+    // location left undefined -> stored NULL, admitted by the search pre-filter's bypass.
+  }));
+  await withDb(postings, async () => {
+    const locationByUrl = new Map();
+    for (let index = 0; index < 600; index += 1) {
+      locationByUrl.set(
+        `https://x/seek-${index}`,
+        index < 4 ? "Reykjavik, Iceland" : "Denver, CO"
+      );
+    }
+    setPostingLocationByJobUrl(locationByUrl);
+
+    const full = await listPostingsWithFilters({ search: "reykjavik", limit: 500 });
+    assert.strictEqual(full.count, 4, "all four deep matches must be found, none skipped");
+    assert.deepStrictEqual(
+      urlsOf(full),
+      ["https://x/seek-0", "https://x/seek-1", "https://x/seek-2", "https://x/seek-3"]
+    );
+
+    const page1 = await listPostingsWithFilters({ search: "reykjavik", limit: 2, offset: 0 });
+    const page2 = await listPostingsWithFilters({ search: "reykjavik", limit: 2, offset: 2 });
+    const combined = [...urlsOf(page1), ...urlsOf(page2)].sort();
+    assert.deepStrictEqual(
+      combined,
+      ["https://x/seek-0", "https://x/seek-1", "https://x/seek-2", "https://x/seek-3"],
+      "paging across two separate requests must cover every match exactly once"
     );
   });
 }
@@ -453,6 +497,7 @@ async function main() {
   await testStateProjectionKeepsSecondaryLocations();
   await testFilteredRowsCarryDisplayFields();
   await testFilteredPageStopsAfterBoundedChunk();
+  await testSeekPaginationFindsMatchesAcrossChunkBoundaries();
   await testAbortedFilteredRequestNeverEntersQueue();
   console.log("posting-filter-pushdown tests passed");
 }

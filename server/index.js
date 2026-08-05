@@ -136,9 +136,118 @@ const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS || 10 * 60 * 1000);
 // it: when it can't get the lock it just reports busy and no-ops, so the checkpoint attempt
 // itself is harmless -- but see the comment in initDb() on walCheckpointDb for why it must
 // not run on the shared write connection despite that.
+//
+// TRUNCATE (and FULL/RESTART) checkpoints block new writers for as long as the copy of
+// outstanding WAL frames into the main file takes -- not just to acquire the lock, per
+// https://www.sqlite.org/c3ref/wal_checkpoint_v2.html. On a multi-GB database under real
+// disk contention that copy can itself run past the sync writer's 30s busy_timeout, which
+// is what dropped 100-1200 postings at a time even after this connection was split out.
+// PASSIVE never blocks and never invokes a busy handler -- it opportunistically checkpoints
+// whatever it can concurrently with every other connection -- so running it often keeps the
+// WAL small in small, harmless increments. That shrinks how much work is left for the rare
+// blocking TRUNCATE, which only needs to run at all when PASSIVE couldn't keep up.
+const WAL_CHECKPOINT_PASSIVE_INTERVAL_MS = Number(process.env.WAL_CHECKPOINT_PASSIVE_INTERVAL_MS || 30 * 1000);
 const WAL_CHECKPOINT_TRUNCATE_INTERVAL_MS = Number(process.env.WAL_CHECKPOINT_TRUNCATE_INTERVAL_MS || 5 * 60 * 1000);
+// Below this, TRUNCATE has nothing meaningful to reclaim -- skip the blocking attempt
+// entirely rather than risk a collision for no gain.
+const WAL_CHECKPOINT_TRUNCATE_MIN_WAL_BYTES = Number(
+  process.env.WAL_CHECKPOINT_TRUNCATE_MIN_WAL_BYTES || 8 * 1024 * 1024
+);
+
+// Leading indicators for the failure modes that have actually hit this app before: a WAL
+// the periodic checkpoint can't keep up with, the wide-scan queue backing up as the active
+// posting set grows, and host memory pressure (swap, RSS approaching the systemd
+// MemoryHigh ceiling) that stalls the process without any single request being at fault.
+// None of these are checked against by throwing -- they are watch thresholds, tuned above
+// the normal churn a healthy pass produces, so a poll of /sync/status can surface them
+// early instead of waiting for a client timeout to notice.
+const WAL_SIZE_WARNING_BYTES = Number(process.env.WAL_SIZE_WARNING_BYTES || 256 * 1024 * 1024);
+const FILTERED_QUERY_QUEUE_WARNING_DEPTH = Number(process.env.FILTERED_QUERY_QUEUE_WARNING_DEPTH || 3);
+const SWAP_USED_WARNING_MB = Number(process.env.SWAP_USED_WARNING_MB || 512);
+const PROCESS_RSS_WARNING_MB = Number(process.env.PROCESS_RSS_WARNING_MB || 3584);
+
+function getWalSizeBytes() {
+  try {
+    return fs.statSync(`${DB_PATH}-wal`).size;
+  } catch {
+    return 0;
+  }
+}
+
+// Linux-only (the /proc filesystem doesn't exist on the macOS/Windows desktop builds this
+// same server code ships in) -- returns null rather than throwing when it's unavailable.
+function getHostMemorySnapshot() {
+  try {
+    if (process.platform !== "linux" || !fs.existsSync("/proc/meminfo")) return null;
+    const meminfo = fs.readFileSync("/proc/meminfo", "utf8");
+    const readKb = (label) => {
+      const match = meminfo.match(new RegExp(`^${label}:\\s+(\\d+)\\s*kB`, "m"));
+      return match ? Number(match[1]) * 1024 : null;
+    };
+    const swapTotal = readKb("SwapTotal");
+    const swapFree = readKb("SwapFree");
+    const memAvailable = readKb("MemAvailable");
+    if (swapTotal === null || swapFree === null) return null;
+    return {
+      swap_used_mb: Math.round((swapTotal - swapFree) / 1048576),
+      swap_total_mb: Math.round(swapTotal / 1048576),
+      mem_available_mb: memAvailable !== null ? Math.round(memAvailable / 1048576) : null
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Only fires recordError on the transition into a bad state (mirrors how flush_failures
+// is handled below) -- /sync/status is polled continuously, so without this a sustained
+// condition would spam the error log instead of writing it once and staying quiet until
+// something changes.
+const activeHealthWarnings = new Set();
+
+async function checkHealthWarnings({ walSizeBytes, hostMemory, filteredQueryQueue, rssMb }) {
+  const checks = [
+    {
+      key: "wal_size",
+      active: walSizeBytes > WAL_SIZE_WARNING_BYTES,
+      message: `jobs.db-wal has grown to ${Math.round(walSizeBytes / 1048576)}MB, above the ${Math.round(WAL_SIZE_WARNING_BYTES / 1048576)}MB watch threshold -- the periodic checkpoint may not be keeping up with write volume.`
+    },
+    {
+      key: "filtered_query_queue",
+      active: Number(filteredQueryQueue?.queued || 0) >= FILTERED_QUERY_QUEUE_WARNING_DEPTH,
+      message: `${filteredQueryQueue?.queued} filtered posting queries are queued behind the wide-scan lock -- the active posting set may have grown past what a single scan clears quickly.`
+    },
+    {
+      key: "swap_used",
+      active: Boolean(hostMemory && hostMemory.swap_used_mb > SWAP_USED_WARNING_MB),
+      message: `Host swap usage is ${hostMemory?.swap_used_mb}MB, above the ${SWAP_USED_WARNING_MB}MB watch threshold -- memory pressure can stall the process independent of any single request.`
+    },
+    {
+      key: "process_rss",
+      active: rssMb > PROCESS_RSS_WARNING_MB,
+      message: `API process RSS is ${rssMb}MB, above the ${PROCESS_RSS_WARNING_MB}MB watch threshold and approaching the systemd MemoryHigh ceiling.`
+    }
+  ];
+
+  for (const check of checks) {
+    if (check.active && !activeHealthWarnings.has(check.key)) {
+      activeHealthWarnings.add(check.key);
+      await recordError({
+        source: "health",
+        operation: `watch:${check.key}`,
+        message: check.message,
+        context: {}
+      }).catch(() => {});
+    } else if (!check.active && activeHealthWarnings.has(check.key)) {
+      activeHealthWarnings.delete(check.key);
+    }
+  }
+
+  return checks
+    .filter((check) => check.active)
+    .map((check) => ({ key: check.key, message: check.message }));
+}
 // Opened lazily in initDb(). Kept off the shared write connection deliberately -- see the
-// comment on startWalCheckpointTruncateTask for why sharing it caused SQLITE_BUSY elsewhere.
+// comment on startWalCheckpointTasks for why sharing it caused SQLITE_BUSY elsewhere.
 let walCheckpointDb = null;
 
 
@@ -1523,6 +1632,16 @@ function createServer() {
       const durableLastWriteEpoch = Number(lastWriteEpoch || 0);
       const nowEpoch = Math.floor(Date.now() / 1000);
       const processMemory = process.memoryUsage();
+      const rssMb = Math.round(processMemory.rss / 1048576);
+      const walSizeBytes = getWalSizeBytes();
+      const hostMemory = getHostMemorySnapshot();
+      const filteredQueryQueue = getWideScanStats();
+      const healthWarnings = await checkHealthWarnings({
+        walSizeBytes,
+        hostMemory,
+        filteredQueryQueue,
+        rssMb
+      });
       const payload = sanitizeFrontendValue({
         ...syncStatus,
         active_targets: (syncStatus.active_targets || []).map((target) => ({
@@ -1536,15 +1655,18 @@ function createServer() {
           : null,
         service_uptime_seconds: Math.floor(process.uptime()),
         process_memory: {
-          rss_mb: Math.round(processMemory.rss / 1048576),
+          rss_mb: rssMb,
           heap_used_mb: Math.round(processMemory.heapUsed / 1048576),
           heap_total_mb: Math.round(processMemory.heapTotal / 1048576),
           external_mb: Math.round(processMemory.external / 1048576),
           array_buffers_mb: Math.round((processMemory.arrayBuffers || 0) / 1048576)
         },
+        wal_size_mb: Math.round(walSizeBytes / 1048576),
+        host_memory: hostMemory,
+        health_warnings: healthWarnings,
         scraper_request_queue: getAtsRequestQueueStats(),
         ...syncScopeStats,
-        filtered_query_queue: getWideScanStats(),
+        filtered_query_queue: filteredQueryQueue,
         sync_coverage: coverage,
         posting_freshness_hours: syncSettings?.posting_freshness_hours,
         active_posting_freshness_hours: syncSettings?.active_posting_freshness_hours,
@@ -2358,21 +2480,49 @@ function createServer() {
   return app;
 }
 
-// See WAL_CHECKPOINT_TRUNCATE_INTERVAL_MS above for why this exists: PASSIVE auto-checkpoints
-// reclaim WAL content but never shrink the file, so this is what actually bounds it back down.
+// Both ticks share walCheckpointDb, so this keeps them from overlapping on the same
+// connection -- a PASSIVE tick landing mid-TRUNCATE would just queue behind it and add
+// nothing, and skipping it is free since there is always another tick 30s later.
+let walCheckpointInFlight = false;
+
+// See WAL_CHECKPOINT_PASSIVE_INTERVAL_MS above for why this exists: PASSIVE never blocks a
+// writer or reader, so running it often is pure upside -- it keeps the WAL small in small
+// increments instead of leaving it all for the rare blocking TRUNCATE to deal with at once.
 // Runs on walCheckpointDb, not the shared write connection -- see the comment where that
 // connection is opened in initDb().
-function startWalCheckpointTruncateTask() {
-  const timer = setInterval(async () => {
+function startWalCheckpointTasks() {
+  const passiveTimer = setInterval(async () => {
+    if (!walCheckpointDb || walCheckpointInFlight) return;
+    walCheckpointInFlight = true;
     try {
-      if (!walCheckpointDb) return;
+      await walCheckpointDb.all("PRAGMA wal_checkpoint(PASSIVE);");
+    } catch (error) {
+      console.error("[OpenPostings API] periodic WAL passive checkpoint failed:", error?.message || error);
+    } finally {
+      walCheckpointInFlight = false;
+    }
+  }, WAL_CHECKPOINT_PASSIVE_INTERVAL_MS);
+  if (typeof passiveTimer.unref === "function") passiveTimer.unref();
+
+  // Actually shrinks the file back down, unlike PASSIVE -- but only worth the collision
+  // risk when there is a meaningful amount to reclaim. With PASSIVE running every 30s this
+  // should usually find little left to do; skip it outright when the file says so.
+  const truncateTimer = setInterval(async () => {
+    if (!walCheckpointDb || walCheckpointInFlight) return;
+    try {
+      const walSizeBytes = fs.statSync(`${DB_PATH}-wal`, { throwIfNoEntry: false })?.size || 0;
+      if (walSizeBytes < WAL_CHECKPOINT_TRUNCATE_MIN_WAL_BYTES) return;
+      walCheckpointInFlight = true;
       await walCheckpointDb.all("PRAGMA wal_checkpoint(TRUNCATE);");
     } catch (error) {
       console.error("[OpenPostings API] periodic WAL truncate checkpoint failed:", error?.message || error);
+    } finally {
+      walCheckpointInFlight = false;
     }
   }, WAL_CHECKPOINT_TRUNCATE_INTERVAL_MS);
-  if (typeof timer.unref === "function") timer.unref();
-  return timer;
+  if (typeof truncateTimer.unref === "function") truncateTimer.unref();
+
+  return { passiveTimer, truncateTimer };
 }
 
 async function start() {
@@ -2413,7 +2563,7 @@ async function start() {
   // Watches for a pass that stops making progress and abandons it, so a wedged sync
   // does not leave the cached promise in place and stop syncing until a restart.
   startSyncStallWatchdog();
-  startWalCheckpointTruncateTask();
+  startWalCheckpointTasks();
 
   // Fetching posting pages and keeping the semantic index current run on their own
   // clocks, deliberately not tied to a sync pass finishing.

@@ -1949,6 +1949,16 @@ export default function App() {
     const firstRate = Number(syncPerformanceHistory[0]?.rate || 0);
     const rateDelta = syncPerformanceHistory.length > 1 ? rate - firstRate : 0;
 
+    // Leading indicators, not failures in progress -- see /sync/status on the server for
+    // the thresholds. Surfaced here so a slow slide (WAL not draining, the wide-scan queue
+    // backing up, host memory pressure) is visible before it turns into a client timeout.
+    const walSizeMb = Number(status?.wal_size_mb || 0);
+    const hostMemory = status?.host_memory || null;
+    const healthWarnings = Array.isArray(status?.health_warnings) ? status.health_warnings : [];
+    if (healthWarnings.length > 0 && (health.tone === "good" || health.tone === "neutral")) {
+      health = { label: "Needs attention", tone: "warning" };
+    }
+
     return {
       progress,
       queue,
@@ -1964,7 +1974,10 @@ export default function App() {
       coverageSynced,
       coveragePercent,
       rateDelta,
-      queueHotspots
+      queueHotspots,
+      walSizeMb,
+      hostMemory,
+      healthWarnings
     };
   }, [status, syncPerformanceHistory]);
 
@@ -2083,7 +2096,19 @@ export default function App() {
       setApplicationsLoading(true);
     }
     try {
-      const response = await fetchApplications(1000, 0);
+      let response;
+      try {
+        response = await fetchApplications(1000, 0);
+      } catch (e) {
+        // A one-off collision with the sync's writer (a periodic WAL checkpoint, a busy
+        // moment) looks identical to a real outage from here. One short retry tells them
+        // apart without making the user leave the page and come back to find it was fine.
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        if (requestSequence !== applicationsRequestSequenceRef.current) {
+          return;
+        }
+        response = await fetchApplications(1000, 0);
+      }
       if (requestSequence !== applicationsRequestSequenceRef.current) {
         return;
       }
@@ -4053,6 +4078,16 @@ export default function App() {
             </View>
           </View>
 
+          {scraperDashboard.healthWarnings.length > 0 ? (
+            <View style={styles.performanceWarningBanner}>
+              {scraperDashboard.healthWarnings.map((warning) => (
+                <Text key={warning.key} style={styles.performanceWarningText}>
+                  {warning.message}
+                </Text>
+              ))}
+            </View>
+          ) : null}
+
           <View style={styles.performanceMetricGrid}>
             <PerformanceMetric
               label="Throughput"
@@ -4093,6 +4128,26 @@ export default function App() {
                     : "critical"
               }
             />
+            <PerformanceMetric
+              label="WAL size"
+              value={`${scraperDashboard.walSizeMb.toLocaleString()} MB`}
+              hint="Reclaimed by the periodic checkpoint"
+              tone={scraperDashboard.walSizeMb < 128 ? "good" : scraperDashboard.walSizeMb < 256 ? "warning" : "critical"}
+            />
+            {scraperDashboard.hostMemory ? (
+              <PerformanceMetric
+                label="Host swap"
+                value={`${Number(scraperDashboard.hostMemory.swap_used_mb || 0).toLocaleString()} MB`}
+                hint={`of ${Number(scraperDashboard.hostMemory.swap_total_mb || 0).toLocaleString()} MB total`}
+                tone={
+                  Number(scraperDashboard.hostMemory.swap_used_mb || 0) < 256
+                    ? "good"
+                    : Number(scraperDashboard.hostMemory.swap_used_mb || 0) < 512
+                      ? "warning"
+                      : "critical"
+                }
+              />
+            ) : null}
             <PerformanceMetric
               label="Request queue"
               value={`${Number(scraperDashboard.queue.active || 0)} active / ${Number(scraperDashboard.queue.queued || 0)} queued`}
@@ -5607,6 +5662,21 @@ const styles = StyleSheet.create({
     color: "#ffffff",
     fontSize: 11,
     fontWeight: "700"
+  },
+  performanceWarningBanner: {
+    marginTop: 10,
+    borderWidth: 1,
+    borderColor: "#f1c27d",
+    backgroundColor: "#fffaf0",
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    gap: 4
+  },
+  performanceWarningText: {
+    color: "#8a5a1a",
+    fontSize: 11,
+    lineHeight: 15
   },
   performanceMetricGrid: {
     marginTop: 12,
