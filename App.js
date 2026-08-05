@@ -512,6 +512,13 @@ function formatDurationCompact(secondsValue) {
   return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
 }
 
+function formatDaysCompact(daysValue) {
+  const days = Number(daysValue);
+  if (!Number.isFinite(days) || days < 0) return "unknown";
+  if (days < 1) return `${Math.round(days * 24)}h`;
+  return `${days.toFixed(1)}d`;
+}
+
 function formatApplicationDate(value) {
   const epochSeconds = Number(value);
   if (!Number.isFinite(epochSeconds) || epochSeconds <= 0) {
@@ -3907,6 +3914,13 @@ export default function App() {
     const denialRate = Number(applicationStats?.denial_rate || 0);
     const byStatus = applicationStats?.by_status || {};
     const other = Number(applicationStats?.other || 0);
+    const byCompany = Array.isArray(applicationStats?.by_company) ? applicationStats.by_company : [];
+    const deniedApplications = Array.isArray(applicationStats?.denied_applications)
+      ? applicationStats.denied_applications
+      : [];
+    const timeToDenial = applicationStats?.time_to_denial || {};
+    const timeToDenialSampleSize = Number(timeToDenial?.sample_size || 0);
+
     const statusRows = APPLICATION_STATUS_OPTIONS.map((status) => {
       const count = Number(byStatus[status] || 0);
       const percent = total > 0 ? (count / total) * 100 : 0;
@@ -3956,6 +3970,71 @@ export default function App() {
                   ))}
                 </View>
               </View>
+
+              <View style={styles.performanceSection}>
+                <View style={styles.performanceSectionTitleRow}>
+                  <Text style={styles.performanceSectionTitle}>Time to denial</Text>
+                  <Text style={styles.performanceSectionValue}>
+                    {timeToDenialSampleSize > 0 ? `${timeToDenialSampleSize} timed` : "0 timed"}
+                  </Text>
+                </View>
+                {timeToDenialSampleSize > 0 ? (
+                  <View style={styles.performanceMetricGrid}>
+                    <PerformanceMetric label="Average" value={formatDaysCompact(timeToDenial.average_days)} />
+                    <PerformanceMetric label="Median" value={formatDaysCompact(timeToDenial.median_days)} />
+                  </View>
+                ) : (
+                  <Text style={styles.performanceEmptyText}>
+                    No denial has a timed transition yet. This fills in as applications you mark
+                    denied going forward accumulate a real applied-to-denied timestamp --
+                    denials that predate this dashboard have no recorded moment of denial to
+                    measure from.
+                  </Text>
+                )}
+              </View>
+
+              {byCompany.length > 0 ? (
+                <View style={styles.performanceSection}>
+                  <Text style={styles.performanceSectionTitle}>Denials by company</Text>
+                  <View style={styles.performanceHotspotList}>
+                    {byCompany.slice(0, 15).map((row) => (
+                      <View key={row.company_name} style={styles.performanceHotspotRow}>
+                        <Text style={styles.performanceHotspotName} numberOfLines={1}>
+                          {row.company_name}
+                        </Text>
+                        <Text style={styles.performanceHotspotStats}>
+                          {`${row.denied}/${row.total} denied (${Number(row.denial_rate || 0).toFixed(1)}%)`}
+                        </Text>
+                      </View>
+                    ))}
+                  </View>
+                </View>
+              ) : null}
+
+              {deniedApplications.length > 0 ? (
+                <View style={styles.performanceSection}>
+                  <Text style={styles.performanceSectionTitle}>Denied applications</Text>
+                  <View style={styles.performanceHotspotList}>
+                    {deniedApplications.map((item) => (
+                      <View key={item.id} style={styles.performanceHotspotRow}>
+                        <View style={styles.performanceWorkerInfo}>
+                          <Text style={styles.performanceHotspotName} numberOfLines={1}>
+                            {`${sanitizeDisplayText(item.position_name, "Unknown position")} — ${sanitizeDisplayText(item.company_name, "Unknown company")}`}
+                          </Text>
+                          <Text style={styles.performanceMetricHint}>
+                            {`Applied ${formatApplicationDate(item.application_date)}`}
+                          </Text>
+                        </View>
+                        <Text style={styles.performanceHotspotStats}>
+                          {item.days_to_denial !== null && item.days_to_denial !== undefined
+                            ? formatDaysCompact(item.days_to_denial)
+                            : "time unknown"}
+                        </Text>
+                      </View>
+                    ))}
+                  </View>
+                </View>
+              ) : null}
             </>
           ) : null}
         </View>

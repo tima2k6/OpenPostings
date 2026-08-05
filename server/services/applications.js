@@ -442,14 +442,56 @@ const LEGACY_STATUS_ALIASES = {
   submitted: "applied"
 };
 
+function resolveStatusBucket(rawStatus) {
+  const raw = String(rawStatus || "").trim();
+  if (!raw || APPLICATION_STATUS_OPTIONS.has(raw)) {
+    return normalizeApplicationStatus(raw);
+  }
+  return LEGACY_STATUS_ALIASES[raw] || null; // null means "other" -- genuinely unrecognized.
+}
+
+function average(values) {
+  if (values.length === 0) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function median(values) {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
 async function getApplicationDenialStats() {
   const db = getDb();
   const rows = await db.all(
     `
-      SELECT LOWER(TRIM(COALESCE(status, ''))) AS status, COUNT(*) AS count
-      FROM applications
-      GROUP BY LOWER(TRIM(COALESCE(status, '')));
+      SELECT
+        a.id,
+        COALESCE(NULLIF(TRIM(c.company_name), ''), a.company_name) AS company_name,
+        a.position_name,
+        a.application_date,
+        a.status
+      FROM applications a
+      LEFT JOIN companies c
+        ON c.id = a.company_id;
     `
+  );
+
+  // Only a transition with a real previous_status marks an observed denial moment --
+  // the seed row every application gets (previous_status NULL) is a backfilled stand-in
+  // for applications that predate this table, not evidence of when a denial happened.
+  const deniedAtRows = await db.all(
+    `
+      SELECT application_id, MIN(changed_at_epoch) AS denied_at_epoch
+      FROM application_status_history
+      WHERE previous_status IS NOT NULL
+        AND LOWER(TRIM(new_status)) = 'denied'
+      GROUP BY application_id;
+    `
+  );
+  const deniedAtByApplicationId = new Map(
+    deniedAtRows.map((row) => [Number(row.application_id), Number(row.denied_at_epoch)])
   );
 
   const byStatus = {};
@@ -457,32 +499,72 @@ async function getApplicationDenialStats() {
     byStatus[option] = 0;
   }
 
+  const companyTotals = new Map();
+  const deniedApplications = [];
+  const daysToDenialSamples = [];
+
   let total = 0;
   let other = 0;
-  for (const row of rows) {
-    const raw = String(row?.status || "").trim();
-    const count = Number(row?.count || 0);
-    total += count;
 
-    if (!raw || APPLICATION_STATUS_OPTIONS.has(raw)) {
-      const status = normalizeApplicationStatus(raw);
-      byStatus[status] += count;
-    } else if (LEGACY_STATUS_ALIASES[raw]) {
-      byStatus[LEGACY_STATUS_ALIASES[raw]] += count;
+  for (const row of rows) {
+    total += 1;
+    const bucket = resolveStatusBucket(row?.status);
+    if (bucket) {
+      byStatus[bucket] += 1;
     } else {
-      other += count;
+      other += 1;
+    }
+
+    const companyName = String(row?.company_name || "").trim() || "Unknown company";
+    const companyEntry = companyTotals.get(companyName) || { company_name: companyName, total: 0, denied: 0 };
+    companyEntry.total += 1;
+    if (bucket === "denied") companyEntry.denied += 1;
+    companyTotals.set(companyName, companyEntry);
+
+    if (bucket === "denied") {
+      const applicationId = Number(row?.id || 0);
+      const applicationDate = Number(row?.application_date || 0);
+      const deniedAtEpoch = deniedAtByApplicationId.get(applicationId) ?? null;
+      const daysToDenial =
+        deniedAtEpoch && applicationDate && deniedAtEpoch >= applicationDate
+          ? (deniedAtEpoch - applicationDate) / 86400
+          : null;
+      if (daysToDenial !== null) daysToDenialSamples.push(daysToDenial);
+
+      deniedApplications.push({
+        id: applicationId,
+        company_name: companyName,
+        position_name: String(row?.position_name || "").trim() || "Unknown position",
+        application_date: applicationDate,
+        denied_at_epoch: deniedAtEpoch,
+        days_to_denial: daysToDenial
+      });
     }
   }
 
   const denied = byStatus.denied || 0;
   const denialRate = total > 0 ? (denied / total) * 100 : 0;
 
+  const byCompany = Array.from(companyTotals.values())
+    .filter((entry) => entry.denied > 0)
+    .map((entry) => ({ ...entry, denial_rate: entry.total > 0 ? (entry.denied / entry.total) * 100 : 0 }))
+    .sort((a, b) => b.denied - a.denied || b.total - a.total || a.company_name.localeCompare(b.company_name));
+
+  deniedApplications.sort((a, b) => b.application_date - a.application_date);
+
   return {
     total,
     denied,
     denial_rate: denialRate,
     by_status: byStatus,
-    other
+    other,
+    by_company: byCompany,
+    denied_applications: deniedApplications,
+    time_to_denial: {
+      average_days: average(daysToDenialSamples),
+      median_days: median(daysToDenialSamples),
+      sample_size: daysToDenialSamples.length
+    }
   };
 }
 
