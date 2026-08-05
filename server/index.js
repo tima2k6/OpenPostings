@@ -88,7 +88,7 @@ const { ensurePersonalInformationTable, getPersonalInformation, upsertPersonalIn
 const { upsertSeededCompanySource } = require("./services/seeded-source.js");
 const { getMcpSettings, upsertMcpSettings, buildMcpRunbook } = require("./services/mcp.js");
 const { buildCoverLetterDraft, buildCoverLetterBrief } = require("./services/cover-letter.js");
-const { listApplications, createApplication, updateApplicationStatus, deleteApplicationById } = require("./services/applications.js");
+const { listApplications, createApplication, updateApplicationStatus, deleteApplicationById, getApplicationDenialStats } = require("./services/applications.js");
 const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable, ensurePostingLocationStateIndex, startSyncStallWatchdog, getSyncCoverageStats, getLastSyncWriteEpoch } = require("./services/sync-runtime.js");
 const {
   startEnrichmentLoops,
@@ -1061,6 +1061,23 @@ async function ensureApplicationsTable() {
     CREATE INDEX IF NOT EXISTS idx_applications_status
       ON applications(status);
 
+    -- Every status transition an application goes through, so denial-rate and
+    -- time-to-decision metrics can be computed without applications.status having
+    -- already overwritten the prior value.
+    CREATE TABLE IF NOT EXISTS application_status_history (
+      id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      application_id INTEGER NOT NULL,
+      previous_status TEXT,
+      new_status TEXT NOT NULL,
+      changed_at_epoch INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_application_status_history_application_id
+      ON application_status_history(application_id);
+
+    CREATE INDEX IF NOT EXISTS idx_application_status_history_new_status
+      ON application_status_history(new_status, changed_at_epoch);
+
     CREATE TABLE IF NOT EXISTS application_attribution (
       application_id INTEGER NOT NULL PRIMARY KEY,
       applied_by_type TEXT NOT NULL,
@@ -1221,6 +1238,19 @@ async function ensureApplicationsTable() {
       throw error;
     }
   }
+
+  // Applications that predate application_status_history get one seed row so every
+  // application has a starting point for the denial dashboard, even though the real
+  // moment of that status (e.g. an old denial) was never recorded and this backfill
+  // can only use application_date as a stand-in.
+  await db.run(`
+    INSERT INTO application_status_history (application_id, previous_status, new_status, changed_at_epoch)
+    SELECT a.id, NULL, COALESCE(a.status, 'applied'), a.application_date
+    FROM applications a
+    WHERE NOT EXISTS (
+      SELECT 1 FROM application_status_history h WHERE h.application_id = a.id
+    );
+  `);
 
   if (mcpSettingsColumnNames.has("agent_login_password")) {
     await db.run(`UPDATE McpSettings SET agent_login_password = '' WHERE agent_login_password <> '';`);
@@ -2343,6 +2373,14 @@ function createServer() {
     res.json({
       ...payload,
       status_options: Array.from(APPLICATION_STATUS_OPTIONS)
+    });
+  });
+
+  app.get("/applications/stats", async (req, res) => {
+    const stats = await getApplicationDenialStats();
+    res.json({
+      ok: true,
+      ...stats
     });
   });
 

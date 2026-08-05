@@ -1,4 +1,4 @@
-const { normalizeLikeText, normalizeApplicationStatus, normalizeAppliedByType, normalizeAppliedByLabel } = require("../helpers/normalize-strings");
+const { normalizeLikeText, normalizeApplicationStatus, normalizeAppliedByType, normalizeAppliedByLabel, APPLICATION_STATUS_OPTIONS } = require("../helpers/normalize-strings");
 const { parseNonNegativeInteger, nowEpochSeconds } = require("../helpers/normalize-numbers");
 const { markPostingAppliedState } = require("./postings.js");
 const { getDb, setDb, runInWriteTransaction } = require("../services/runtime-context")
@@ -247,6 +247,18 @@ async function createApplication(input) {
 
     await handle.run(
       `
+        INSERT INTO application_status_history (
+          application_id,
+          previous_status,
+          new_status,
+          changed_at_epoch
+        ) VALUES (?, NULL, ?, ?);
+      `,
+      [result.lastID, status, applicationDate]
+    );
+
+    await handle.run(
+      `
         INSERT INTO application_attribution (
           application_id,
           applied_by_type,
@@ -282,20 +294,40 @@ async function createApplication(input) {
 
 async function updateApplicationStatus(applicationId, statusValue) {
   const status = normalizeApplicationStatus(statusValue);
-  const db = getDb()
-  const result = await db.run(
-    `
-      UPDATE applications
-      SET status = ?
-      WHERE id = ?;
-    `,
-    [status, applicationId]
-  );
 
-  if (Number(result?.changes || 0) === 0) {
-    return null;
-  }
+  const changed = await runInWriteTransaction(async (handle) => {
+    const existing = await handle.get(`SELECT status FROM applications WHERE id = ?;`, [applicationId]);
+    if (!existing) return false;
 
+    const result = await handle.run(
+      `
+        UPDATE applications
+        SET status = ?
+        WHERE id = ?;
+      `,
+      [status, applicationId]
+    );
+    if (Number(result?.changes || 0) === 0) return false;
+
+    const previousStatus = normalizeApplicationStatus(existing.status);
+    if (previousStatus !== status) {
+      await handle.run(
+        `
+          INSERT INTO application_status_history (
+            application_id,
+            previous_status,
+            new_status,
+            changed_at_epoch
+          ) VALUES (?, ?, ?, ?);
+        `,
+        [applicationId, previousStatus, status, nowEpochSeconds()]
+      );
+    }
+
+    return true;
+  });
+
+  if (!changed) return null;
   return getApplicationById(applicationId);
 }
 
@@ -398,4 +430,60 @@ async function deleteApplicationById(applicationId) {
   });
 }
 
-module.exports = { resolveCompanyIdForApplication, resolveCompanyIdFromPostingUrl, getExistingAppliedApplicationByPostingUrl, listApplications, createApplication, updateApplicationStatus, deleteApplicationById };
+// applications.status has no CHECK constraint and is normalized only on write, so rows
+// written before normalizeApplicationStatus existed (or by a path that bypassed it) can
+// carry values outside APPLICATION_STATUS_OPTIONS forever -- "rejected" and "submitted"
+// both show up in production data. Folding those into normalizeApplicationStatus's generic
+// "unrecognized input" default would silently count a real denial ("rejected") as "applied",
+// which is exactly backwards for a denial dashboard. These are the two legacy values known
+// to exist; anything else unrecognized is surfaced as "other" rather than guessed at.
+const LEGACY_STATUS_ALIASES = {
+  rejected: "denied",
+  submitted: "applied"
+};
+
+async function getApplicationDenialStats() {
+  const db = getDb();
+  const rows = await db.all(
+    `
+      SELECT LOWER(TRIM(COALESCE(status, ''))) AS status, COUNT(*) AS count
+      FROM applications
+      GROUP BY LOWER(TRIM(COALESCE(status, '')));
+    `
+  );
+
+  const byStatus = {};
+  for (const option of APPLICATION_STATUS_OPTIONS) {
+    byStatus[option] = 0;
+  }
+
+  let total = 0;
+  let other = 0;
+  for (const row of rows) {
+    const raw = String(row?.status || "").trim();
+    const count = Number(row?.count || 0);
+    total += count;
+
+    if (!raw || APPLICATION_STATUS_OPTIONS.has(raw)) {
+      const status = normalizeApplicationStatus(raw);
+      byStatus[status] += count;
+    } else if (LEGACY_STATUS_ALIASES[raw]) {
+      byStatus[LEGACY_STATUS_ALIASES[raw]] += count;
+    } else {
+      other += count;
+    }
+  }
+
+  const denied = byStatus.denied || 0;
+  const denialRate = total > 0 ? (denied / total) * 100 : 0;
+
+  return {
+    total,
+    denied,
+    denial_rate: denialRate,
+    by_status: byStatus,
+    other
+  };
+}
+
+module.exports = { resolveCompanyIdForApplication, resolveCompanyIdFromPostingUrl, getExistingAppliedApplicationByPostingUrl, listApplications, createApplication, updateApplicationStatus, deleteApplicationById, getApplicationDenialStats };

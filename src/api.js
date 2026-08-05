@@ -265,6 +265,10 @@ export function fetchApplications(limit = 500, offset = 0, status = "") {
   return request(`/applications?${params.toString()}`);
 }
 
+export function fetchApplicationStats() {
+  return request(`/applications/stats?_ts=${Date.now()}`);
+}
+
 export function createApplication(payload) {
   return request("/applications", {
     method: "POST",

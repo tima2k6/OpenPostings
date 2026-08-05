@@ -29,6 +29,7 @@ import {
   fetchApplicationAnswers,
   fetchErrors,
   fetchApplications,
+  fetchApplicationStats,
   fetchBlockedCompanies,
   fetchMcpCandidates,
   fetchMcpSettings,
@@ -85,6 +86,7 @@ function isAppForeground() {
 const PAGE_KEYS = {
   POSTINGS: "postings",
   APPLICATIONS: "applications",
+  APPLICATION_METRICS: "application_metrics",
   SCRAPER_PERFORMANCE: "scraper_performance",
   SETTINGS_APPLICANTEE: "settings_applicantee_information",
   SETTINGS_SYNC: "settings_sync",
@@ -94,6 +96,7 @@ const PAGE_KEYS = {
 const PAGE_TITLES = {
   [PAGE_KEYS.POSTINGS]: "Postings",
   [PAGE_KEYS.APPLICATIONS]: "Applications",
+  [PAGE_KEYS.APPLICATION_METRICS]: "Application Metrics",
   [PAGE_KEYS.SCRAPER_PERFORMANCE]: "Scraper Performance",
   [PAGE_KEYS.SETTINGS_APPLICANTEE]: "Settings / Applicantee Information",
   [PAGE_KEYS.SETTINGS_SYNC]: "Settings / Sync Settings",
@@ -1539,6 +1542,8 @@ export default function App() {
   const [applications, setApplications] = useState([]);
   const [applicationsLoading, setApplicationsLoading] = useState(false);
   const [applicationsNotice, setApplicationsNotice] = useState("");
+  const [applicationStats, setApplicationStats] = useState(null);
+  const [applicationStatsLoading, setApplicationStatsLoading] = useState(false);
   // Failures the server recorded that cost the user something -- an application submitted
   // but not logged, most of all. Polled alongside the applications list so a loss surfaces
   // in the app rather than only in whatever the agent happened to say at the time.
@@ -1613,6 +1618,7 @@ export default function App() {
   const postingsRequestAbortControllerRef = useRef(null);
   const postingsFilterRefreshInitializedRef = useRef(false);
   const applicationsRequestSequenceRef = useRef(0);
+  const applicationStatsRequestSequenceRef = useRef(0);
   const frontendLogQueueRef = useRef([]);
   const frontendLogFlushInFlightRef = useRef(false);
   const lastFrontendLogFlushAtRef = useRef(0);
@@ -2121,6 +2127,30 @@ export default function App() {
     } finally {
       if (!silent && requestSequence === applicationsRequestSequenceRef.current) {
         setApplicationsLoading(false);
+      }
+    }
+  }, []);
+
+  const loadApplicationStats = useCallback(async (options = {}) => {
+    const silent = Boolean(options.silent);
+    const requestSequence = applicationStatsRequestSequenceRef.current + 1;
+    applicationStatsRequestSequenceRef.current = requestSequence;
+    if (!silent) {
+      setApplicationStatsLoading(true);
+    }
+    try {
+      const response = await fetchApplicationStats();
+      if (requestSequence !== applicationStatsRequestSequenceRef.current) {
+        return;
+      }
+      setApplicationStats(response);
+    } catch (e) {
+      if (requestSequence === applicationStatsRequestSequenceRef.current) {
+        setError(String(e.message || e));
+      }
+    } finally {
+      if (!silent && requestSequence === applicationStatsRequestSequenceRef.current) {
+        setApplicationStatsLoading(false);
       }
     }
   }, []);
@@ -3382,6 +3412,11 @@ export default function App() {
     loadApplications({ silent: false });
   }, [effectiveActivePage, loadApplications]);
 
+  useEffect(() => {
+    if (effectiveActivePage !== PAGE_KEYS.APPLICATION_METRICS) return;
+    loadApplicationStats({ silent: false });
+  }, [effectiveActivePage, loadApplicationStats]);
+
   // Settings may have bootstrapped while the API was restarting. Reload on entry so a
   // transient failure cannot leave the page stuck on empty defaults for the whole session.
   useEffect(() => {
@@ -3865,6 +3900,68 @@ export default function App() {
       </View>
     </ScrollView>
   );
+
+  const renderApplicationMetricsPage = () => {
+    const total = Number(applicationStats?.total || 0);
+    const denied = Number(applicationStats?.denied || 0);
+    const denialRate = Number(applicationStats?.denial_rate || 0);
+    const byStatus = applicationStats?.by_status || {};
+    const other = Number(applicationStats?.other || 0);
+    const statusRows = APPLICATION_STATUS_OPTIONS.map((status) => {
+      const count = Number(byStatus[status] || 0);
+      const percent = total > 0 ? (count / total) * 100 : 0;
+      return { status, count, percent };
+    });
+    if (other > 0) {
+      statusRows.push({ status: "other (unrecognized status)", count: other, percent: total > 0 ? (other / total) * 100 : 0 });
+    }
+
+    return (
+      <ScrollView contentContainerStyle={styles.settingsContent}>
+        <View style={styles.settingsCard}>
+          <Text style={styles.settingsTitle}>Application Metrics</Text>
+          <Text style={styles.settingsDescription}>
+            How your applications resolve, so patterns worth investigating (like a high denial
+            rate) show up instead of staying buried in a flat list.
+          </Text>
+
+          {applicationStatsLoading ? <ActivityIndicator size="small" style={styles.settingsLoader} /> : null}
+
+          {!applicationStatsLoading && total === 0 ? (
+            <Text style={styles.empty}>No applications tracked yet.</Text>
+          ) : null}
+
+          {total > 0 ? (
+            <>
+              <View style={styles.performanceMetricGrid}>
+                <PerformanceMetric label="Total applications" value={total.toLocaleString()} />
+                <PerformanceMetric label="Denied" value={denied.toLocaleString()} hint={`${denialRate.toFixed(1)}% of total`} />
+                <PerformanceMetric
+                  label="Denial rate"
+                  value={`${denialRate.toFixed(1)}%`}
+                  tone={denialRate < 20 ? "good" : denialRate < 40 ? "warning" : "critical"}
+                />
+              </View>
+
+              <View style={styles.performanceSection}>
+                <Text style={styles.performanceSectionTitle}>Breakdown by status</Text>
+                <View style={styles.performanceHotspotList}>
+                  {statusRows.map((row) => (
+                    <View key={row.status} style={styles.performanceHotspotRow}>
+                      <Text style={styles.performanceHotspotName}>{row.status}</Text>
+                      <Text style={styles.performanceHotspotStats}>
+                        {`${row.count.toLocaleString()} (${row.percent.toFixed(1)}%)`}
+                      </Text>
+                    </View>
+                  ))}
+                </View>
+              </View>
+            </>
+          ) : null}
+        </View>
+      </ScrollView>
+    );
+  };
 
   const renderApplicanteeSettingsPage = () => (
     <ScrollView contentContainerStyle={styles.settingsContent}>
@@ -4860,6 +4957,7 @@ export default function App() {
 
   const renderActivePage = () => {
     if (effectiveActivePage === PAGE_KEYS.APPLICATIONS) return renderApplicationsPage();
+    if (effectiveActivePage === PAGE_KEYS.APPLICATION_METRICS) return renderApplicationMetricsPage();
     if (effectiveActivePage === PAGE_KEYS.SCRAPER_PERFORMANCE) return renderSyncAreaPage();
     if (effectiveActivePage === PAGE_KEYS.SETTINGS_APPLICANTEE) return renderApplicanteeSettingsPage();
     if (effectiveActivePage === PAGE_KEYS.SETTINGS_SYNC) return renderSyncAreaPage();
@@ -4915,6 +5013,11 @@ export default function App() {
               label="Applications"
               selected={effectiveActivePage === PAGE_KEYS.APPLICATIONS}
               onPress={handleOpenApplicationsPage}
+            />
+            <DrawerItem
+              label="Application Metrics"
+              selected={effectiveActivePage === PAGE_KEYS.APPLICATION_METRICS}
+              onPress={() => navigateToPage(PAGE_KEYS.APPLICATION_METRICS)}
             />
             <DrawerItem
               label="Scraper Performance"

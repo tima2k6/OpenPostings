@@ -116,6 +116,15 @@ CREATE TABLE IF NOT EXISTS applications (
 	status TEXT
 );
 
+-- application_status_history
+CREATE TABLE IF NOT EXISTS application_status_history (
+      id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      application_id INTEGER NOT NULL,
+      previous_status TEXT,
+      new_status TEXT NOT NULL,
+      changed_at_epoch INTEGER NOT NULL
+    );
+
 -- companies
 CREATE TABLE IF NOT EXISTS companies (
 	id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
