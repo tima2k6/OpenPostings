@@ -163,7 +163,13 @@ const WAL_CHECKPOINT_TRUNCATE_MIN_WAL_BYTES = Number(
 // early instead of waiting for a client timeout to notice.
 const WAL_SIZE_WARNING_BYTES = Number(process.env.WAL_SIZE_WARNING_BYTES || 256 * 1024 * 1024);
 const FILTERED_QUERY_QUEUE_WARNING_DEPTH = Number(process.env.FILTERED_QUERY_QUEUE_WARNING_DEPTH || 3);
-const SWAP_USED_WARNING_MB = Number(process.env.SWAP_USED_WARNING_MB || 512);
+// A percentage of swap_total, not a fixed MB figure: the steady-state swap usage a healthy
+// host settles at (cold pages from idle processes, reclaimed to make room for page cache)
+// is set by how much cold memory exists, not by how big the swap file is, so it does not
+// grow when swap capacity does. A fixed MB threshold sized for one swap file need re-tuning
+// every time swap is resized; a percentage keeps the same meaning -- "getting close to
+// running out of swap entirely" -- regardless of capacity.
+const SWAP_USED_WARNING_PERCENT = Number(process.env.SWAP_USED_WARNING_PERCENT || 80);
 const PROCESS_RSS_WARNING_MB = Number(process.env.PROCESS_RSS_WARNING_MB || 3584);
 
 function getWalSizeBytes() {
@@ -218,8 +224,14 @@ async function checkHealthWarnings({ walSizeBytes, hostMemory, filteredQueryQueu
     },
     {
       key: "swap_used",
-      active: Boolean(hostMemory && hostMemory.swap_used_mb > SWAP_USED_WARNING_MB),
-      message: `Host swap usage is ${hostMemory?.swap_used_mb}MB, above the ${SWAP_USED_WARNING_MB}MB watch threshold -- memory pressure can stall the process independent of any single request.`
+      active: Boolean(
+        hostMemory &&
+        hostMemory.swap_total_mb > 0 &&
+        (hostMemory.swap_used_mb / hostMemory.swap_total_mb) * 100 > SWAP_USED_WARNING_PERCENT
+      ),
+      message: `Host swap usage is ${hostMemory?.swap_used_mb}MB of ${hostMemory?.swap_total_mb}MB (${
+        hostMemory?.swap_total_mb > 0 ? Math.round((hostMemory.swap_used_mb / hostMemory.swap_total_mb) * 100) : "?"
+      }%), above the ${SWAP_USED_WARNING_PERCENT}% watch threshold -- memory pressure can stall the process independent of any single request.`
     },
     {
       key: "process_rss",

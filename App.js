@@ -4144,13 +4144,17 @@ export default function App() {
                 label="Host swap"
                 value={`${Number(scraperDashboard.hostMemory.swap_used_mb || 0).toLocaleString()} MB`}
                 hint={`of ${Number(scraperDashboard.hostMemory.swap_total_mb || 0).toLocaleString()} MB total`}
-                tone={
-                  Number(scraperDashboard.hostMemory.swap_used_mb || 0) < 256
-                    ? "good"
-                    : Number(scraperDashboard.hostMemory.swap_used_mb || 0) < 512
-                      ? "warning"
-                      : "critical"
-                }
+                tone={(() => {
+                  // Percentage of swap_total, matching the backend's watch threshold (see
+                  // SWAP_USED_WARNING_PERCENT) -- a fixed MB cutoff here would show red at
+                  // the same absolute usage regardless of how much swap is actually
+                  // configured, so this tile and the "Needs attention" banner would disagree
+                  // the moment swap capacity changed.
+                  const total = Number(scraperDashboard.hostMemory.swap_total_mb || 0);
+                  if (total <= 0) return "good";
+                  const percent = (Number(scraperDashboard.hostMemory.swap_used_mb || 0) / total) * 100;
+                  return percent < 50 ? "good" : percent < 80 ? "warning" : "critical";
+                })()}
               />
             ) : null}
             <PerformanceMetric
