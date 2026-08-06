@@ -106,6 +106,14 @@ async function ensureTables() {
       status TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS application_status_history (
+      id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      application_id INTEGER NOT NULL,
+      previous_status TEXT,
+      new_status TEXT NOT NULL,
+      changed_at_epoch INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS McpSettings (
       id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
       enabled INTEGER NOT NULL DEFAULT 0,
@@ -219,6 +227,15 @@ async function ensureTables() {
   if (!applicationColumnNames.has("company_name")) {
     await db.exec(`ALTER TABLE applications ADD COLUMN company_name TEXT NOT NULL DEFAULT '';`);
   }
+  // Mirrors server/index.js: recorded so the denial dashboard can pull a posting's
+  // job_description back up, and so the agent's own submissions get the same history/JD-match
+  // tracking as ones logged through the app.
+  if (!applicationColumnNames.has("job_posting_url")) {
+    await db.exec(`ALTER TABLE applications ADD COLUMN job_posting_url TEXT NOT NULL DEFAULT '';`);
+  }
+  if (!applicationColumnNames.has("fit_assessment")) {
+    await db.exec(`ALTER TABLE applications ADD COLUMN fit_assessment TEXT NOT NULL DEFAULT '';`);
+  }
   const companyIdIsRequired = applicationColumns.some(
     (column) => String(column?.name) === "company_id" && Number(column?.notnull) === 1
   );
@@ -232,13 +249,16 @@ async function ensureTables() {
           company_name TEXT NOT NULL DEFAULT '',
           position_name TEXT NOT NULL,
           application_date INTEGER NOT NULL,
-          status TEXT
+          status TEXT,
+          job_posting_url TEXT NOT NULL DEFAULT '',
+          fit_assessment TEXT NOT NULL DEFAULT ''
         );
-        INSERT INTO applications_migrated (id, company_id, company_name, position_name, application_date, status)
+        INSERT INTO applications_migrated (id, company_id, company_name, position_name, application_date, status, job_posting_url, fit_assessment)
         SELECT a.id, a.company_id,
                CASE WHEN TRIM(COALESCE(a.company_name, '')) <> '' THEN a.company_name
                     ELSE COALESCE(c.company_name, '') END,
-               a.position_name, a.application_date, a.status
+               a.position_name, a.application_date, a.status,
+               COALESCE(a.job_posting_url, ''), COALESCE(a.fit_assessment, '')
         FROM applications a
         LEFT JOIN companies c ON c.id = a.company_id;
         DROP TABLE applications;
@@ -250,6 +270,30 @@ async function ensureTables() {
       throw error;
     }
   }
+
+  // Same backfill as server/index.js, repeated here because this process can open the
+  // database independently of (and potentially before) the API server.
+  await db.run(`
+    INSERT INTO application_status_history (application_id, previous_status, new_status, changed_at_epoch)
+    SELECT a.id, NULL, COALESCE(a.status, 'applied'), a.application_date
+    FROM applications a
+    WHERE NOT EXISTS (
+      SELECT 1 FROM application_status_history h WHERE h.application_id = a.id
+    );
+  `);
+  await db.run(`
+    UPDATE applications
+    SET job_posting_url = (
+      SELECT p.job_posting_url
+      FROM posting_application_state p
+      WHERE p.last_application_id = applications.id
+      LIMIT 1
+    )
+    WHERE TRIM(COALESCE(job_posting_url, '')) = ''
+      AND EXISTS (
+        SELECT 1 FROM posting_application_state p WHERE p.last_application_id = applications.id
+      );
+  `);
 
   if (mcpSettingsColumnNames.has("agent_login_password")) {
     await db.run(`UPDATE McpSettings SET agent_login_password = '' WHERE agent_login_password <> '';`);
@@ -595,10 +639,24 @@ async function createApplicationFromAgent(input) {
           company_name,
           position_name,
           application_date,
-          status
-        ) VALUES (?, ?, ?, ?, ?);
+          status,
+          job_posting_url,
+          fit_assessment
+        ) VALUES (?, ?, ?, ?, ?, ?, ?);
       `,
-      [company?.id ?? null, resolvedCompanyName, positionName, applicationDate, status]
+      [company?.id ?? null, resolvedCompanyName, positionName, applicationDate, status, jobPostingUrl, ""]
+    );
+
+    await handle.run(
+      `
+        INSERT INTO application_status_history (
+          application_id,
+          previous_status,
+          new_status,
+          changed_at_epoch
+        ) VALUES (?, NULL, ?, ?);
+      `,
+      [result.lastID, status, applicationDate]
     );
 
     await handle.run(
@@ -665,6 +723,7 @@ async function createApplicationFromAgent(input) {
       job_posting_url: jobPostingUrl,
       application_date: applicationDate,
       status,
+      fit_assessment: "",
       applied_by_type: "agent",
       applied_by_label: appliedByLabel
     };
