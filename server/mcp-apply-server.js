@@ -26,7 +26,9 @@ const {
   normalizeLikeText,
   normalizeStringArray,
   normalizeAppliedByType,
-  normalizeAppliedByLabel
+  normalizeAppliedByLabel,
+  normalizeApplicationFit,
+  APPLICATION_FIT_OPTIONS
 } = require("./helpers/normalize-strings.js");
 const { MCP_SETTINGS_DEFAULTS } = require("./helpers/normalize-mcp-settings.js");
 const { setDb, runInWriteTransaction } = require("./services/runtime-context.js");
@@ -65,6 +67,7 @@ const MCP_REGION_FILTER_VALUES = Object.freeze(LOCATION_REGION_OPTIONS.map((opti
 const MCP_REMOTE_FILTER_VALUES = Object.freeze(["all", "remote", "hybrid", "non_remote"]);
 const MCP_SORT_VALUES = Object.freeze(["recent", "company_asc"]);
 const MCP_QUERY_SORT_VALUES = Object.freeze(Array.from(SORTABLE.keys()));
+const MCP_FIT_ASSESSMENT_VALUES = Object.freeze(Array.from(APPLICATION_FIT_OPTIONS));
 const MAX_CANDIDATE_LIMIT = 2000;
 
 let db;
@@ -607,6 +610,7 @@ async function createApplicationFromAgent(input) {
   const appliedByLabel = String(input?.applied_by_label || "").trim() || "AI agent applied on behalf of user";
   const applicationDate = parseNonNegativeInteger(input?.application_date) || nowEpochSeconds();
   const status = String(input?.status || "applied").trim().toLowerCase() || "applied";
+  const fitAssessment = normalizeApplicationFit(input?.fit_assessment);
 
   if (jobPostingUrl) {
     const existing = await getExistingAppliedApplicationByPostingUrl(jobPostingUrl);
@@ -644,7 +648,7 @@ async function createApplicationFromAgent(input) {
           fit_assessment
         ) VALUES (?, ?, ?, ?, ?, ?, ?);
       `,
-      [company?.id ?? null, resolvedCompanyName, positionName, applicationDate, status, jobPostingUrl, ""]
+      [company?.id ?? null, resolvedCompanyName, positionName, applicationDate, status, jobPostingUrl, fitAssessment]
     );
 
     await handle.run(
@@ -723,7 +727,7 @@ async function createApplicationFromAgent(input) {
       job_posting_url: jobPostingUrl,
       application_date: applicationDate,
       status,
-      fit_assessment: "",
+      fit_assessment: fitAssessment,
       applied_by_type: "agent",
       applied_by_label: appliedByLabel
     };
@@ -1259,12 +1263,13 @@ async function main() {
     "record_application_result",
     {
       description:
-        "Write a completed agent-driven application result into applications and posting application state tables.",
+        `Write a completed agent-driven application result into applications and posting application state tables. Include fit_assessment (${MCP_FIT_ASSESSMENT_VALUES.join(", ")}) every time -- weigh the posting's requirements against the resume the same way draft_cover_letter's brief does (resume_evidence supports it, unmatched_requirements argue against it) and record that judgment now, while the comparison is fresh. Left blank, the application is stored as not yet assessed and someone has to redo the comparison later from memory.`,
       inputSchema: {
         job_posting_url: z.string(),
         company_name: z.string().optional(),
         position_name: z.string().optional(),
         status: z.string().optional(),
+        fit_assessment: z.enum(MCP_FIT_ASSESSMENT_VALUES).optional(),
         application_date: z.number().int().nonnegative().optional(),
         agent_name: z.string().optional(),
         commit: z.boolean().optional(),
@@ -1327,6 +1332,7 @@ async function main() {
       const companyName = String(args?.company_name || posting?.company_name || "").trim();
       const positionName = String(args?.position_name || posting?.position_name || "").trim();
       const status = String(args?.status || "applied").trim().toLowerCase() || "applied";
+      const fitAssessment = normalizeApplicationFit(args?.fit_assessment);
       const applicationDate = parseNonNegativeInteger(args?.application_date) || nowEpochSeconds();
       const appliedByLabel = `${agentName} applied on behalf of user`;
 
@@ -1344,6 +1350,7 @@ async function main() {
             position_name: positionName,
             job_posting_url: jobPostingUrl,
             status,
+            fit_assessment: fitAssessment,
             application_date: applicationDate,
             applied_by_label: appliedByLabel
           }
@@ -1364,6 +1371,7 @@ async function main() {
         position_name: positionName,
         job_posting_url: jobPostingUrl,
         status,
+        fit_assessment: fitAssessment,
         application_date: applicationDate,
         applied_by_label: appliedByLabel
       });

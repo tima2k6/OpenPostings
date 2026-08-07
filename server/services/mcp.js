@@ -144,7 +144,7 @@ function buildMcpRunbook(settings, personalInformation, candidates) {
       "Open job_posting_url and fill in what can be filled from the applicant's own details and their stored answers.",
       "Stop at the authentication boundary. If the application requires creating an account, signing in, solving a captcha, or entering payment or government-identification details, do not attempt it: report what is prepared, name the posting and what the form is asking for, and let the user finish. requires_account on a posting flags this in advance where it was detected at scrape time.",
       "If dry_run_only is true, stop before final submit and return a dry-run result.",
-      "When the user confirms an application was submitted, call record_application_result with commit=true; consult list_applications when unsure whether a posting was already handled."
+      "When the user confirms an application was submitted, call record_application_result with commit=true and fit_assessment set to the judgment already formed while screening (good fit, stretch, overqualified or underqualified) -- do not leave it blank for the user to redo later. Consult list_applications when unsure whether a posting was already handled."
     ],
     guardrails: {
       dry_run_only: Boolean(settings?.dry_run_only),

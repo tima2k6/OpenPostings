@@ -1175,6 +1175,51 @@ async function runAtsSyncInternal() {
     let completedCompanies = 0;
     const workerCount = Math.min(SYNC_WORKER_CONCURRENCY, Math.max(1, syncTargets.length));
 
+    // postingLocationByJobUrl was previously only pruned once, at the very end of a pass
+    // (see below) -- on a pass that now runs 15+ hours, that let it carry every URL touched
+    // since the last prune for the pass's entire duration. Measured at ~245 bytes/entry, so
+    // at today's ~1M active postings this alone tops out well under a gigabyte -- a real but
+    // modest contributor next to the process's other memory (see the comment on `memory`
+    // below) -- but there is no reason to let even that ride to pass-end when the same
+    // pruning logic can just run periodically instead. Time-based, not company-count-based,
+    // because getActiveJobPostingUrls() is itself a ~1M-row scan and should not scale with
+    // SYNC_WORKER_CONCURRENCY.
+    const MID_PASS_MAINTENANCE_INTERVAL_MS = Number(
+      process.env.MID_PASS_MAINTENANCE_INTERVAL_MS || 2 * 60 * 60 * 1000
+    );
+    let lastMidPassMaintenanceAtMs = Date.now();
+    let midPassMaintenanceInFlight = false;
+    const maybeRunMidPassMaintenance = async () => {
+      if (midPassMaintenanceInFlight) return;
+      if (Date.now() - lastMidPassMaintenanceAtMs < MID_PASS_MAINTENANCE_INTERVAL_MS) return;
+      // Set before the first await so a second worker completing a company in the same tick
+      // sees the updated timestamp and bails out at the check above instead of racing in.
+      midPassMaintenanceInFlight = true;
+      lastMidPassMaintenanceAtMs = Date.now();
+      try {
+        const activeJobPostingUrls = await getActiveJobPostingUrls();
+        let prunedCount = 0;
+        for (const jobPostingUrl of nextPostingLocationByJobUrl.keys()) {
+          if (!activeJobPostingUrls.has(jobPostingUrl)) {
+            nextPostingLocationByJobUrl.delete(jobPostingUrl);
+            prunedCount += 1;
+          }
+        }
+        // Requesting a real collection here, rather than waiting on V8's own heuristics, is
+        // the point of --expose-gc (see the systemd unit): a long-running process otherwise
+        // tends to defer collection until memory pressure forces it, letting RSS ratchet up
+        // across a pass instead of settling back down after a genuine drop in live data.
+        if (typeof global.gc === "function") global.gc();
+        console.log(
+          `[OpenPostings API] mid-pass maintenance: pruned ${prunedCount} stale location cache entries, ${nextPostingLocationByJobUrl.size} remain`
+        );
+      } catch (error) {
+        console.error("[OpenPostings API] mid-pass maintenance failed:", error?.message || error);
+      } finally {
+        midPassMaintenanceInFlight = false;
+      }
+    };
+
     const flushPendingPostings = async (force = false) => {
       if (!Array.isArray(pendingPostingsForUpsert) || pendingPostingsForUpsert.length === 0) return;
       if (!force && pendingPostingsForUpsert.length < SYNC_POSTING_FLUSH_BATCH_SIZE) return;
@@ -1361,6 +1406,9 @@ async function runAtsSyncInternal() {
               targets_per_minute: Math.round(targetsPerMinute * 10) / 10,
               eta_seconds: etaSeconds
             };
+            // Fire-and-forget: maybeRunMidPassMaintenance no-ops until its interval has
+            // elapsed and never throws, so this cannot slow down or fail a worker's loop.
+            maybeRunMidPassMaintenance();
           }
         }
       }
