@@ -1830,9 +1830,15 @@ export default function App() {
 
   const statusText = useMemo(() => {
     if (!status) return "No sync status yet.";
+    // last_sync_at only gets set when a pass *completes*, so it stays null for the entire
+    // duration of the first pass after a restart -- which used to read as "No sync has run
+    // yet" even while a pass was 40% done and actively storing postings. status.running
+    // distinguishes "hasn't finished a pass since the server started" from "never synced."
     const syncTime = status.last_sync_at
       ? formatDateTimeSafe(status.last_sync_at, "Unknown sync time")
-      : "No sync has run yet.";
+      : status.running
+        ? `In progress (started ${formatDateTimeSafe(status.started_at, "recently")})`
+        : "No sync has run yet.";
     const summary = status.last_sync_summary || {};
     const excludedByDate = Number(
       status.excluded_during_sync_by_posting_date ?? summary.excluded_during_sync_by_posting_date ?? 0

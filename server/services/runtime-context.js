@@ -55,6 +55,38 @@ function resetReaderDb() {
   readerDb = null;
 }
 
+// A third connection, for the cheap polling reads (/sync/status's counts and coverage
+// stats) that get starved by putting them on the same connection as listPostingsWithFilters.
+//
+// One SQLite connection runs one statement at a time -- readerDb above was split off the
+// writer for exactly that reason, but it is still one connection, shared by every read
+// including the wide-scan /postings queries (states + review_queue filters), which are
+// documented to take 6-45s depending on data volume. A poll that lands while one of those is
+// mid-scan queues behind it on the same connection and can blow through the client's 30s
+// timeout -- the app was up, the sync was healthy, but /sync/status still timed out because
+// it was stuck in line behind an unrelated slow read. Giving status/count queries their own
+// connection means a slow wide scan can no longer starve the poll that reports on it.
+let statusReaderDb = null;
+
+function setStatusReaderDb(nextStatusReaderDb) {
+  statusReaderDb = nextStatusReaderDb;
+  return statusReaderDb;
+}
+
+function getStatusReaderDb() {
+  return statusReaderDb;
+}
+
+// Falls back to the shared reader (which itself falls back to the writer), so callers need
+// not care whether a dedicated status connection was registered.
+function getStatusReadDb() {
+  return statusReaderDb || getReadDb();
+}
+
+function resetStatusReaderDb() {
+  statusReaderDb = null;
+}
+
 // SQLite has no nested transactions, and every writer in this process shares the single
 // connection above. Two overlapping `BEGIN TRANSACTION` statements therefore fail outright
 // with "cannot start a transaction within a transaction" -- which is exactly what happened
@@ -134,6 +166,7 @@ function setDb(nextDb) {
   // A reader opened against the previous database must not survive the swap -- that is
   // exactly how the listing ended up reading production data inside a test fixture.
   readerDb = null;
+  statusReaderDb = null;
 }
 
 function setSyncPromise(nextSyncPromise) {
@@ -179,6 +212,10 @@ module.exports = {
   getReaderDb,
   setReaderDb,
   resetReaderDb,
+  getStatusReadDb,
+  getStatusReaderDb,
+  setStatusReaderDb,
+  resetStatusReaderDb,
   runInWriteTransaction,
   setDb,
   getSyncPromise,

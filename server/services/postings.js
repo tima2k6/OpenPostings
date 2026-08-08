@@ -4,7 +4,7 @@ const { normalizeStringArray, normalizeLikeText, normalizeAppliedByType, normali
 const { normalizeCompensationType, normalizeCompensationPayPeriod, normalizeEducationLevels, parseEducationLevels, normalizeCompensationCurrencyCode, parseCountyFilters, parseCountryFilters, parseRegionFilters, normalizeRemoteFilters, buildIndustryMatchersByKey, rowMatchesIndustryLikeParts, rowMatchesEducationFilter, rowMatchesCompensationFilter, rowMatchesCompensationRangeFilter, rowMatchesLocationFilters, rowMatchesRemoteFilter, buildDefaultCountryFilterOptions, inferLocationGeo, LOCATION_REGION_OPTIONS, STATE_CODE_TO_NAME } = require("../helpers/description-filters");
 const { normalizePayFilterNumber, normalizeBoolean, parseNonNegativeInteger, nowEpochSeconds, parsePostingDateToEpochSeconds, getPostingFreshnessWindowSeconds } = require("../helpers/normalize-numbers");
 const { inferAshbyLocationFromDescription } = require("../ats/ashby/service.js");
-const { getDb, setDb, getReadDb, getPostingLocationByJobUrl } = require("../services/runtime-context")
+const { getDb, setDb, getReadDb, getStatusReadDb, getPostingLocationByJobUrl } = require("../services/runtime-context")
 const { parseCityFilters, rowMatchesCityFilters, parseLocationsJson, parsePostingLocation } = require("../helpers/parse-location")
 const { enrichPostingClassification, classifyPosting } = require("./posting-classification.js");
 const { setPostingIgnoredCompatibility } = require("./posting-review.js");
@@ -1264,9 +1264,10 @@ async function setPostingIgnoredState(payload) {
 
 
 async function getCounts() {
-  // Reader connection: /sync/status is polled continuously and its COUNT(*) over ~930k
-  // postings has no business queueing behind a sync write transaction.
-  const db = getReadDb()
+  // Dedicated status reader connection: /sync/status is polled continuously and its COUNT(*)
+  // over ~930k postings has no business queueing behind a sync write transaction, or behind
+  // an unrelated slow /postings wide scan sharing the general reader connection.
+  const db = getStatusReadDb()
   const companyRow = await db.get(`SELECT COUNT(*) AS count FROM companies;`);
   const postingRow = await db.get(
     `

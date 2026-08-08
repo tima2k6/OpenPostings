@@ -103,7 +103,7 @@ const { getPostingFilterOptions } = require("./services/filter-options.js");
 const { extractDocumentText, getApplicantDocument, saveApplicantDocument, listApplicantDocuments, deleteApplicantDocument, checkConfiguredDocumentPaths, normalizeDocumentKind, MAX_DOCUMENT_KEY_LENGTH, APPLICANT_DOCUMENT_KINDS } = require("./services/applicant-documents.js");
 const { ensureApplicationAnswersTable, listApplicationAnswers, setApplicationAnswers, clearApplicationAnswer } = require("./services/application-answers.js");
 const { ensureErrorLogTable, recordError, listErrors, acknowledgeErrors } = require("./services/error-log.js");
-const { getDb, setDb, setReaderDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
+const { getDb, setDb, setReaderDb, setStatusReaderDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
 const { getAtsRequestQueueStats } = require("./services/queue.js");
 
 const cors = require("cors");
@@ -733,6 +733,22 @@ async function initDb() {
     console.log("[OpenPostings API] reader connection open (app reads do not queue behind sync writes)");
   } catch (error) {
     console.error("[OpenPostings API] reader connection unavailable, falling back to the shared one:", error?.message || error);
+  }
+
+  // A fourth connection, dedicated to the cheap, continuously-polled reads (/sync/status's
+  // counts and coverage stats). See the comment on getStatusReadDb() in runtime-context.js:
+  // these shared the connection above with listPostingsWithFilters, so a slow wide-scan
+  // /postings query (states + review_queue filters) could make status polling queue behind
+  // it and blow through the client's 30s timeout even though nothing was actually down.
+  // Small cache -- these are aggregate queries over a handful of tables, not the hot listing
+  // path -- so it isn't worth duplicating the 64MB the listing reader keeps warm.
+  try {
+    const statusReader = await openDatabase({ filename: DB_PATH, mode: getSqliteReadOnlyMode() });
+    await statusReader.exec("PRAGMA busy_timeout = 15000; PRAGMA cache_size = -16384;");
+    setStatusReaderDb(statusReader);
+    console.log("[OpenPostings API] status reader connection open (status polling does not queue behind wide-scan postings queries)");
+  } catch (error) {
+    console.error("[OpenPostings API] status reader connection unavailable, falling back to the shared reader:", error?.message || error);
   }
 
   // A third connection, dedicated to the periodic WAL truncate checkpoint below. TRUNCATE
