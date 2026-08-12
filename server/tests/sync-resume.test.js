@@ -21,6 +21,7 @@ const {
   getCompaniesForSync,
   markCompanySynced,
   flushCompanySyncMarks,
+  getSyncCoverageStats,
   interleaveTargetsByAts
 } = require("../services/sync-runtime.js");
 
@@ -135,6 +136,44 @@ async function testFailingCompanyDoesNotStarveTheRest() {
   assert.notStrictEqual(next[0].id, first.id, "a failing company yields its place on the next lap");
 }
 
+// Rolling coverage must record the moment a company finishes, not a pass-wide reference
+// time. Otherwise a pass longer than the coverage window makes every company expire from
+// coverage at once even while targets continue completing.
+async function testDefaultSyncMarkUsesCompletionTime() {
+  await getDb().run(`UPDATE companies SET last_synced_epoch = NULL;`);
+  const [company] = await getCompaniesForSync();
+  const before = Math.floor(Date.now() / 1000);
+
+  markCompanySynced(company.id);
+  await flushCompanySyncMarks();
+
+  const row = await getDb().get(`SELECT last_synced_epoch FROM companies WHERE id = ?;`, [company.id]);
+  const after = Math.floor(Date.now() / 1000);
+  assert.ok(
+    Number(row?.last_synced_epoch || 0) >= before && Number(row?.last_synced_epoch || 0) <= after,
+    "a company mark without an override must use its actual completion time"
+  );
+}
+
+async function testCoverageUsesTheSameAtsAliasesAsTheCrawler() {
+  const db = getDb();
+  await db.run(`DELETE FROM companies;`);
+  const now = Math.floor(Date.now() / 1000);
+  await db.run(
+    `INSERT INTO companies (company_name, url_string, ATS_name, last_synced_epoch) VALUES (?, ?, ?, ?);`,
+    ["ashby-alias", "https://example.com/ashby", "ashbyhq", now]
+  );
+  await db.run(
+    `INSERT INTO companies (company_name, url_string, ATS_name, last_synced_epoch) VALUES (?, ?, ?, ?);`,
+    ["lever-alias", "https://example.com/lever", "leverco", now]
+  );
+  setSyncEnabledAts(new Set(["ashby", "lever"]));
+
+  const coverage = await getSyncCoverageStats();
+  assert.strictEqual(coverage.enabled_companies, 2, "coverage must include enabled ATS aliases");
+  assert.strictEqual(coverage.synced_within_window, 2, "recent alias rows must count as covered");
+}
+
 // Ordering has to survive assembly, not just be produced. getCompaniesForSync sorted by
 // staleness and the caller then ran the list through a shuffle, which silently discarded it
 // -- so passes sampled a random subset and roughly 4,000 companies stayed unreached however
@@ -190,6 +229,8 @@ async function main() {
   await testAnInterruptedPassResumesRatherThanRestarting();
   await testRepeatedInterruptionsStillCoverEveryAts();
   await testFailingCompanyDoesNotStarveTheRest();
+  await testDefaultSyncMarkUsesCompletionTime();
+  await testCoverageUsesTheSameAtsAliasesAsTheCrawler();
   console.log("sync-resume tests passed");
 }
 

@@ -7,7 +7,16 @@
 // as "no jobs match your preferences".
 const CITY_OPTIONS_PER_STATE = 60;
 
-const { getDb } = require("./runtime-context.js");
+// The city list never varies by request (it is not scoped by the caller's selected
+// states), yet every call re-ran a windowed GROUP BY over the full Postings table --
+// measured at ~9s standalone and worse under read contention. It changes slowly (a job
+// board's busiest cities per state do not shift minute to minute), so a short cache turns
+// every call after the first into a lookup instead of a multi-second scan. Same TTL as the
+// geo-options cache next to it in postings.js.
+const CITY_OPTIONS_TTL_MS = 60000;
+let cityOptionsCache = { builtAtMs: 0, cities: [] };
+
+const { getReadDb } = require("./runtime-context.js");
 const { normalizeSyncEnabledAts, ATS_FILTER_OPTION_ITEMS } = require("../helpers/normalize-ats.js");
 const {
   COMPENSATION_TYPE_OPTION_ITEMS,
@@ -115,7 +124,11 @@ async function getCountyOptions(db, selectedStates) {
 }
 
 async function getPostingFilterOptions(options = {}) {
-  const db = getDb();
+  // Every query in here is a read; getReadDb() keeps it off the sync's write connection so
+  // it does not queue behind an in-progress posting flush. Without this it inherited the
+  // full 30s busy_timeout whenever it landed mid-write, which is most of the time on a
+  // continuously-syncing install.
+  const db = getReadDb();
   const selectedStates = (Array.isArray(options?.states) ? options.states : [])
     .map((state) => String(state || "").trim().toUpperCase())
     .filter(Boolean);
@@ -151,35 +164,39 @@ async function getPostingFilterOptions(options = {}) {
   // capped: there are ~38,000 distinct city/state pairs, which is not a dropdown, but the
   // busiest few dozen in each state cover real job markets. Anything outside that is still
   // reachable through the free-text city box, which takes "City, ST" directly.
-  let cities = [];
-  try {
-    const cityRows = await db.all(
-      `SELECT city, state_region, n FROM (
-         SELECT city,
-                state_region,
-                COUNT(*) AS n,
-                ROW_NUMBER() OVER (PARTITION BY state_region ORDER BY COUNT(*) DESC) AS rank
-         FROM Postings
-         WHERE hidden = 0
-           AND city IS NOT NULL AND TRIM(city) <> ''
-           AND state_region IS NOT NULL AND TRIM(state_region) <> ''
-         GROUP BY city, state_region
-       )
-       WHERE rank <= ?
-       ORDER BY state_region, n DESC;`,
-      [CITY_OPTIONS_PER_STATE]
-    );
-    cities = cityRows.map((row) => ({
-      // Same "Value|ST" shape counties use, because a bare city name is ambiguous.
-      value: `${row.city}|${row.state_region}`,
-      label: `${row.city}, ${row.state_region}`,
-      city: row.city,
-      state: row.state_region,
-      count: Number(row.n || 0)
-    }));
-  } catch {
-    // A database without the parsed columns yet simply offers no cities.
-    cities = [];
+  let cities = cityOptionsCache.cities;
+  if (Date.now() - cityOptionsCache.builtAtMs >= CITY_OPTIONS_TTL_MS) {
+    try {
+      const cityRows = await db.all(
+        `SELECT city, state_region, n FROM (
+           SELECT city,
+                  state_region,
+                  COUNT(*) AS n,
+                  ROW_NUMBER() OVER (PARTITION BY state_region ORDER BY COUNT(*) DESC) AS rank
+           FROM Postings
+           WHERE hidden = 0
+             AND city IS NOT NULL AND TRIM(city) <> ''
+             AND state_region IS NOT NULL AND TRIM(state_region) <> ''
+           GROUP BY city, state_region
+         )
+         WHERE rank <= ?
+         ORDER BY state_region, n DESC;`,
+        [CITY_OPTIONS_PER_STATE]
+      );
+      cities = cityRows.map((row) => ({
+        // Same "Value|ST" shape counties use, because a bare city name is ambiguous.
+        value: `${row.city}|${row.state_region}`,
+        label: `${row.city}, ${row.state_region}`,
+        city: row.city,
+        state: row.state_region,
+        count: Number(row.n || 0)
+      }));
+      cityOptionsCache = { builtAtMs: Date.now(), cities };
+    } catch {
+      // A database without the parsed columns yet simply offers no cities. Do not cache
+      // the failure -- the next call should retry rather than being stuck empty for the TTL.
+      cities = [];
+    }
   }
 
   return {

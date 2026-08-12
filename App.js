@@ -1853,12 +1853,11 @@ export default function App() {
     const syncEnabledCompanies = Number(status.sync_enabled_company_count ?? summary.sync_enabled_company_count ?? 0);
     const excludedAtsCount = Number(status.excluded_ats_count ?? summary.excluded_ats_count ?? 0);
     const failedCompanies = Number(status.failed_companies ?? summary.failed_companies ?? 0);
-    // Pass position resets to 0 on every restart, so on its own it cannot say whether any
-    // company is being starved. Coverage is read from stored per-company sync times and
-    // survives restarts, which is the question worth answering after an interruption.
+    // Pass position and rolling coverage answer different questions. Keep both labels
+    // explicit so a time-window count can never be mistaken for progress in this pass.
     const coverage = status?.sync_coverage;
     const coverageHint = coverage
-      ? ` | Coverage: ${Number(coverage.synced_within_window || 0).toLocaleString()}/${Number(coverage.enabled_companies || 0).toLocaleString()} companies synced in the last ${Math.round(Number(coverage.window_seconds || 86400) / 3600)}h` +
+      ? ` | Rolling ${Math.round(Number(coverage.window_seconds || 86400) / 3600)}h company coverage: ${Number(coverage.synced_within_window || 0).toLocaleString()}/${Number(coverage.enabled_companies || 0).toLocaleString()}` +
         (Number(coverage.never_synced || 0) > 0 ? `, ${Number(coverage.never_synced).toLocaleString()} not yet reached` : "")
       : "";
     const base = `Last completed sync: ${syncTime} | Listed in the ${freshnessHours}h review window: ${Number(status.posting_count || 0).toLocaleString()} | Sync-enabled companies: ${syncEnabledCompanies.toLocaleString()} | Failed companies: ${failedCompanies} | Excluded by date: ${excludedByDate} | Excluded ATS: ${excludedAtsCount}`;
@@ -1871,7 +1870,11 @@ export default function App() {
       const newPostings = Number(status.new_postings || 0);
       const refreshedPostings = Number(status.refreshed_postings || 0);
       const lastWriteAge = status.last_write_age_seconds;
-      return `${base} | Syncing ${Number(status.progress.current || 0).toLocaleString()}/${Number(status.progress.total || 0).toLocaleString()} (${progressPercent.toFixed(1)}%) | New: ${newPostings.toLocaleString()} | Refreshed: ${refreshedPostings.toLocaleString()} | Collected: ${collectedCount.toLocaleString()} | Rate: ${targetsPerMinute.toFixed(1)} targets/min | ETA: ${formatDurationCompact(etaSeconds)} | Last write: ${formatDurationCompact(lastWriteAge)} ago | Last completed target: ${syncingCompanyName}${coverageHint}`;
+      const companyProgress = status?.company_progress;
+      const companyProgressHint = companyProgress
+        ? ` | Companies this pass: ${Number(companyProgress.current || 0).toLocaleString()}/${Number(companyProgress.total || 0).toLocaleString()}`
+        : "";
+      return `${base} | Syncing targets ${Number(status.progress.current || 0).toLocaleString()}/${Number(status.progress.total || 0).toLocaleString()} (${progressPercent.toFixed(1)}%)${companyProgressHint} | New: ${newPostings.toLocaleString()} | Refreshed: ${refreshedPostings.toLocaleString()} | Collected: ${collectedCount.toLocaleString()} | Rate: ${targetsPerMinute.toFixed(1)} targets/min | ETA: ${formatDurationCompact(etaSeconds)} | Last write: ${formatDurationCompact(lastWriteAge)} ago | Last completed target: ${syncingCompanyName}${coverageHint}`;
     }
     return `${base}${coverageHint}`;
   }, [status, syncServiceSettings.active_posting_freshness_hours, syncServiceSettings.posting_freshness_hours]);
@@ -1910,6 +1913,7 @@ export default function App() {
 
   const scraperDashboard = useMemo(() => {
     const progress = status?.progress || {};
+    const companyProgress = status?.company_progress || {};
     const queue = status?.scraper_request_queue || {};
     const memory = status?.process_memory || status?.memory || {};
     const coverage = status?.sync_coverage || {};
@@ -1985,6 +1989,7 @@ export default function App() {
 
     return {
       progress,
+      companyProgress,
       queue,
       memory,
       activeTargets,
@@ -4512,7 +4517,7 @@ export default function App() {
               tone={Number(scraperDashboard.queue.queued || 0) === 0 ? "good" : "warning"}
             />
             <PerformanceMetric
-              label="24h coverage"
+              label="Rolling 24h coverage"
               value={`${scraperDashboard.coveragePercent.toFixed(1)}%`}
               hint={`${scraperDashboard.coverageSynced.toLocaleString()} of ${scraperDashboard.coverageEnabled.toLocaleString()} companies`}
               tone={scraperDashboard.coveragePercent >= 99 ? "good" : scraperDashboard.coveragePercent >= 90 ? "warning" : "critical"}
@@ -4529,7 +4534,7 @@ export default function App() {
             <View style={styles.performanceSectionTitleRow}>
               <Text style={styles.performanceSectionTitle}>Pass progress</Text>
               <Text style={styles.performanceSectionValue}>
-                {`${Number(scraperDashboard.progress.percent || 0).toFixed(1)}%`}
+                {`${Number(scraperDashboard.progress.current || 0).toLocaleString()}/${Number(scraperDashboard.progress.total || 0).toLocaleString()} · ${Number(scraperDashboard.progress.percent || 0).toFixed(1)}%`}
               </Text>
             </View>
             <View style={styles.performanceProgressTrack}>
@@ -4541,7 +4546,7 @@ export default function App() {
               />
             </View>
             <Text style={styles.performanceMetricHint}>
-              {`${Number(status?.new_postings || 0).toLocaleString()} new, ${Number(status?.refreshed_postings || 0).toLocaleString()} refreshed, ${Number(scraperDashboard.progress.total_collected || 0).toLocaleString()} collected`}
+              {`${Number(scraperDashboard.companyProgress.current || 0).toLocaleString()}/${Number(scraperDashboard.companyProgress.total || 0).toLocaleString()} stored companies completed this pass · ${Number(status?.new_postings || 0).toLocaleString()} new, ${Number(status?.refreshed_postings || 0).toLocaleString()} refreshed, ${Number(scraperDashboard.progress.total_collected || 0).toLocaleString()} collected`}
             </Text>
           </View>
 

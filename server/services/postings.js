@@ -314,7 +314,9 @@ function hasRealSourcePostingDate(rawPostingDate, ats, firstSeenEpoch, lastSeenE
 const LOCATION_GEO_OPTIONS_TTL_MS = 60000;
 
 async function readDistinctStoredLocations() {
-  const db = getDb();
+  // Read-only, and called from the filter-options bootstrap request -- getReadDb() keeps it
+  // off the sync's write connection so it does not queue behind an in-progress flush.
+  const db = getReadDb();
   try {
     const rows = await db.all(
       `

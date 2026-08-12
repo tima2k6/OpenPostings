@@ -136,7 +136,8 @@ const syncStatus = {
   // "one timeout happened recently" is true almost continuously during otherwise-healthy
   // operation. What actually distinguishes a real problem is a burst -- several in a short
   // window -- which needs more than one timestamp to detect.
-  recent_target_timeout_epochs_ms: []
+  recent_target_timeout_epochs_ms: [],
+  company_progress: null
 };
 
 // How far back recent_target_timeout_epochs_ms is allowed to look. Generous relative to the
@@ -806,14 +807,27 @@ async function getSyncCoverageStats(withinSeconds = 24 * 60 * 60) {
   const db = getStatusReadDb();
   if (!db) return null;
 
-  const enabled = normalizeSyncEnabledAts(Array.from(getSyncEnabledAts()));
-  if (enabled.length === 0) {
+  const enabled = new Set(normalizeSyncEnabledAts(Array.from(getSyncEnabledAts())));
+  if (enabled.size === 0) {
+    return { enabled_companies: 0, never_synced: 0, synced_within_window: 0, stale: 0, oldest_sync_age_seconds: null, window_seconds: withinSeconds };
+  }
+
+  // companies.ATS_name contains historical aliases (ashbyhq, leverco, breezyHR,
+  // pageuppeople, etc.), while sync settings store canonical values. The crawler applies
+  // normalizeAtsFilterValue before deciding whether a company is enabled; coverage must use
+  // that exact scope too. Comparing raw SQL values to canonical settings omitted thousands
+  // of companies and produced a misleading 54k denominator for a 61k-company pass.
+  const storedAtsRows = await db.all(`SELECT DISTINCT LOWER(TRIM(ATS_name)) AS ats_name FROM companies;`);
+  const enabledStoredAts = storedAtsRows
+    .map((item) => String(item?.ats_name || "").trim())
+    .filter((atsName) => atsName && enabled.has(normalizeAtsFilterValue(atsName)));
+  if (enabledStoredAts.length === 0) {
     return { enabled_companies: 0, never_synced: 0, synced_within_window: 0, stale: 0, oldest_sync_age_seconds: null, window_seconds: withinSeconds };
   }
 
   const now = nowEpochSeconds();
   const cutoff = now - withinSeconds;
-  const placeholders = enabled.map(() => "?").join(", ");
+  const placeholders = enabledStoredAts.map(() => "?").join(", ");
   const row = await db.get(
     `SELECT
        COUNT(*) AS total,
@@ -826,7 +840,7 @@ async function getSyncCoverageStats(withinSeconds = 24 * 60 * 60) {
          SELECT 1 FROM blocked_companies b
          WHERE b.normalized_company_name = LOWER(TRIM(companies.company_name))
        );`,
-    [cutoff, ...enabled]
+    [cutoff, ...enabledStoredAts]
   );
 
   const total = Number(row?.total || 0);
@@ -1076,12 +1090,14 @@ async function runAtsSyncInternal() {
   syncStatus.target_timeouts = 0;
   syncStatus.last_target_timeout_at = null;
   syncStatus.recent_target_timeout_epochs_ms = [];
+  syncStatus.company_progress = null;
   syncStatus.worker_concurrency = SYNC_WORKER_CONCURRENCY;
   syncStatus.target_timeout_seconds = Math.round(SYNC_TARGET_TIMEOUT_MS / 1000);
   activeSyncTargetsByWorker.clear();
 
   try {
     const companies = await getCompaniesForSync();
+    syncStatus.company_progress = { current: 0, total: companies.length, percent: 0 };
     const enabledAts = new Set(normalizeSyncEnabledAts(Array.from(getSyncEnabledAts())));
     const shuffledCompanies = interleaveTargetsByAts(companies);
     const syncTargets = [];
@@ -1173,6 +1189,7 @@ async function runAtsSyncInternal() {
     let excludedByPostingDate = 0;
     let nextCompanyIndex = 0;
     let completedCompanies = 0;
+    let completedStoredCompanies = 0;
     const workerCount = Math.min(SYNC_WORKER_CONCURRENCY, Math.max(1, syncTargets.length));
 
     // postingLocationByJobUrl was previously only pruned once, at the very end of a pass
@@ -1357,7 +1374,12 @@ async function runAtsSyncInternal() {
           // must not stay at the head of the queue forever, starving everything behind it --
           // it gets its turn again on the next lap like everything else.
           if (company?.id) {
-            markCompanySynced(company.id, syncReferenceEpoch);
+            // Coverage is a rolling wall-clock metric, so stamp when this target actually
+            // completed. Using syncReferenceEpoch made every company in a long pass share
+            // its start time; all 54k then fell out of the 24h window simultaneously and
+            // the dashboard incorrectly jumped to 0/54k while work was still completing.
+            markCompanySynced(company.id);
+            completedStoredCompanies += 1;
           }
           if (pendingPostingsForUpsert.length >= SYNC_POSTING_FLUSH_BATCH_SIZE) {
             try {
@@ -1405,6 +1427,14 @@ async function runAtsSyncInternal() {
               percent: syncTargets.length > 0 ? Math.round((completedCompanies / syncTargets.length) * 1000) / 10 : 0,
               targets_per_minute: Math.round(targetsPerMinute * 10) / 10,
               eta_seconds: etaSeconds
+            };
+            syncStatus.company_progress = {
+              current: completedStoredCompanies,
+              total: companies.length,
+              percent:
+                companies.length > 0
+                  ? Math.round((completedStoredCompanies / companies.length) * 1000) / 10
+                  : 0
             };
             // Fire-and-forget: maybeRunMidPassMaintenance no-ops until its interval has
             // elapsed and never throws, so this cannot slow down or fail a worker's loop.
@@ -2065,18 +2095,58 @@ async function ensurePostingLocationStateIndex() {
       DELETE FROM posting_location_states WHERE posting_id = OLD.id;
     END;
 
-    INSERT OR IGNORE INTO posting_location_states (posting_id, state_region)
-    SELECT id, UPPER(TRIM(state_region))
-    FROM Postings
-    WHERE state_region IS NOT NULL AND TRIM(state_region) <> '';
-
-    INSERT OR IGNORE INTO posting_location_states (posting_id, state_region)
-    SELECT p.id, UPPER(TRIM(json_extract(j.value, '$.state_region')))
-    FROM Postings p
-    JOIN json_each(CASE WHEN json_valid(p.locations_json) THEN p.locations_json ELSE '[]' END) j
-    WHERE json_extract(j.value, '$.state_region') IS NOT NULL
-      AND TRIM(json_extract(j.value, '$.state_region')) <> '';
+    -- Records how far the one-time backfill below has caught up. Every row written through
+    -- a normal INSERT/UPDATE is already covered by the triggers above the moment it lands,
+    -- so the backfill only ever has real work to do for rows that predate this migration.
+    CREATE TABLE IF NOT EXISTS posting_location_backfill_state (
+      id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+      last_backfilled_posting_id INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT OR IGNORE INTO posting_location_backfill_state (id, last_backfilled_posting_id) VALUES (1, 0);
   `);
+
+  // Was an unconditional full-table scan (with a per-row json_each parse) on every server
+  // boot -- against ~930k rows that were already backfilled the previous boot, that read
+  // most of the database file from disk and cost 60-100+ seconds of total API downtime on
+  // every restart (measured 2026-08-12: 4.8GB read, 927k read syscalls, 117s before
+  // app.listen()). MAX(id) is effectively free (Postings.id is the rowid), so this skips
+  // straight past the expensive backfill once the watermark has already caught up, which is
+  // every boot after the first.
+  const watermarkRow = await db.get(
+    `SELECT last_backfilled_posting_id FROM posting_location_backfill_state WHERE id = 1;`
+  );
+  const watermark = Number(watermarkRow?.last_backfilled_posting_id || 0);
+  const maxIdRow = await db.get(`SELECT MAX(id) AS max_id FROM Postings;`);
+  const maxId = Number(maxIdRow?.max_id || 0);
+  if (maxId <= watermark) return;
+
+  await db.run(
+    `
+      INSERT OR IGNORE INTO posting_location_states (posting_id, state_region)
+      SELECT id, UPPER(TRIM(state_region))
+      FROM Postings
+      WHERE id > ? AND state_region IS NOT NULL AND TRIM(state_region) <> '';
+    `,
+    watermark
+  );
+
+  await db.run(
+    `
+      INSERT OR IGNORE INTO posting_location_states (posting_id, state_region)
+      SELECT p.id, UPPER(TRIM(json_extract(j.value, '$.state_region')))
+      FROM Postings p
+      JOIN json_each(CASE WHEN json_valid(p.locations_json) THEN p.locations_json ELSE '[]' END) j
+      WHERE p.id > ?
+        AND json_extract(j.value, '$.state_region') IS NOT NULL
+        AND TRIM(json_extract(j.value, '$.state_region')) <> '';
+    `,
+    watermark
+  );
+
+  await db.run(
+    `UPDATE posting_location_backfill_state SET last_backfilled_posting_id = ? WHERE id = 1;`,
+    maxId
+  );
 }
 
 async function rebuildPostingsTableStorage() {
@@ -2093,6 +2163,7 @@ async function rebuildPostingsTableStorage() {
   );
   await db.exec(`DROP TABLE IF EXISTS Postings;`);
   await db.exec(`DELETE FROM posting_location_states;`).catch(() => undefined);
+  await db.exec(`DELETE FROM posting_location_backfill_state;`).catch(() => undefined);
   await createCanonicalPostingsTable();
 }
 
