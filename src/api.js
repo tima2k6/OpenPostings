@@ -422,6 +422,30 @@ export function unblockCompany(payload) {
   });
 }
 
+export function fetchSavedJobSearches() {
+  return request("/job-searches");
+}
+
+export function createSavedJobSearch(payload) {
+  return request("/job-searches", {
+    method: "POST",
+    body: JSON.stringify(payload || {})
+  });
+}
+
+export function updateSavedJobSearch(id, payload) {
+  return request(`/job-searches/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    body: JSON.stringify(payload || {})
+  });
+}
+
+export function deleteSavedJobSearch(id) {
+  return request(`/job-searches/${encodeURIComponent(id)}`, {
+    method: "DELETE"
+  });
+}
+
 export function migrateDatabaseSettings(payload) {
   return request("/settings/migrate-db", {
     method: "POST",
