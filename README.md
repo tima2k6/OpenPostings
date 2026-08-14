@@ -55,6 +55,7 @@ It combines:
 
 - Pulls jobs from **multiple ATS** providers into one local database.
 - Filters postings by **search text, ATS, industry, region (AMER/EMEA/APAC), country, state, county, and remote mode**.
+- Lets you **save named job searches** (search text + filters) and switch back to them later.
 - Tracks **unseen/viewed/shortlisted/ignored** review state separately from application lifecycle status.
 <br>
 <img src="README-Images/apply_or_ignore.png" alt="Applications" width="25%" />
@@ -334,6 +335,13 @@ Applications:
 - `POST /applications`
 - `PATCH /applications/:id`
 - `DELETE /applications/:id`
+
+Saved Job Searches:
+
+- `GET /job-searches`
+- `POST /job-searches`
+- `PUT /job-searches/:id`
+- `DELETE /job-searches/:id`
 
 Settings:
 
