@@ -64,7 +64,7 @@ function getEnrichmentStatus() {
 // the loop can tell "did work" from "nothing to do" without each job re-implementing the
 // backoff. Self-scheduling via setTimeout rather than setInterval: a run that takes longer
 // than the interval must not have the next one stack up behind it.
-function startEnrichmentLoop({ name, state, intervalMs, task, enabled }) {
+function startEnrichmentLoop({ name, state, intervalMs, task, enabled, initialDelayMs }) {
   let stopped = false;
 
   const schedule = (delayMs) => {
@@ -109,8 +109,14 @@ function startEnrichmentLoop({ name, state, intervalMs, task, enabled }) {
   };
 
   // Stagger the first run: startup is already busy opening the database, loading settings
-  // and kicking off a sync, and nothing here is urgent.
-  schedule(Math.min(intervalMs, 60 * 1000));
+  // and kicking off a sync, and nothing here is urgent. Each loop's own default lands at
+  // the same ~60s mark, though -- callers running genuinely heavy work alongside others
+  // (see startSemanticIndexLoop/startMatchIndexLoop) pass an explicit initialDelayMs so
+  // their first runs don't all land in the same few seconds after boot, competing with the
+  // sync's own startup burst for CPU. This is what caused a real, observed /sync/status
+  // timeout: a fresh restart's first minute had the sync ramping up, the semantic reindex,
+  // and a freshly-enlarged match-index batch (10,000 rows) all firing at once.
+  schedule(initialDelayMs ?? Math.min(intervalMs, 60 * 1000));
 
   return () => {
     stopped = true;
@@ -203,6 +209,8 @@ function startSemanticIndexLoop() {
     name: "semantic reindex",
     state: enrichmentStatus.semantic_index,
     intervalMs: SEMANTIC_INTERVAL_MS,
+    // Second in the startup stagger -- see the comment in startEnrichmentLoop.
+    initialDelayMs: 100 * 1000,
     task: async () => {
       // Incremental: only postings newer than the highest id already indexed. The worker
       // is isolated from the API event loop and bounded even if a large backlog forms.
@@ -276,6 +284,10 @@ function startMatchIndexLoop() {
     name: "match index",
     state: enrichmentStatus.match_index,
     intervalMs: MATCH_INTERVAL_MS,
+    // Third and last in the startup stagger -- see the comment in startEnrichmentLoop. This
+    // one matters most: its batch is 10,000 rows (vs. 400 for semantic reindex), so it is
+    // the heaviest of the three first-boot jobs.
+    initialDelayMs: 150 * 1000,
     task: async () => {
       // Incremental, and self-invalidating on a resume re-upload -- see posting-match.js.
       const summary = await runMatchIndexWorker({});
