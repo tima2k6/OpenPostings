@@ -99,6 +99,13 @@ const { startWriteLivenessWatchdog, getWriteLivenessStatus } = require("./servic
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
 const { listPostingsWithFilters, getPostingsByUrls, setPostingIgnoredState, getCounts, getWideScanStats } = require("./services/postings.js");
 const { ensurePostingReviewSchema, setPostingReviewState } = require("./services/posting-review.js");
+const {
+  ensureSavedJobSearchesTable,
+  listSavedJobSearches,
+  createSavedJobSearch,
+  updateSavedJobSearch,
+  deleteSavedJobSearch
+} = require("./services/saved-job-searches.js");
 const { getPostingFilterOptions } = require("./services/filter-options.js");
 const { extractDocumentText, getApplicantDocument, saveApplicantDocument, listApplicantDocuments, deleteApplicantDocument, checkConfiguredDocumentPaths, normalizeDocumentKind, MAX_DOCUMENT_KEY_LENGTH, APPLICANT_DOCUMENT_KINDS } = require("./services/applicant-documents.js");
 const { ensureApplicationAnswersTable, listApplicationAnswers, setApplicationAnswers, clearApplicationAnswer } = require("./services/application-answers.js");
@@ -815,6 +822,7 @@ async function initDb() {
   await ensureBlockedCompaniesTable();
   await ensureApplicationAnswersTable();
   await ensureErrorLogTable();
+  await ensureSavedJobSearchesTable();
   // Real wall-clock time of the last sync write. Kept separate from Postings.last_seen_epoch,
   // which records when a pass started rather than when a row was written.
   await db.exec(`
@@ -2523,6 +2531,90 @@ function createServer() {
       return res.status(404).json({
         ok: false,
         error: "application not found"
+      });
+    }
+
+    return res.json({
+      ok: true,
+      deleted: true
+    });
+  });
+
+  app.get("/job-searches", async (_req, res) => {
+    const items = await listSavedJobSearches();
+    res.json({
+      ok: true,
+      items,
+      count: items.length
+    });
+  });
+
+  app.post("/job-searches", async (req, res) => {
+    try {
+      const item = await createSavedJobSearch({
+        name: req.body?.name,
+        search: req.body?.search,
+        filters: req.body?.filters
+      });
+      res.status(201).json({
+        ok: true,
+        item
+      });
+    } catch (error) {
+      res.status(400).json({
+        ok: false,
+        error: String(error?.message || error)
+      });
+    }
+  });
+
+  app.put("/job-searches/:id", async (req, res) => {
+    const searchId = Number(req.params.id);
+    if (!Number.isFinite(searchId) || searchId <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "job search id must be a positive number"
+      });
+    }
+
+    try {
+      const item = await updateSavedJobSearch(searchId, {
+        name: req.body?.name,
+        search: req.body?.search,
+        filters: req.body?.filters
+      });
+      if (!item) {
+        return res.status(404).json({
+          ok: false,
+          error: "saved job search not found"
+        });
+      }
+      return res.json({
+        ok: true,
+        item
+      });
+    } catch (error) {
+      return res.status(400).json({
+        ok: false,
+        error: String(error?.message || error)
+      });
+    }
+  });
+
+  app.delete("/job-searches/:id", async (req, res) => {
+    const searchId = Number(req.params.id);
+    if (!Number.isFinite(searchId) || searchId <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "job search id must be a positive number"
+      });
+    }
+
+    const deleted = await deleteSavedJobSearch(searchId);
+    if (!deleted) {
+      return res.status(404).json({
+        ok: false,
+        error: "saved job search not found"
       });
     }
 

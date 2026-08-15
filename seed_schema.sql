@@ -98,6 +98,19 @@ CREATE TABLE IF NOT EXISTS blocked_companies (
 CREATE INDEX IF NOT EXISTS idx_blocked_companies_company_name
   ON blocked_companies(company_name);
 
+-- saved_job_searches
+CREATE TABLE IF NOT EXISTS saved_job_searches (
+  id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  search_text TEXT NOT NULL DEFAULT '',
+  filters_json TEXT NOT NULL DEFAULT '{}',
+  created_at_epoch INTEGER NOT NULL,
+  updated_at_epoch INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_job_searches_name
+  ON saved_job_searches(LOWER(name));
+
 -- application_attribution
 CREATE TABLE IF NOT EXISTS application_attribution (
       application_id INTEGER NOT NULL PRIMARY KEY,

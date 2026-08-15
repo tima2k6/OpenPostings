@@ -23,7 +23,9 @@ import {
   API_BASE_URL,
   blockCompany,
   createApplication,
+  createSavedJobSearch,
   deleteApplication,
+  deleteSavedJobSearch,
   fetchApplicantDocuments,
   acknowledgeErrors,
   fetchApplicationAnswers,
@@ -38,6 +40,7 @@ import {
   fetchPostingDetails,
   fetchPersonalInformation,
   fetchPostings,
+  fetchSavedJobSearches,
   fetchSettingsExport,
   restartServer,
   postFrontendLog,
@@ -59,6 +62,7 @@ import {
 import {
   DEFAULT_POSTINGS_FILTERS,
   loadPersistedFilters,
+  normalizePersistedFilters,
   savePersistedFilters,
   MATCH_PERCENT_THRESHOLDS
 } from "./src/filter-storage";
@@ -1626,6 +1630,14 @@ export default function App() {
   const [blockedCompanies, setBlockedCompanies] = useState([]);
   const [blockedCompaniesLoading, setBlockedCompaniesLoading] = useState(false);
   const [unblockingCompanyNames, setUnblockingCompanyNames] = useState({});
+  const [savedJobSearches, setSavedJobSearches] = useState([]);
+  const [savedJobSearchesLoading, setSavedJobSearchesLoading] = useState(false);
+  const [activeSavedJobSearchId, setActiveSavedJobSearchId] = useState(null);
+  const [savingJobSearch, setSavingJobSearch] = useState(false);
+  const [deletingJobSearchIds, setDeletingJobSearchIds] = useState({});
+  const [saveSearchModalVisible, setSaveSearchModalVisible] = useState(false);
+  const [saveSearchNameInput, setSaveSearchNameInput] = useState("");
+  const [saveSearchError, setSaveSearchError] = useState("");
   const [updatingApplicationIds, setUpdatingApplicationIds] = useState({});
   const [deletingApplicationIds, setDeletingApplicationIds] = useState({});
   const [openApplicationStatusForId, setOpenApplicationStatusForId] = useState(null);
@@ -2444,6 +2456,80 @@ export default function App() {
       if (!silent) {
         setBlockedCompaniesLoading(false);
       }
+    }
+  }, []);
+
+  const loadSavedJobSearches = useCallback(async (options = {}) => {
+    const silent = Boolean(options.silent);
+    if (!silent) {
+      setSavedJobSearchesLoading(true);
+    }
+    try {
+      const response = await fetchSavedJobSearches();
+      setSavedJobSearches(Array.isArray(response?.items) ? response.items : []);
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      if (!silent) {
+        setSavedJobSearchesLoading(false);
+      }
+    }
+  }, []);
+
+  const handleApplySavedJobSearch = useCallback((savedSearch) => {
+    if (!savedSearch) return;
+    setSearch(String(savedSearch.search || ""));
+    setPostingsFilters(normalizePersistedFilters(savedSearch.filters));
+    setActiveSavedJobSearchId(savedSearch.id);
+  }, []);
+
+  const openSaveSearchModal = useCallback(() => {
+    setSaveSearchNameInput("");
+    setSaveSearchError("");
+    setSaveSearchModalVisible(true);
+  }, []);
+
+  const handleSaveCurrentJobSearch = useCallback(async () => {
+    const name = saveSearchNameInput.trim();
+    if (!name) {
+      setSaveSearchError("Name is required.");
+      return;
+    }
+    setSavingJobSearch(true);
+    setSaveSearchError("");
+    try {
+      const response = await createSavedJobSearch({
+        name,
+        search,
+        filters: postingsFilters
+      });
+      setSaveSearchModalVisible(false);
+      setSaveSearchNameInput("");
+      await loadSavedJobSearches({ silent: true });
+      if (response?.item?.id) {
+        setActiveSavedJobSearchId(response.item.id);
+      }
+    } catch (e) {
+      setSaveSearchError(String(e.message || e));
+    } finally {
+      setSavingJobSearch(false);
+    }
+  }, [saveSearchNameInput, search, postingsFilters, loadSavedJobSearches]);
+
+  const handleDeleteSavedJobSearch = useCallback(async (id) => {
+    setDeletingJobSearchIds((prev) => ({ ...prev, [id]: true }));
+    try {
+      await deleteSavedJobSearch(id);
+      setSavedJobSearches((prev) => prev.filter((item) => item.id !== id));
+      setActiveSavedJobSearchId((prev) => (prev === id ? null : prev));
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      setDeletingJobSearchIds((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
     }
   }, []);
 
@@ -3545,7 +3631,8 @@ export default function App() {
     loadStatus();
     loadSyncServiceSettings({ silent: true });
     loadPostingFilterOptions();
-  }, [effectiveActivePage, loadStatus, loadSyncServiceSettings, loadPostingFilterOptions]);
+    loadSavedJobSearches({ silent: true });
+  }, [effectiveActivePage, loadStatus, loadSyncServiceSettings, loadPostingFilterOptions, loadSavedJobSearches]);
 
   useEffect(() => {
     if (effectiveActivePage !== PAGE_KEYS.SETTINGS_SYNC) return;
@@ -3571,6 +3658,40 @@ export default function App() {
           <Text style={styles.syncBtnText}>{syncing ? "Syncing..." : "Sync Postings"}</Text>
         </Pressable>
       </View>
+
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        style={styles.savedSearchesRow}
+        contentContainerStyle={styles.savedSearchesRowContent}
+      >
+        <Pressable onPress={openSaveSearchModal} style={styles.savedSearchNewChip}>
+          <Text style={styles.savedSearchNewChipText}>+ New Search</Text>
+        </Pressable>
+        {savedJobSearchesLoading ? <ActivityIndicator size="small" style={styles.savedSearchesLoader} /> : null}
+        {savedJobSearches.map((savedSearch) => {
+          const active = activeSavedJobSearchId === savedSearch.id;
+          const deleting = Boolean(deletingJobSearchIds[savedSearch.id]);
+          return (
+            <View key={`saved-search-${savedSearch.id}`} style={[styles.savedSearchChip, active ? styles.savedSearchChipActive : null]}>
+              <Pressable onPress={() => handleApplySavedJobSearch(savedSearch)} style={styles.savedSearchChipLabelBtn}>
+                <Text style={[styles.savedSearchChipText, active ? styles.savedSearchChipTextActive : null]}>
+                  {savedSearch.name}
+                </Text>
+              </Pressable>
+              <Pressable
+                onPress={() => handleDeleteSavedJobSearch(savedSearch.id)}
+                disabled={deleting}
+                style={styles.savedSearchChipRemoveBtn}
+              >
+                <Text style={[styles.savedSearchChipText, active ? styles.savedSearchChipTextActive : null]}>
+                  {deleting ? "..." : "×"}
+                </Text>
+              </Pressable>
+            </View>
+          );
+        })}
+      </ScrollView>
 
       <View style={styles.reviewQueueRow}>
         {POSTING_REVIEW_QUEUES.map((queue) => {
@@ -3917,6 +4038,44 @@ export default function App() {
                 </Pressable>
               </ScrollView>
             )}
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={saveSearchModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setSaveSearchModalVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <Pressable style={styles.modalBackdrop} onPress={() => setSaveSearchModalVisible(false)} />
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeaderRow}>
+              <Text style={styles.modalTitle}>Save This Search</Text>
+              <Pressable onPress={() => setSaveSearchModalVisible(false)} style={styles.modalCloseButton}>
+                <Text style={styles.modalCloseButtonText}>Close</Text>
+              </Pressable>
+            </View>
+            <Text style={styles.settingsDescription}>
+              Saves the current search text and filters so you can jump back to this job search later.
+            </Text>
+            <TextInput
+              style={styles.textField}
+              value={saveSearchNameInput}
+              onChangeText={setSaveSearchNameInput}
+              placeholder="e.g. Remote frontend roles"
+              autoCapitalize="none"
+              autoFocus
+            />
+            {saveSearchError ? <Text style={styles.inlineNotice}>{saveSearchError}</Text> : null}
+            <Pressable
+              onPress={handleSaveCurrentJobSearch}
+              disabled={savingJobSearch}
+              style={[styles.settingsSaveButton, savingJobSearch ? styles.blockedCompanyUnblockBtnDisabled : null]}
+            >
+              <Text style={styles.settingsSaveButtonText}>{savingJobSearch ? "Saving..." : "Save Search"}</Text>
+            </Pressable>
           </View>
         </View>
       </Modal>
@@ -5537,6 +5696,62 @@ const styles = StyleSheet.create({
     color: "#7a8798",
     fontSize: 12,
     fontWeight: "600"
+  },
+  savedSearchesRow: {
+    paddingHorizontal: 16,
+    marginBottom: 8
+  },
+  savedSearchesRowContent: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  savedSearchesLoader: {
+    marginLeft: 4
+  },
+  savedSearchNewChip: {
+    borderWidth: 1,
+    borderColor: "#0b6e4f",
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: "#0b6e4f"
+  },
+  savedSearchNewChipText: {
+    color: "#ffffff",
+    fontSize: 12,
+    fontWeight: "700"
+  },
+  savedSearchChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#c6ceda",
+    backgroundColor: "#ffffff",
+    borderRadius: 999,
+    paddingLeft: 12,
+    paddingRight: 6,
+    paddingVertical: 6,
+    gap: 6
+  },
+  savedSearchChipActive: {
+    borderColor: "#102a43",
+    backgroundColor: "#102a43"
+  },
+  savedSearchChipLabelBtn: {
+    paddingVertical: 2
+  },
+  savedSearchChipRemoveBtn: {
+    paddingHorizontal: 6,
+    paddingVertical: 2
+  },
+  savedSearchChipText: {
+    color: "#334e68",
+    fontSize: 12,
+    fontWeight: "600"
+  },
+  savedSearchChipTextActive: {
+    color: "#ffffff"
   },
   postingsFiltersPanel: {
     marginHorizontal: 16,
