@@ -2587,6 +2587,8 @@ function createServer() {
         include_ignored: normalizeBoolean(req.query.include_ignored, false),
         include_descriptions: normalizeBoolean(req.query.include_descriptions, true),
         review_queue: String(req.query.review_queue || "").trim(),
+        include_match: normalizeBoolean(req.query.include_match, false),
+        min_match_percent: req.query.min_match_percent,
         signal: abortController.signal
       });
 

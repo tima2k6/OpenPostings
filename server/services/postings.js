@@ -52,6 +52,23 @@ function getPostingFreshnessCutoffEpoch() {
   return nowEpochSeconds() - getPostingFreshnessWindowSeconds();
 }
 
+function parseJsonArraySafe(value) {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function normalizeMatchPercentFilter(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  return Math.max(0, Math.min(100, numeric));
+}
+
 // A search term is user text, so % and _ arrive as literals but mean "anything" to LIKE.
 // Leaving them unescaped cannot return a wrong row -- the JS filter still decides -- but a
 // term containing % would match every posting and hand the whole table back to JS, which
@@ -210,6 +227,24 @@ function buildSeekPredicate(sortBy, cursor) {
       ]
     };
   }
+  if (sortBy === "match_desc") {
+    // Same three-tier descending tuple as the last_seen_epoch/id case below, with
+    // match_sort_key (COALESCE(m.match_percent, -1), see candidateQuery above) as the
+    // leading column -- a plain descending seek predicate works because -1 sorting below
+    // every real 0-100 score already gives "never scored" rows the nulls-last position,
+    // with no separate NULL-aware branch needed here.
+    return {
+      sql: `AND (
+        COALESCE(m.match_percent, -1) < ?
+        OR (COALESCE(m.match_percent, -1) = ? AND p.last_seen_epoch < ?)
+        OR (COALESCE(m.match_percent, -1) = ? AND p.last_seen_epoch = ? AND p.id < ?)
+      )`,
+      params: [
+        cursor.match_sort_key, cursor.match_sort_key, cursor.last_seen_epoch,
+        cursor.match_sort_key, cursor.last_seen_epoch, cursor.id
+      ]
+    };
+  }
   const column = sortBy === "first_seen_desc" ? "first_seen_epoch" : "last_seen_epoch";
   return {
     sql: `AND (
@@ -224,6 +259,9 @@ function extractSeekCursor(sortBy, row) {
   if (!row) return null;
   if (sortBy === "company_asc") {
     return { company_name: row.company_name, position_name: row.position_name, id: row.id };
+  }
+  if (sortBy === "match_desc") {
+    return { match_sort_key: Number(row.match_sort_key), last_seen_epoch: row.last_seen_epoch, id: row.id };
   }
   const column = sortBy === "first_seen_desc" ? "first_seen_epoch" : "last_seen_epoch";
   return { [column]: row[column], id: row.id };
@@ -554,6 +592,12 @@ async function listPostingsWithFilters(options = {}) {
     .filter(Boolean);
   const payMinFilter = normalizePayFilterNumber(options?.pay_min);
   const payMaxFilter = normalizePayFilterNumber(options?.pay_max);
+  const minMatchPercentFilter = normalizeMatchPercentFilter(options?.min_match_percent);
+  // include_match defaults false: joining posting_match_scores forces this into the
+  // wide-scan branch below (see needsMatchJoin), so an unrequested join must not turn every
+  // ordinary page load into a chunked scan. sort_by=match_desc or min_match_percent opt in
+  // implicitly, since a match-ordered or match-filtered result is meaningless without it.
+  const includeMatch = normalizeBoolean(options?.include_match, false);
   // Most rows carry no pay figure at all, so a pay range that dropped them excluded whole
   // employers rather than out-of-range offers. Unknown pay stays in unless opted out.
   const includeUnknownPay = normalizeBoolean(options?.include_unknown_pay, true);
@@ -604,9 +648,14 @@ async function listPostingsWithFilters(options = {}) {
     // no-filter branch skips the JS predicate entirely, so the query returned the whole
     // unfiltered listing while looking like it had filtered.
     cityFilters.length > 0 ||
-    !(remoteFilters.length === 1 && remoteFilters[0] === "all");
+    !(remoteFilters.length === 1 && remoteFilters[0] === "all") ||
+    minMatchPercentFilter !== null;
 
-  const needsWideScan = Boolean(search) || hasStructuredFilters || Boolean(reviewQueue);
+  // Ordering or filtering by a joined column has no place in the bounded branch's plain
+  // `ORDER BY ... LIMIT ? OFFSET ?` -- it needs the chunked/seek-predicate machinery below,
+  // the same as any other filter SQL alone cannot express.
+  const needsMatchJoin = includeMatch || minMatchPercentFilter !== null || sortBy === "match_desc";
+  const needsWideScan = Boolean(search) || hasStructuredFilters || Boolean(reviewQueue) || needsMatchJoin;
   const postingLocationByJobUrl = getPostingLocationByJobUrl();
   const stateLocationFallbackUrls = stateCodes.length > 0
     ? Array.from(postingLocationByJobUrl.entries())
@@ -622,7 +671,7 @@ async function listPostingsWithFilters(options = {}) {
   const runPostingsQuery = async () => {
   let rows = [];
   let candidateQuery = null;
-  if (!search && !hasStructuredFilters && !reviewQueue) {
+  if (!search && !hasStructuredFilters && !reviewQueue && !needsMatchJoin) {
     if (includeApplied && includeIgnored) {
       rows = await db.all(
         `
@@ -723,31 +772,107 @@ async function listPostingsWithFilters(options = {}) {
     const wideScanOrderByClause = sortBy === "company_asc"
       ? "company_name ASC, position_name ASC, id ASC"
       : orderByClause;
-    candidateQuery = {
-      sql: `
-        SELECT p.id, p.company_name, p.position_name, p.job_posting_url, p.posting_date,
+    const baseSelect = `p.id, p.company_name, p.position_name, p.job_posting_url, p.posting_date,
                p.location, p.locations_json, p.status, p.location_conflict,
                p.requires_account, p.hidden, p.hidden_reason, p.compensation_type,
                p.education_levels, p.pay_min, p.pay_max, p.pay_currency, p.pay_period,
                p.pay_raw, p.first_seen_epoch, p.last_seen_epoch,
                CASE WHEN p.job_description IS NOT NULL AND TRIM(p.job_description) <> '' THEN 1 ELSE 0 END AS description_available,
-               ${reviewStateSelect} AS _review_state
-        FROM Postings p
-        ${reviewStateJoin}
-        WHERE ${reviewVisibilitySql}
+               ${reviewStateSelect} AS _review_state`;
+    const baseWhere = `WHERE ${reviewVisibilitySql}
           AND NOT EXISTS (
           SELECT 1
           FROM blocked_companies b
           WHERE b.normalized_company_name = LOWER(TRIM(p.company_name))
         )
-        ${reviewStateSql}
-        ${prefilter.sql}
-        __SEEK_PREDICATE__
-        ORDER BY ${wideScanOrderByClause}
-      `,
-      params: [...reviewVisibilityParams, ...prefilter.params],
-      sortBy
-    };
+        ${reviewStateSql}`;
+    const baseParams = [...reviewVisibilityParams, ...prefilter.params];
+    // Every phase's WHERE places its own extra predicate (if any) between baseWhere's `?`
+    // and prefilter.sql's `?`s -- textually right after reviewStateSql, same position in
+    // every phase below -- so this ordering has to match each phase's SQL text exactly.
+    const paramsWithExtra = (extra) => [...reviewVisibilityParams, ...extra, ...prefilter.params];
+
+    if (sortBy === "match_desc") {
+      // A LEFT JOIN ordered by COALESCE(m.match_percent, -1) has no index to serve the
+      // ORDER BY -- SQLite falls back to sorting the entire visible Postings set in a temp
+      // b-tree (measured ~30s against 1.7M rows). Splitting into two phases lets each one
+      // use an index for its own ordering instead: phase 1 drives from
+      // posting_match_scores' own index (idx_posting_match_scores_percent, cost
+      // proportional to how many postings are scored, not the whole table); phase 2 covers
+      // postings with no score yet using the same last_seen_epoch/id index the default sort
+      // already relies on. CROSS JOIN is a documented SQLite idiom that pins the join order
+      // to the FROM-clause order -- without it the planner still preferred driving from
+      // Postings' own index and lost the free ordering from idx_posting_match_scores_percent.
+      const scoredPhase = {
+        sql: `
+          SELECT ${baseSelect}, m.match_percent AS match_sort_key, m.match_percent AS match_percent,
+                 m.overlap_terms_json AS match_overlap_terms_json,
+                 m.unmatched_requirements_json AS match_unmatched_requirements_json
+          FROM posting_match_scores m
+          CROSS JOIN Postings p ON p.id = m.posting_id
+          ${reviewStateJoin}
+          ${baseWhere}
+          ${minMatchPercentFilter !== null ? "AND m.match_percent >= ?" : ""}
+          ${prefilter.sql}
+          __SEEK_PREDICATE__
+          ORDER BY m.match_percent DESC, p.last_seen_epoch DESC, p.id DESC
+        `,
+        params: paramsWithExtra(minMatchPercentFilter !== null ? [minMatchPercentFilter] : []),
+        seekSortBy: "match_desc"
+      };
+      // Unscored postings can never satisfy a positive match threshold (there is nothing
+      // to compare), so this phase is pure waste once min_match_percent has excluded them
+      // all anyway.
+      const unscoredPhase = minMatchPercentFilter !== null
+        ? null
+        : {
+            sql: `
+              SELECT ${baseSelect}, -1 AS match_sort_key, NULL AS match_percent,
+                     NULL AS match_overlap_terms_json, NULL AS match_unmatched_requirements_json
+              FROM Postings p
+              ${reviewStateJoin}
+              ${baseWhere}
+              AND NOT EXISTS (SELECT 1 FROM posting_match_scores m2 WHERE m2.posting_id = p.id)
+              ${prefilter.sql}
+              __SEEK_PREDICATE__
+              ORDER BY p.last_seen_epoch DESC, p.id DESC
+            `,
+            params: baseParams,
+            seekSortBy: "recent"
+          };
+      candidateQuery = {
+        phases: [scoredPhase, ...(unscoredPhase ? [unscoredPhase] : [])],
+        sortBy
+      };
+    } else {
+      const matchJoinSql = needsMatchJoin ? "LEFT JOIN posting_match_scores m ON m.posting_id = p.id" : "";
+      const matchSelectSql = needsMatchJoin
+        ? `, COALESCE(m.match_percent, -1) AS match_sort_key, m.match_percent AS match_percent,
+               m.overlap_terms_json AS match_overlap_terms_json,
+               m.unmatched_requirements_json AS match_unmatched_requirements_json`
+        : "";
+      const minMatchPercentSql = minMatchPercentFilter !== null ? "AND COALESCE(m.match_percent, -1) >= ?" : "";
+      candidateQuery = {
+        phases: [
+          {
+            sql: `
+              SELECT ${baseSelect}${matchSelectSql}
+              FROM Postings p
+              ${reviewStateJoin}
+              ${matchJoinSql}
+              ${baseWhere}
+              ${minMatchPercentSql}
+              ${prefilter.sql}
+              __SEEK_PREDICATE__
+              ORDER BY ${wideScanOrderByClause}
+            `,
+            params: paramsWithExtra(minMatchPercentFilter !== null ? [minMatchPercentFilter] : []),
+            seekSortBy: sortBy
+          }
+        ],
+        sortBy
+      };
+    }
   }
 
   const loadCompanyAtsByNormalizedName = async (candidateRows) => {
@@ -867,7 +992,25 @@ async function listPostingsWithFilters(options = {}) {
           ? null
           : Boolean(Number(row?.requires_account)),
       pay_currency: normalizeCompensationCurrencyCode(row?.pay_currency),
-      pay_raw: String(row?.pay_raw || "").trim() || null
+      pay_raw: String(row?.pay_raw || "").trim() || null,
+      // Only present when the query actually joined posting_match_scores (see
+      // needsMatchJoin) -- undefined keys are dropped by JSON.stringify, so a caller that
+      // never asked for match data sees no shape change at all. match_sort_key and the raw
+      // *_json columns are internal to the seek predicate above and never shipped.
+      ...(needsMatchJoin
+        ? {
+            match_available: row?.match_percent !== null && row?.match_percent !== undefined,
+            match_percent:
+              row?.match_percent === null || row?.match_percent === undefined
+                ? null
+                : Math.round(Number(row.match_percent) * 10) / 10,
+            match_overlap_terms: parseJsonArraySafe(row?.match_overlap_terms_json),
+            match_unmatched_requirements: parseJsonArraySafe(row?.match_unmatched_requirements_json)
+          }
+        : {}),
+      match_sort_key: undefined,
+      match_overlap_terms_json: undefined,
+      match_unmatched_requirements_json: undefined
     };
   };
 
@@ -985,22 +1128,36 @@ async function listPostingsWithFilters(options = {}) {
     const targetMatchCount = offset + limit;
     const chunkSize = Math.max(250, Math.min(1000, limit * 4));
     const matchingRows = [];
+    // Almost always one phase -- see candidateQuery above. sort_by=match_desc is the one
+    // exception, with a second phase for postings that have not been scored yet; each
+    // phase has its own stable ordering and therefore its own seek cursor, reset when the
+    // walk moves on to the next one.
+    let phaseIndex = 0;
     let cursor = null;
 
-    while (matchingRows.length < targetMatchCount) {
+    while (matchingRows.length < targetMatchCount && phaseIndex < candidateQuery.phases.length) {
       throwIfAborted(signal);
-      const seek = buildSeekPredicate(candidateQuery.sortBy, cursor);
+      const phase = candidateQuery.phases[phaseIndex];
+      const seek = buildSeekPredicate(phase.seekSortBy, cursor);
       const candidateRows = await db.all(
-        `${candidateQuery.sql.replace("__SEEK_PREDICATE__", seek.sql)} LIMIT ?;`,
-        [...candidateQuery.params, ...seek.params, chunkSize]
+        `${phase.sql.replace("__SEEK_PREDICATE__", seek.sql)} LIMIT ?;`,
+        [...phase.params, ...seek.params, chunkSize]
       );
-      if (candidateRows.length === 0) break;
-      cursor = extractSeekCursor(candidateQuery.sortBy, candidateRows[candidateRows.length - 1]);
+      if (candidateRows.length === 0) {
+        phaseIndex += 1;
+        cursor = null;
+        continue;
+      }
+      cursor = extractSeekCursor(phase.seekSortBy, candidateRows[candidateRows.length - 1]);
 
       const filteredRows = await prepareCandidateRows(candidateRows);
       const remaining = targetMatchCount - matchingRows.length;
       matchingRows.push(...filteredRows.slice(0, remaining));
-      if (candidateRows.length < chunkSize) break;
+      if (candidateRows.length < chunkSize) {
+        phaseIndex += 1;
+        cursor = null;
+        continue;
+      }
 
       // Let status and other lightweight requests run between chunks. SQLite work is
       // asynchronous, but the classification/filter loop above is CPU-bound JavaScript.
@@ -1050,6 +1207,7 @@ async function listPostingsWithFilters(options = {}) {
       industries: industryKeys,
       compensation_types: compensationTypes,
       pay_periods: payPeriods,
+      min_match_percent: minMatchPercentFilter,
       pay_min: payMinFilter,
       pay_max: payMaxFilter,
       include_unknown_pay: includeUnknownPay,

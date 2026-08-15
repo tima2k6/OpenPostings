@@ -1,9 +1,9 @@
 const { normalizeLikeText, normalizeApplicationStatus, normalizeApplicationFit, normalizeAppliedByType, normalizeAppliedByLabel, APPLICATION_STATUS_OPTIONS } = require("../helpers/normalize-strings");
 const { parseNonNegativeInteger, nowEpochSeconds } = require("../helpers/normalize-numbers");
 const { markPostingAppliedState } = require("./postings.js");
-const { buildCoverLetterBrief } = require("./cover-letter.js");
 const { getApplicantDocument } = require("./applicant-documents.js");
-const { getDb, setDb, runInWriteTransaction } = require("../services/runtime-context")
+const { computeMatchForPosting, getMatchesByPostingIds } = require("./posting-match.js");
+const { getDb, getReadDb, setDb, runInWriteTransaction } = require("../services/runtime-context")
 
 async function resolveCompanyIdForApplication(companyName) {
   const normalized = normalizeLikeText(companyName);
@@ -132,11 +132,13 @@ async function getApplicationById(applicationId) {
   return mapApplicationRow(row);
 }
 
+// On the reader connection, not the writer -- see personal-info.js's getPersonalInformation
+// for why.
 async function listApplications(options = {}) {
   const limit = Math.max(1, Math.min(2000, Number(options?.limit || 500)));
   const offset = Math.max(0, Number(options?.offset || 0));
   const status = normalizeLikeText(options?.status);
-  const db = getDb()
+  const db = getReadDb()
 
   let rows = [];
   if (status && status !== "all") {
@@ -487,30 +489,53 @@ function average(values) {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
-// Reuses the cover-letter brief's requirement extraction and resume-overlap matching
-// (server/services/cover-letter.js) rather than building a second keyword comparison --
-// "does the JD match the resume" is exactly what that module already computes to write a
-// letter, and a requirement with no keyword support in the resume is the same signal
-// whether it feeds a denial dashboard or a cover letter.
+function buildFitResultFromLiveCompute(description, resumeText, posting) {
+  const computed = computeMatchForPosting({ description, resume_text: resumeText, posting });
+  return {
+    available: computed.available,
+    reason: computed.available ? null : "Description had no detectable requirements section.",
+    requirements_total: computed.requirements_total,
+    requirements_matched: computed.requirements_matched,
+    match_percent: computed.match_percent,
+    unmatched_requirements: computed.unmatched_requirements,
+    overlap_terms: computed.overlap_terms
+  };
+}
+
+// Reuses posting-match.js's computeMatchForPosting (itself a thin wrapper over
+// cover-letter.js's requirement extraction and resume-overlap matching) rather than
+// building a second keyword comparison -- "does the JD match the resume" is exactly what
+// that module already computes to write a letter, and a requirement with no keyword
+// support in the resume is the same signal whether it feeds a denial dashboard or a cover
+// letter. The background match-index job has usually already scored these postings, since
+// every application's posting is also a row in Postings; that cached score is read first,
+// and only a posting the job hasn't caught up to yet is scored live here.
 async function computeJobFitByApplicationId(applicationRows) {
-  const db = getDb();
+  const db = getReadDb();
   const fitByApplicationId = new Map();
 
   const jobPostingUrls = Array.from(
     new Set(applicationRows.map((row) => String(row?.job_posting_url || "").trim()).filter(Boolean))
   );
 
-  const descriptionByUrl = new Map();
+  const postingByUrl = new Map();
   if (jobPostingUrls.length > 0) {
     const placeholders = jobPostingUrls.map(() => "?").join(", ");
-    const descriptionRows = await db.all(
-      `SELECT job_posting_url, job_description FROM Postings WHERE job_posting_url IN (${placeholders});`,
+    const postingRows = await db.all(
+      `SELECT id, job_posting_url, job_description FROM Postings WHERE job_posting_url IN (${placeholders});`,
       jobPostingUrls
     );
-    for (const row of descriptionRows) {
-      descriptionByUrl.set(String(row.job_posting_url || ""), String(row.job_description || ""));
+    for (const row of postingRows) {
+      postingByUrl.set(String(row.job_posting_url || ""), {
+        id: Number(row.id),
+        job_description: String(row.job_description || "")
+      });
     }
   }
+
+  const cachedMatchesByPostingId = await getMatchesByPostingIds(
+    Array.from(postingByUrl.values()).map((posting) => posting.id)
+  );
 
   const resumeDocument = await getApplicantDocument("resume");
   const resumeText = String(resumeDocument?.text || "").trim();
@@ -518,33 +543,38 @@ async function computeJobFitByApplicationId(applicationRows) {
   for (const row of applicationRows) {
     const applicationId = Number(row?.id || 0);
     const jobPostingUrl = String(row?.job_posting_url || "").trim();
-    const description = jobPostingUrl ? String(descriptionByUrl.get(jobPostingUrl) || "").trim() : "";
+    const posting = jobPostingUrl ? postingByUrl.get(jobPostingUrl) : null;
+    const description = String(posting?.job_description || "").trim();
 
-    if (!description || !resumeText) {
+    if (!posting) {
       fitByApplicationId.set(applicationId, {
         available: false,
-        reason: !jobPostingUrl
-          ? "This application has no linked posting (applied before job_posting_url was tracked, or logged by hand)."
-          : !description
-            ? "No stored job description for this posting."
-            : "No resume uploaded to compare against."
+        reason: "This application has no linked posting (applied before job_posting_url was tracked, or logged by hand)."
       });
       continue;
     }
 
-    const brief = buildCoverLetterBrief({ description, resume_text: resumeText, posting: row });
-    const requirementsTotal = brief.requirements.length;
-    const requirementsUnmatched = brief.unmatched_requirements.length;
+    const cached = cachedMatchesByPostingId.get(posting.id);
+    const match = cached
+      ? {
+          available: cached.requirements_total > 0,
+          reason: cached.requirements_total > 0 ? null : "Description had no detectable requirements section.",
+          requirements_total: cached.requirements_total,
+          requirements_matched: cached.requirements_matched,
+          match_percent: cached.match_percent,
+          unmatched_requirements: cached.unmatched_requirements,
+          overlap_terms: cached.overlap_terms
+        }
+      : !description || !resumeText
+        ? {
+            available: false,
+            reason: !description
+              ? "No stored job description for this posting."
+              : "No resume uploaded to compare against."
+          }
+        : buildFitResultFromLiveCompute(description, resumeText, row);
 
-    fitByApplicationId.set(applicationId, {
-      available: requirementsTotal > 0,
-      reason: requirementsTotal > 0 ? null : "Description had no detectable requirements section.",
-      requirements_total: requirementsTotal,
-      requirements_matched: Math.max(0, requirementsTotal - requirementsUnmatched),
-      match_percent: requirementsTotal > 0 ? ((requirementsTotal - requirementsUnmatched) / requirementsTotal) * 100 : null,
-      unmatched_requirements: brief.unmatched_requirements.slice(0, 5),
-      overlap_terms: brief.overlap_terms.slice(0, 10).map((entry) => entry.term)
-    });
+    fitByApplicationId.set(applicationId, match);
   }
 
   return fitByApplicationId;
@@ -557,8 +587,10 @@ function median(values) {
   return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
+// On the reader connection, not the writer -- see personal-info.js's getPersonalInformation
+// for why.
 async function getApplicationDenialStats() {
-  const db = getDb();
+  const db = getReadDb();
   const rows = await db.all(
     `
       SELECT

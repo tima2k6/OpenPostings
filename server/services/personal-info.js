@@ -1,5 +1,5 @@
 const { normalizePersonalInformationInput, createDefaultPersonalInformation, PERSONAL_INFORMATION_FIELDS } = require("../helpers/personal-info-normalize")
-const { getDb, setDb, runInWriteTransaction } = require("./runtime-context.js");
+const { getDb, getReadDb, setDb, runInWriteTransaction } = require("./runtime-context.js");
 
 async function ensurePersonalInformationTable() {
   const db = getDb();
@@ -39,8 +39,11 @@ async function ensurePersonalInformationTable() {
 }
 
 
+// On the reader connection, not the writer: this is polled by every screen that shows the
+// applicant's name or documents, and queuing it behind a sync write is exactly the timeout
+// the app's own error message names.
 async function getPersonalInformation() {
-  const db = getDb();
+  const db = getReadDb();
   const row = await db.get(
     `
       SELECT

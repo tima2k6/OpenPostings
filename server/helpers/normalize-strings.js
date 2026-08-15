@@ -1,4 +1,4 @@
-const POSTING_SORT_OPTIONS = new Set(["recent", "company_asc", "first_seen_desc"]);
+const POSTING_SORT_OPTIONS = new Set(["recent", "company_asc", "first_seen_desc", "match_desc"]);
 const APPLICATION_STATUS_OPTIONS = new Set([
   "applied",
   "interview scheduled",

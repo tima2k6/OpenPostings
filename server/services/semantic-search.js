@@ -21,7 +21,7 @@
 // not connect two texts that describe the same work in entirely disjoint vocabulary. If a
 // neural backend is ever wanted, `scoreCandidates` is the seam: replace it and leave the
 // rest.
-const { getDb, runInWriteTransaction } = require("./runtime-context.js");
+const { getDb, getReadDb, runInWriteTransaction } = require("./runtime-context.js");
 
 const FTS_TABLE = "postings_fts";
 const MAX_QUERY_TERMS = 60;
@@ -75,8 +75,10 @@ function toMatchExpression(terms) {
   return terms.map((term) => `"${term.replace(/"/g, '""')}"`).join(" OR ");
 }
 
+// On the reader connection, not the writer -- see personal-info.js's getPersonalInformation
+// for why. This is a pure read; the index/table creation paths below stay on the writer.
 async function ftsIndexExists() {
-  const db = getDb();
+  const db = getReadDb();
   const row = await db.get(
     `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1;`,
     [FTS_TABLE]
@@ -104,8 +106,10 @@ async function ensureIndexStateTable() {
 }
 
 async function readIndexState() {
-  const db = getDb();
   await ensureIndexStateTable();
+  // On the reader connection, not the writer -- the table-creation/seed check above stays
+  // on the writer since it may CREATE/INSERT.
+  const db = getReadDb();
   const row = await db.get(`SELECT last_indexed_id, indexed_count FROM semantic_index_state WHERE id = 1;`);
   return {
     last_indexed_id: Number(row?.last_indexed_id || 0),
@@ -239,7 +243,7 @@ async function rebuildSemanticIndex({
 // The ranking step, isolated so a different backend can replace it without touching the
 // query plumbing above or the tool surface below.
 async function scoreCandidates(queryText, { limit = 50, pool = 500 } = {}) {
-  const db = getDb();
+  const db = getReadDb();
   const terms = buildQueryTerms(queryText);
   if (terms.length === 0) return { terms, rows: [] };
 
@@ -267,7 +271,7 @@ async function scoreCandidates(queryText, { limit = 50, pool = 500 } = {}) {
 // similar_to: free text (a resume, a job description, a paragraph describing the work) or
 // an existing posting's URL/id, whose stored description becomes the query.
 async function findSimilarPostings(options = {}) {
-  const db = getDb();
+  const db = getReadDb();
   if (!(await ftsIndexExists())) {
     throw new Error(
       "Semantic index has not been built. Run `node server/scripts/build-semantic-index.js` or POST /semantic/reindex."

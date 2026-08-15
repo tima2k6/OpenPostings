@@ -65,7 +65,7 @@ const DB_PATH = process.env.DB_PATH || path.resolve(__dirname, "..", "jobs.db");
 const MCP_ATS_FILTER_VALUES = Object.freeze(Array.from(ATS_FILTER_OPTIONS));
 const MCP_REGION_FILTER_VALUES = Object.freeze(LOCATION_REGION_OPTIONS.map((option) => option.value));
 const MCP_REMOTE_FILTER_VALUES = Object.freeze(["all", "remote", "hybrid", "non_remote"]);
-const MCP_SORT_VALUES = Object.freeze(["recent", "company_asc"]);
+const MCP_SORT_VALUES = Object.freeze(["recent", "company_asc", "match_desc"]);
 const MCP_QUERY_SORT_VALUES = Object.freeze(Array.from(SORTABLE.keys()));
 const MCP_FIT_ASSESSMENT_VALUES = Object.freeze(Array.from(APPLICATION_FIT_OPTIONS));
 const MAX_CANDIDATE_LIMIT = 2000;
@@ -472,7 +472,12 @@ async function findCandidates(options = {}) {
     cities: normalizeStringArray(options.cities),
     // Descriptions are the bulk of the payload, and an agent that only needs to rank titles
     // and open URLs does not want them in its context. Opt in per call.
-    include_descriptions: normalizeBoolean(options.include_descriptions, false)
+    include_descriptions: normalizeBoolean(options.include_descriptions, false),
+    // Resume-match fields cost nothing extra once sort_by=match_desc or min_match_percent
+    // has already forced the join (see needsMatchJoin in listPostingsWithFilters), so they
+    // are included whenever either of those is set, same as the app's own list view.
+    include_match: normalizeBoolean(options.include_match, options.sort_by === "match_desc" || options.min_match_percent !== undefined),
+    min_match_percent: options.min_match_percent
   });
 
   return {
@@ -820,7 +825,7 @@ async function main() {
     "find_posting_candidates",
     {
       description:
-        "Find postings to prepare, using the same filter engine as the app's job list. Any filter left empty falls back to the saved MCP preference for it; pass use_settings=false to ignore saved preferences entirely. Applied, ignored and dead postings are excluded by default (include_dead=true to see verified-gone ones). Postings hidden only because their posting date is older than the freshness window are excluded too but remain applyable -- include_stale_dated=true brings them back. Rows carry canonical freshness, confidence and review state alongside compatibility fields such as hidden_reason and ignored. Pay ranges keep postings with no published pay figure -- pay_unknown_count reports how many -- unless include_unknown_pay=false. Rows carry location_conflict, which flags a posting whose description restricts hiring to fewer places than its header lists. Job descriptions are omitted unless include_descriptions=true. Use cities for city-level targeting: values are City|ST (get_filter_options lists them per state, busiest first) and they match parsed locations, so Kent|WA cannot return Kent in England or anything in Kentucky. Call get_filter_options for the valid values of the list filters.",
+        "Find postings to prepare, using the same filter engine as the app's job list. Any filter left empty falls back to the saved MCP preference for it; pass use_settings=false to ignore saved preferences entirely. Applied, ignored and dead postings are excluded by default (include_dead=true to see verified-gone ones). Postings hidden only because their posting date is older than the freshness window are excluded too but remain applyable -- include_stale_dated=true brings them back. Rows carry canonical freshness, confidence and review state alongside compatibility fields such as hidden_reason and ignored. Pay ranges keep postings with no published pay figure -- pay_unknown_count reports how many -- unless include_unknown_pay=false. Rows carry location_conflict, which flags a posting whose description restricts hiring to fewer places than its header lists. Job descriptions are omitted unless include_descriptions=true. Use cities for city-level targeting: values are City|ST (get_filter_options lists them per state, busiest first) and they match parsed locations, so Kent|WA cannot return Kent in England or anything in Kentucky. Call get_filter_options for the valid values of the list filters. sort_by=match_desc ranks by match_percent against the uploaded resume (a background job scores every posting with a stored description -- see get_resume; postings not yet scored sort last), with match_percent/match_overlap_terms/match_unmatched_requirements on each row; min_match_percent filters to postings scored at or above a threshold.",
       inputSchema: {
         search: z.string().optional(),
         ats: z
@@ -839,6 +844,7 @@ async function main() {
         regions: z.array(z.enum(MCP_REGION_FILTER_VALUES)).optional(),
         remote: z.enum(MCP_REMOTE_FILTER_VALUES).optional(),
         sort_by: z.enum(MCP_SORT_VALUES).optional(),
+        min_match_percent: z.number().min(0).max(100).optional(),
         hide_no_date: z.boolean().optional(),
         include_applied: z.boolean().optional(),
         include_ignored: z.boolean().optional(),

@@ -26,6 +26,12 @@ const SEMANTIC_WORKER_MAX_BATCHES = Number(process.env.SEMANTIC_INDEX_WORKER_MAX
 const SEMANTIC_WORKER_TIMEOUT_MS = Number(process.env.SEMANTIC_INDEX_WORKER_TIMEOUT_MS || 10 * 60 * 1000);
 const SEMANTIC_WORKER_SCRIPT = path.resolve(__dirname, "..", "scripts", "build-semantic-index.js");
 
+const MATCH_INTERVAL_MS = Number(process.env.MATCH_INDEX_INTERVAL_MS || 15 * 60 * 1000);
+const MATCH_WORKER_BATCH_SIZE = Number(process.env.MATCH_INDEX_WORKER_BATCH_SIZE || 25);
+const MATCH_WORKER_MAX_BATCHES = Number(process.env.MATCH_INDEX_WORKER_MAX_BATCHES || 16);
+const MATCH_WORKER_TIMEOUT_MS = Number(process.env.MATCH_INDEX_WORKER_TIMEOUT_MS || 10 * 60 * 1000);
+const MATCH_WORKER_SCRIPT = path.resolve(__dirname, "..", "scripts", "build-match-index.js");
+
 // When a run finds nothing to do, waiting the same short interval again just burns a query
 // every few minutes forever. Each idle run doubles the wait; any run that does work resets
 // it. Capped at 5 doublings (32x the interval) and separately at an hour, so a long-idle
@@ -46,7 +52,8 @@ function createEnrichmentState() {
 
 const enrichmentStatus = {
   descriptions: createEnrichmentState(),
-  semantic_index: createEnrichmentState()
+  semantic_index: createEnrichmentState(),
+  match_index: createEnrichmentState()
 };
 
 function getEnrichmentStatus() {
@@ -211,10 +218,83 @@ function startSemanticIndexLoop() {
   });
 }
 
+// Same reasoning as runSemanticIndexWorker: buildCoverLetterBrief's section extraction and
+// tokenization is synchronous, regex-heavy work over full description text, and running it
+// over a batch inline would block the API event loop the same way FTS5 indexing did.
+function runMatchIndexWorker({
+  rebuild = false,
+  batchSize = MATCH_WORKER_BATCH_SIZE,
+  maxBatches = MATCH_WORKER_MAX_BATCHES
+} = {}) {
+  const args = [
+    MATCH_WORKER_SCRIPT,
+    "--batch-size",
+    String(Math.max(1, Math.floor(Number(batchSize) || MATCH_WORKER_BATCH_SIZE))),
+    "--max-batches",
+    String(Math.max(1, Math.floor(Number(maxBatches) || MATCH_WORKER_MAX_BATCHES)))
+  ];
+  if (rebuild) args.push("--rebuild");
+
+  return new Promise((resolve, reject) => {
+    execFile(
+      process.execPath,
+      args,
+      {
+        env: process.env,
+        timeout: MATCH_WORKER_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024,
+        windowsHide: true
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          const detail = String(stderr || stdout || error.message).trim();
+          reject(new Error(`Match index worker failed: ${detail}`));
+          return;
+        }
+
+        const line = String(stdout)
+          .split(/\r?\n/)
+          .find((candidate) => candidate.startsWith("[build-match-index] "));
+        const match = line?.match(/^\[build-match-index\] (\{.*\}) in \d+s$/);
+        if (!match) {
+          reject(new Error(`Match index worker returned unexpected output: ${String(stdout).trim()}`));
+          return;
+        }
+
+        try {
+          resolve(JSON.parse(match[1]));
+        } catch (parseError) {
+          reject(new Error(`Match index worker returned invalid JSON: ${parseError.message}`));
+        }
+      }
+    );
+  });
+}
+
+function startMatchIndexLoop() {
+  return startEnrichmentLoop({
+    name: "match index",
+    state: enrichmentStatus.match_index,
+    intervalMs: MATCH_INTERVAL_MS,
+    task: async () => {
+      // Incremental, and self-invalidating on a resume re-upload -- see posting-match.js.
+      const summary = await runMatchIndexWorker({});
+      enrichmentStatus.match_index.last_summary = summary;
+      if (summary.scored > 0) {
+        console.log(
+          `[OpenPostings API] match index: +${summary.scored} postings scored${summary.rebuilt ? " (resume changed, rebuilt)" : ""}`
+        );
+      }
+      return summary.scored;
+    }
+  });
+}
+
 function startEnrichmentLoops() {
   return {
     stopDescriptions: startDescriptionBackfillLoop(),
     stopSemanticIndex: startSemanticIndexLoop(),
+    stopMatchIndex: startMatchIndexLoop(),
     started_at: nowEpochSeconds()
   };
 }
@@ -223,14 +303,19 @@ module.exports = {
   startEnrichmentLoops,
   startDescriptionBackfillLoop,
   startSemanticIndexLoop,
+  startMatchIndexLoop,
   // Exported for tests: the scheduling guarantees (single-flight, idle backoff, a failing
   // run not killing the loop) are the part worth pinning down.
   startEnrichmentLoop,
   runSemanticIndexWorker,
+  runMatchIndexWorker,
   createEnrichmentState,
   getEnrichmentStatus,
   DESCRIPTION_INTERVAL_MS,
   SEMANTIC_INTERVAL_MS,
   SEMANTIC_WORKER_BATCH_SIZE,
-  SEMANTIC_WORKER_MAX_BATCHES
+  SEMANTIC_WORKER_MAX_BATCHES,
+  MATCH_INTERVAL_MS,
+  MATCH_WORKER_BATCH_SIZE,
+  MATCH_WORKER_MAX_BATCHES
 };

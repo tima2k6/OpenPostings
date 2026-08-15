@@ -237,6 +237,15 @@ export function fetchPostings(search = "", limit = 500, offset = 0, filters = {}
   if (filters?.sort_by) {
     params.set("sort_by", String(filters.sort_by));
   }
+  // Requesting the join costs nothing extra once the sort itself needs it, so the two stay
+  // in sync automatically -- a caller need not remember to ask for match fields separately
+  // from asking to sort by them.
+  if (filters?.sort_by === "match_desc" || filters?.min_match_percent) {
+    params.set("include_match", "1");
+  }
+  if (filters?.min_match_percent) {
+    params.set("min_match_percent", String(filters.min_match_percent));
+  }
   // Descriptions dominate the response size, and the listing has a toggle that hides them.
   // When it is off there is no reason to ship them.
   if (filters?.include_descriptions === false) {

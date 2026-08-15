@@ -11,7 +11,7 @@
 // the start, with an empty value meaning "not answered yet". An unanswered question is a
 // question to put to the user, never one to fill in from context, from the resume, or from
 // what a similar posting seemed to want.
-const { getDb } = require("./runtime-context.js");
+const { getDb, getReadDb } = require("./runtime-context.js");
 
 const MAX_KEY_LENGTH = 64;
 const MAX_VALUE_LENGTH = 4000;
@@ -74,9 +74,11 @@ async function ensureApplicationAnswersTable() {
   }
 }
 
+// On the reader connection, not the writer -- see getPersonalInformation for why. The
+// table-creation/seed check above stays on the writer since it may CREATE/INSERT.
 async function listApplicationAnswers() {
   await ensureApplicationAnswersTable();
-  const db = getDb();
+  const db = getReadDb();
   const rows = await db.all(
     `SELECT key, value, label, category, notes, updated_at
      FROM application_answers

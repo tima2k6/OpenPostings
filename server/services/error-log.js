@@ -10,7 +10,7 @@
 // that failed in a way that costs the user something -- an application not logged, a
 // document not saved -- so the app can say so. logs/frontend-client.log still exists for
 // diagnostics; that is a file nobody reads, which is exactly the problem.
-const { getDb } = require("./runtime-context.js");
+const { getDb, getReadDb } = require("./runtime-context.js");
 const { nowEpochSeconds } = require("../helpers/normalize-numbers.js");
 
 const MAX_CONTEXT_CHARS = 4000;
@@ -93,9 +93,11 @@ function mapRow(row) {
 // application-submission failures ("api", "mcp") and operational/infra warnings ("sync",
 // "health"), and a caller for one must not surface the other. Omitting it returns everything,
 // for callers (or ad-hoc inspection) that genuinely want the whole log.
+// On the reader connection, not the writer -- see getPersonalInformation for why. The
+// table-creation check above stays on the writer since it may CREATE/ALTER.
 async function listErrors({ limit = 50, include_acknowledged = false, sources = null } = {}) {
   await ensureErrorLogTable();
-  const db = getDb();
+  const db = getReadDb();
   const bounded = Math.max(1, Math.min(500, Number(limit) || 50));
   const sourceList = Array.isArray(sources)
     ? sources.map((value) => String(value || "").trim()).filter(Boolean)

@@ -10,13 +10,17 @@ export const DEFAULT_POSTINGS_FILTERS = Object.freeze({
   counties: [],
   remote: ["all"],
   hide_no_date: false,
-  sort_by: "recent"
+  sort_by: "recent",
+  min_match_percent: 0
 });
 
 const REMOTE_FILTER_VALUES = ["all", "remote", "hybrid", "non_remote"];
 // Mirrors POSTING_SORT_OPTIONS in server/helpers/normalize-strings.js. An unknown stored
 // value falls back to the default rather than being sent on to the API.
-const POSTING_SORT_VALUES = ["recent", "first_seen_desc", "company_asc"];
+const POSTING_SORT_VALUES = ["recent", "first_seen_desc", "company_asc", "match_desc"];
+// Mirrors normalizeMatchPercentFilter in server/services/postings.js. 0 means "off" -- no
+// threshold is sent to the API, same as an empty pay_min.
+export const MATCH_PERCENT_THRESHOLDS = [0, 50, 70, 90];
 
 function toStringArray(value) {
   if (!Array.isArray(value)) return [];
@@ -50,7 +54,10 @@ export function normalizePersistedFilters(stored) {
     hide_no_date: source.hide_no_date === true,
     sort_by: POSTING_SORT_VALUES.includes(String(source.sort_by ?? ""))
       ? String(source.sort_by)
-      : DEFAULT_POSTINGS_FILTERS.sort_by
+      : DEFAULT_POSTINGS_FILTERS.sort_by,
+    min_match_percent: MATCH_PERCENT_THRESHOLDS.includes(Number(source.min_match_percent))
+      ? Number(source.min_match_percent)
+      : DEFAULT_POSTINGS_FILTERS.min_match_percent
   };
 }
 

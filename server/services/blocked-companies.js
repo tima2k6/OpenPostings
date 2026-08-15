@@ -1,4 +1,4 @@
-const { getDb, setDb } = require("./runtime-context.js");
+const { getDb, getReadDb, setDb } = require("./runtime-context.js");
 const { normalizeCompanyNameForBlockList } = require("../helpers/normalize-ats.js")
 const { nowEpochSeconds } = require("../helpers/normalize-numbers.js")
 async function ensureBlockedCompaniesTable() {
@@ -15,8 +15,9 @@ async function ensureBlockedCompaniesTable() {
   `);
 }
 
+// On the reader connection, not the writer -- see getPersonalInformation for why.
 async function listBlockedCompanies() {
-  const db = getDb();
+  const db = getReadDb();
   const rows = await db.all(`
     SELECT normalized_company_name, company_name, blocked_at_epoch
     FROM blocked_companies

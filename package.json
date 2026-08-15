@@ -28,6 +28,8 @@
     "test:backend:error-log": "node server/tests/error-log.test.js",
     "test:backend:write-transaction": "node server/tests/write-transaction.test.js",
     "test:backend:write-liveness": "node server/tests/write-liveness.test.js",
+    "test:backend:reader-connection-routing": "node server/tests/reader-connection-routing.test.js",
+    "test:backend:posting-match-index": "node server/tests/posting-match-index.test.js",
     "test:backend:request-cancellation": "node server/tests/request-cancellation.test.js",
     "test:backend:sync-target-hard-deadline": "node server/tests/sync-target-hard-deadline.test.js",
     "test:backend:sync-resume": "node server/tests/sync-resume.test.js",

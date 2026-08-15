@@ -13,7 +13,7 @@ const fs = require("fs");
 const path = require("path");
 const zlib = require("zlib");
 const { decodeHtmlEntities } = require("../helpers/normalize-strings.js");
-const { getDb, runInWriteTransaction } = require("./runtime-context.js");
+const { getDb, getReadDb, runInWriteTransaction } = require("./runtime-context.js");
 
 // Documents are an open-ended map now, not a fixed pair. A career change means keeping
 // several tailored resumes -- "resume_hospitality" against the 13 years already served,
@@ -282,9 +282,11 @@ async function ensureApplicantDocumentsTable() {
 
 // Keys and metadata only -- never the text or the bytes. This is what a caller reads to
 // find out which documents exist before asking for one.
+// On the reader connection, not the writer -- see personal-info.js's getPersonalInformation
+// for why. ensureApplicantDocumentsTable stays on the writer since it may CREATE/ALTER.
 async function listApplicantDocuments() {
   await ensureApplicantDocumentsTable();
-  const db = getDb();
+  const db = getReadDb();
   const rows = await db.all(
     `SELECT kind, file_name, format, chars, truncated, pages, label, uploaded_at
      FROM applicant_documents
@@ -429,12 +431,14 @@ async function saveApplicantDocument({ kind, file_name, content, label }) {
   };
 }
 
+// On the reader connection, not the writer -- see personal-info.js's getPersonalInformation
+// for why. ensureApplicantDocumentsTable stays on the writer since it may CREATE/ALTER.
 async function getApplicantDocument(kind, { includeContent = false } = {}) {
   const normalizedKind = normalizeDocumentKind(kind);
   if (!normalizedKind) return null;
 
   await ensureApplicantDocumentsTable();
-  const db = getDb();
+  const db = getReadDb();
   const row = await db.get(
     `
       SELECT kind, file_name, format, ${includeContent ? "content," : ""} extracted_text, chars, truncated, pages, label, uploaded_at

@@ -59,7 +59,8 @@ import {
 import {
   DEFAULT_POSTINGS_FILTERS,
   loadPersistedFilters,
-  savePersistedFilters
+  savePersistedFilters,
+  MATCH_PERCENT_THRESHOLDS
 } from "./src/filter-storage";
 
 // "recent" is last_seen_epoch, i.e. when the sync last touched the row -- rows in a batch
@@ -68,7 +69,8 @@ import {
 const POSTING_SORT_OPTIONS = [
   { value: "first_seen_desc", label: "Newest found" },
   { value: "recent", label: "Recently synced" },
-  { value: "company_asc", label: "Company A-Z" }
+  { value: "company_asc", label: "Company A-Z" },
+  { value: "match_desc", label: "Best match" }
 ];
 
 // A backgrounded tab or app has no one looking at it, but its polling intervals keep
@@ -596,6 +598,15 @@ function getPostingConfidenceLabels(item) {
   if (confidence.liveness === "confirmed_live") labels.push("Live checked");
   if (confidence.liveness === "delisted") labels.push("Delisted");
   return labels;
+}
+
+// Bands mirror the ones the denial dashboard's "Job description match" already uses
+// (PerformanceMetric's tone prop) so the same score reads the same way in both places.
+function getPostingMatchTone(matchPercent) {
+  if (matchPercent === null || matchPercent === undefined) return "neutral";
+  if (matchPercent >= 70) return "good";
+  if (matchPercent >= 40) return "warning";
+  return "critical";
 }
 
 function formatPostingCompensationAmount(value, currencyCode = "") {
@@ -1167,6 +1178,7 @@ function PostingCard({
   showDescriptions
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [matchDetailsOpen, setMatchDetailsOpen] = useState(false);
   const postingUrl = String(item?.job_posting_url || "").trim();
   const onOpenPosting = useCallback(() => onOpenDetails(item), [item, onOpenDetails]);
 
@@ -1193,6 +1205,14 @@ function PostingCard({
   const reviewState = String(item?.review_state || "unseen");
   const freshnessLabel = getPostingFreshnessLabel(item);
   const confidenceLabels = getPostingConfidenceLabels(item);
+  const matchAvailable = Boolean(item?.match_available);
+  const matchPercent = matchAvailable ? Number(item?.match_percent) : null;
+  const matchTone = getPostingMatchTone(matchPercent);
+  const matchOverlapTerms = Array.isArray(item?.match_overlap_terms) ? item.match_overlap_terms : [];
+  const matchUnmatchedRequirements = Array.isArray(item?.match_unmatched_requirements)
+    ? item.match_unmatched_requirements
+    : [];
+  const hasMatchDetail = matchOverlapTerms.length > 0 || matchUnmatchedRequirements.length > 0;
 
   return (
     <View style={[styles.card, reviewState === "ignored" ? styles.cardIgnored : null, menuOpen ? styles.cardMenuOpen : null]}>
@@ -1208,8 +1228,50 @@ function PostingCard({
             <Text style={[styles.postingReviewBadge, reviewState === "ignored" ? styles.postingReviewBadgeIgnored : null]}>
               {reviewState === "shortlisted" ? "Shortlisted" : reviewState === "ignored" ? "Ignored" : reviewState === "viewed" ? "Viewed" : "New"}
             </Text>
+            {matchAvailable ? (
+              <Pressable
+                disabled={!hasMatchDetail}
+                onPress={(event) => {
+                  event.stopPropagation();
+                  setMatchDetailsOpen((prev) => !prev);
+                }}
+              >
+                <Text
+                  style={[
+                    styles.postingMatchBadge,
+                    matchTone === "good"
+                      ? styles.postingMatchBadgeGood
+                      : matchTone === "warning"
+                        ? styles.postingMatchBadgeWarning
+                        : matchTone === "critical"
+                          ? styles.postingMatchBadgeCritical
+                          : null
+                  ]}
+                >
+                  {`${Math.round(matchPercent)}% match${hasMatchDetail ? (matchDetailsOpen ? " ▲" : " ▼") : ""}`}
+                </Text>
+              </Pressable>
+            ) : null}
             {confidenceLabels.map((label) => <Text key={label} style={styles.postingConfidenceBadge}>{label}</Text>)}
           </View>
+          {matchAvailable && matchDetailsOpen && hasMatchDetail ? (
+            <View style={styles.postingMatchDetail}>
+              {matchOverlapTerms.length > 0 ? (
+                <>
+                  <Text style={styles.postingMatchDetailHeadingFirst}>Your resume already covers</Text>
+                  <Text>{matchOverlapTerms.join(", ")}</Text>
+                </>
+              ) : null}
+              {matchUnmatchedRequirements.length > 0 ? (
+                <>
+                  <Text style={styles.postingMatchDetailHeading}>Not shown in your resume</Text>
+                  {matchUnmatchedRequirements.map((requirement, index) => (
+                    <Text key={index}>{`• ${requirement}`}</Text>
+                  ))}
+                </>
+              ) : null}
+            </View>
+          ) : null}
           {postingCompensationLabel ? <Text style={styles.postingCompensation}>{postingCompensationLabel}</Text> : null}
           {shouldRenderDescription ? (
             <Text style={styles.postingDescription}>{postingDescriptionLabel}</Text>
@@ -3146,7 +3208,8 @@ export default function App() {
       cities: [],
       remote: ["all"],
       hide_no_date: false,
-      sort_by: "recent"
+      sort_by: "recent",
+      min_match_percent: 0
     });
   }, []);
 
@@ -3746,6 +3809,31 @@ export default function App() {
                     }))
                   }
                 />
+              </View>
+            </View>
+
+            <View style={styles.remoteFilterGroup}>
+              <Text style={styles.fieldLabel}>Min match with resume</Text>
+              <View style={styles.remoteFilterChipsRow}>
+                {MATCH_PERCENT_THRESHOLDS.map((threshold) => {
+                  const selected = Number(postingsFilters.min_match_percent || 0) === threshold;
+                  return (
+                    <Pressable
+                      key={threshold}
+                      onPress={() =>
+                        setPostingsFilters((prev) => ({
+                          ...prev,
+                          min_match_percent: threshold
+                        }))
+                      }
+                      style={[styles.remoteFilterChip, selected ? styles.remoteFilterChipActive : null]}
+                    >
+                      <Text style={[styles.remoteFilterChipText, selected ? styles.remoteFilterChipTextActive : null]}>
+                        {threshold === 0 ? "Any" : `${threshold}%+`}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
               </View>
             </View>
           </ScrollView>
@@ -5727,6 +5815,41 @@ const styles = StyleSheet.create({
     fontSize: 10,
     paddingHorizontal: 7,
     paddingVertical: 3
+  },
+  postingMatchBadge: {
+    borderRadius: 999,
+    backgroundColor: "#edf2f7",
+    color: "#486581",
+    fontSize: 10,
+    fontWeight: "700",
+    paddingHorizontal: 7,
+    paddingVertical: 3
+  },
+  postingMatchBadgeGood: { backgroundColor: "#e8f6ef", color: "#0b6e4f" },
+  postingMatchBadgeWarning: { backgroundColor: "#fff7e6", color: "#92400e" },
+  postingMatchBadgeCritical: { backgroundColor: "#fdecea", color: "#b3261e" },
+  postingMatchDetail: {
+    marginTop: 8,
+    fontSize: 12,
+    color: "#334e68",
+    lineHeight: 18,
+    backgroundColor: "#f4f7fb",
+    borderWidth: 1,
+    borderColor: "#dbe3ec",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8
+  },
+  postingMatchDetailHeading: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#334e68",
+    marginTop: 4
+  },
+  postingMatchDetailHeadingFirst: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#334e68"
   },
   postingCompensation: {
     marginTop: 2,

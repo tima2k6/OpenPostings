@@ -1,14 +1,18 @@
 const { normalizeMcpSettingsInput, MCP_SETTINGS_DEFAULTS } = require("../helpers/normalize-mcp-settings");
 const { parseJsonArray } = require("../helpers/normalize-strings");
 const { parseNonNegativeInteger } = require("../helpers/normalize-numbers");
-const { getDb, setDb } = require("./runtime-context.js");
+const { getDb, getReadDb, setDb } = require("./runtime-context.js");
 
 // The SELECT below has to name preferred_regions and preferred_countries explicitly. It did
 // not, so upsertMcpSettings wrote both columns and every read handed back [] -- the settings
 // page showed the saved regions and countries while the candidate query behaved as though
 // none were set.
+//
+// On the reader connection, not the writer -- see personal-info.js's getPersonalInformation
+// for why: this is read on nearly every request path (MCP tools and the settings screen
+// both need it), so it must not queue behind a sync write transaction.
 async function getMcpSettings() {
-  const db = getDb();
+  const db = getReadDb();
   const row = await db.get(
     `
       SELECT

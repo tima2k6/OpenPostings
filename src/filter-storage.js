@@ -4,7 +4,7 @@ import { normalizePersistedFilters, normalizePersistedSearch } from "./filter-no
 
 const STORAGE_KEY = "openpostings.postings-filters.v1";
 
-export { DEFAULT_POSTINGS_FILTERS, normalizePersistedFilters } from "./filter-normalize";
+export { DEFAULT_POSTINGS_FILTERS, normalizePersistedFilters, MATCH_PERCENT_THRESHOLDS } from "./filter-normalize";
 
 export async function loadPersistedFilters() {
   try {
