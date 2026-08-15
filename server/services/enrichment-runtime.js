@@ -39,6 +39,29 @@ const MATCH_WORKER_SCRIPT = path.resolve(__dirname, "..", "scripts", "build-matc
 const MAX_IDLE_DOUBLINGS = 5;
 const MAX_BACKOFF_MS = 60 * 60 * 1000;
 
+// The startup stagger (see initialDelayMs below) only keeps the semantic reindex and match
+// index children apart for their first run. Each one's later schedule shifts on its own --
+// idle backoff doubles the wait whenever a run finds nothing to do, and resets the moment
+// one does -- so the two drift independently and can land on top of each other again hours
+// into a run. That happened on this box at 16:05:54Z: both children started within 719ms of
+// each other, and the ATS request queue logged a burst of 12s timeouts at the same instant.
+// Both children are already isolated from the API's event loop (see the comments on
+// runSemanticIndexWorker/runMatchIndexWorker), but that isolation is logical, not physical:
+// on a 2-CPU host, two simultaneous CPU-bound children leave the main process fighting them
+// for scheduler time, and HTTP handling -- including /sync/status on its own DB connection
+// -- goes slow right along with the ATS fetches. Chaining both through the same promise
+// queue guarantees at most one of them is ever running, no matter how their independent
+// backoff timers drift.
+let heavyEnrichmentWorkerChain = Promise.resolve();
+function runHeavyEnrichmentWorker(startWorker) {
+  const run = heavyEnrichmentWorkerChain.then(startWorker, startWorker);
+  heavyEnrichmentWorkerChain = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
 function createEnrichmentState() {
   return {
     running: false,
@@ -214,7 +237,8 @@ function startSemanticIndexLoop() {
     task: async () => {
       // Incremental: only postings newer than the highest id already indexed. The worker
       // is isolated from the API event loop and bounded even if a large backlog forms.
-      const summary = await runSemanticIndexWorker({});
+      // Serialized against the match index worker -- see runHeavyEnrichmentWorker.
+      const summary = await runHeavyEnrichmentWorker(() => runSemanticIndexWorker({}));
       enrichmentStatus.semantic_index.last_summary = summary;
       if (summary.indexed > 0) {
         console.log(
@@ -290,7 +314,8 @@ function startMatchIndexLoop() {
     initialDelayMs: 150 * 1000,
     task: async () => {
       // Incremental, and self-invalidating on a resume re-upload -- see posting-match.js.
-      const summary = await runMatchIndexWorker({});
+      // Serialized against the semantic index worker -- see runHeavyEnrichmentWorker.
+      const summary = await runHeavyEnrichmentWorker(() => runMatchIndexWorker({}));
       enrichmentStatus.match_index.last_summary = summary;
       if (summary.scored > 0) {
         console.log(
