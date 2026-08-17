@@ -8,6 +8,8 @@ const { getDb, setDb, getReadDb, getStatusReadDb, getPostingLocationByJobUrl } =
 const { parseCityFilters, rowMatchesCityFilters, parseLocationsJson, parsePostingLocation } = require("../helpers/parse-location")
 const { enrichPostingClassification, classifyPosting } = require("./posting-classification.js");
 const { setPostingIgnoredCompatibility } = require("./posting-review.js");
+const { getMatchesByPostingIdsForKeys } = require("./posting-match.js");
+const { DEFAULT_DOCUMENT_KEY, listResumeDocumentKeys } = require("./applicant-documents.js");
 
 const DEFAULT_COUNTRY_FILTER_OPTIONS = buildDefaultCountryFilterOptions();
 let postingLocationGeoFilterOptionsCache = {
@@ -593,6 +595,11 @@ async function listPostingsWithFilters(options = {}) {
   const payMinFilter = normalizePayFilterNumber(options?.pay_min);
   const payMaxFilter = normalizePayFilterNumber(options?.pay_max);
   const minMatchPercentFilter = normalizeMatchPercentFilter(options?.min_match_percent);
+  // Which resume's cached scores drive sort_by=match_desc and min_match_percent. Every
+  // uploaded resume's score is still attached to each returned row when include_match is on
+  // (see the match_scores enrichment below) -- this only picks the one axis SQL can order/
+  // filter by in a single query.
+  const resumeKey = String(options?.resume_key || "").trim() || DEFAULT_DOCUMENT_KEY;
   // include_match defaults false: joining posting_match_scores forces this into the
   // wide-scan branch below (see needsMatchJoin), so an unrequested join must not turn every
   // ordinary page load into a chunked scan. sort_by=match_desc or min_match_percent opt in
@@ -812,12 +819,13 @@ async function listPostingsWithFilters(options = {}) {
           CROSS JOIN Postings p ON p.id = m.posting_id
           ${reviewStateJoin}
           ${baseWhere}
+          AND m.resume_key = ?
           ${minMatchPercentFilter !== null ? "AND m.match_percent >= ?" : ""}
           ${prefilter.sql}
           __SEEK_PREDICATE__
           ORDER BY m.match_percent DESC, p.last_seen_epoch DESC, p.id DESC
         `,
-        params: paramsWithExtra(minMatchPercentFilter !== null ? [minMatchPercentFilter] : []),
+        params: paramsWithExtra([resumeKey, ...(minMatchPercentFilter !== null ? [minMatchPercentFilter] : [])]),
         seekSortBy: "match_desc"
       };
       // Unscored postings can never satisfy a positive match threshold (there is nothing
@@ -832,12 +840,12 @@ async function listPostingsWithFilters(options = {}) {
               FROM Postings p
               ${reviewStateJoin}
               ${baseWhere}
-              AND NOT EXISTS (SELECT 1 FROM posting_match_scores m2 WHERE m2.posting_id = p.id)
+              AND NOT EXISTS (SELECT 1 FROM posting_match_scores m2 WHERE m2.posting_id = p.id AND m2.resume_key = ?)
               ${prefilter.sql}
               __SEEK_PREDICATE__
               ORDER BY p.last_seen_epoch DESC, p.id DESC
             `,
-            params: baseParams,
+            params: paramsWithExtra([resumeKey]),
             seekSortBy: "recent"
           };
       candidateQuery = {
@@ -845,7 +853,15 @@ async function listPostingsWithFilters(options = {}) {
         sortBy
       };
     } else {
-      const matchJoinSql = needsMatchJoin ? "LEFT JOIN posting_match_scores m ON m.posting_id = p.id" : "";
+      // resume_key belongs in the ON clause, not a later WHERE: this is a LEFT JOIN, and a
+      // posting with no score at all (m.resume_key IS NULL) must stay in the result with a
+      // null match_percent. Filtering resume_key after the join would also fan a posting out
+      // into one row per resume it happens to be scored against instead of the one being
+      // asked for.
+      const matchJoinSql = needsMatchJoin
+        ? "LEFT JOIN posting_match_scores m ON m.posting_id = p.id AND m.resume_key = ?"
+        : "";
+      const matchJoinParams = needsMatchJoin ? [resumeKey] : [];
       const matchSelectSql = needsMatchJoin
         ? `, COALESCE(m.match_percent, -1) AS match_sort_key, m.match_percent AS match_percent,
                m.overlap_terms_json AS match_overlap_terms_json,
@@ -866,7 +882,10 @@ async function listPostingsWithFilters(options = {}) {
               __SEEK_PREDICATE__
               ORDER BY ${wideScanOrderByClause}
             `,
-            params: paramsWithExtra(minMatchPercentFilter !== null ? [minMatchPercentFilter] : []),
+            params: [
+              ...matchJoinParams,
+              ...paramsWithExtra(minMatchPercentFilter !== null ? [minMatchPercentFilter] : [])
+            ],
             seekSortBy: sortBy
           }
         ],
@@ -999,6 +1018,10 @@ async function listPostingsWithFilters(options = {}) {
       // *_json columns are internal to the seek predicate above and never shipped.
       ...(needsMatchJoin
         ? {
+            // Which resume the flat match_* fields below were computed against -- lets a
+            // caller with more than one resume uploaded tell them apart from the other
+            // entries in match_scores without guessing from the percentage alone.
+            match_resume: resumeKey,
             match_available: row?.match_percent !== null && row?.match_percent !== undefined,
             match_percent:
               row?.match_percent === null || row?.match_percent === undefined
@@ -1191,6 +1214,33 @@ async function listPostingsWithFilters(options = {}) {
     items = items.filter((item) => String(item?.status || "unverified") !== "dead");
   }
 
+  // Every uploaded resume's score, not just the one that drove sort_by/min_match_percent
+  // above -- computed only for the page being returned (cheap: one query keyed by this
+  // page's ids), not joined into the wide-scan SQL above, which stays scoped to a single
+  // resume_key for its ordering/filtering.
+  if (includeMatch && items.length > 0) {
+    const resumeKeys = await listResumeDocumentKeys();
+    const matchesByPosting = await getMatchesByPostingIdsForKeys(items.map((item) => item.id), resumeKeys);
+    items = items.map((item) => {
+      const perResume = matchesByPosting.get(item.id);
+      const matchScores = {};
+      if (perResume) {
+        for (const [key, match] of perResume) {
+          matchScores[key] = {
+            match_available: true,
+            match_percent:
+              match.match_percent === null || match.match_percent === undefined
+                ? null
+                : Math.round(Number(match.match_percent) * 10) / 10,
+            match_overlap_terms: match.overlap_terms,
+            match_unmatched_requirements: match.unmatched_requirements
+          };
+        }
+      }
+      return { ...item, match_scores: matchScores };
+    });
+  }
+
   return {
     items,
     count: items.length,
@@ -1204,6 +1254,7 @@ async function listPostingsWithFilters(options = {}) {
       search,
       ats: atsFilters,
       sort_by: sortBy,
+      resume: resumeKey,
       industries: industryKeys,
       compensation_types: compensationTypes,
       pay_periods: payPeriods,

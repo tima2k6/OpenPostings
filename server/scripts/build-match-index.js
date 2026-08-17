@@ -3,7 +3,11 @@
 // scored id are added, and a resume re-upload is detected automatically (see
 // posting-match.js) and triggers a full rescore. Pass --rebuild to force one regardless.
 //
-//   node server/scripts/build-match-index.js [--rebuild] [--batch-size 25] [--max-batches 16]
+// Runs once per uploaded resume-like document (listResumeDocumentKeys: "resume" plus any
+// "resume_*" variant), so a second tailored resume gets scanned the moment it is uploaded
+// with no further configuration. Pass --resume <key> to scan only that one key instead.
+//
+//   node server/scripts/build-match-index.js [--rebuild] [--batch-size 25] [--max-batches 16] [--resume <key>]
 const path = require("path");
 const { open } = require("sqlite");
 const sqlite3 = require("sqlite3");
@@ -21,6 +25,13 @@ function readPositiveIntegerArg(argv, name, fallback) {
   return Math.floor(value);
 }
 
+function readStringArg(argv, name) {
+  const index = argv.indexOf(name);
+  if (index < 0) return undefined;
+  const value = String(argv[index + 1] || "").trim();
+  return value || undefined;
+}
+
 async function main(argv = process.argv.slice(2)) {
   const db = await open({ filename: DB_PATH, driver: sqlite3.Database });
   try {
@@ -28,12 +39,30 @@ async function main(argv = process.argv.slice(2)) {
     setDb(db);
 
     const { rescoreMatches } = require("../services/posting-match.js");
+    const { listResumeDocumentKeys } = require("../services/applicant-documents.js");
+    const resumeArg = readStringArg(argv, "--resume");
+    const resumeKeys = resumeArg ? [resumeArg] : await listResumeDocumentKeys();
+
     const startedAt = Date.now();
-    const summary = await rescoreMatches({
-      rebuild: argv.includes("--rebuild"),
-      batch_size: readPositiveIntegerArg(argv, "--batch-size", undefined),
-      max_batches: readPositiveIntegerArg(argv, "--max-batches", undefined)
-    });
+    const perResume = {};
+    let scored = 0;
+    let rebuilt = false;
+    for (const resumeKey of resumeKeys) {
+      // Sequential, not Promise.all: every resume's scan writes through the same serialized
+      // write-transaction chain (runInWriteTransaction) regardless, so there is no
+      // concurrency to gain by running these in parallel.
+      const summary = await rescoreMatches({
+        resume_key: resumeKey,
+        rebuild: argv.includes("--rebuild"),
+        batch_size: readPositiveIntegerArg(argv, "--batch-size", undefined),
+        max_batches: readPositiveIntegerArg(argv, "--max-batches", undefined)
+      });
+      perResume[resumeKey] = summary;
+      scored += summary.scored;
+      rebuilt = rebuilt || summary.rebuilt;
+    }
+
+    const summary = { scored, rebuilt, per_resume: perResume };
     console.log(
       `[build-match-index] ${JSON.stringify(summary)} in ${Math.round((Date.now() - startedAt) / 1000)}s`
     );

@@ -120,6 +120,19 @@ function run() {
     "missing sort should default to recent"
   );
 
+  assert.equal(
+    normalizePersistedFilters({ resume: "resume_secondary" }).resume,
+    "resume_secondary",
+    "a slug-shaped resume key should round-trip"
+  );
+  for (const bogus of ["not a slug", "UPPER", "-leading-dash", "", null, 7, {}]) {
+    assert.equal(
+      normalizePersistedFilters({ resume: bogus }).resume,
+      "resume",
+      `non-slug resume ${JSON.stringify(bogus)} should fall back to the default`
+    );
+  }
+
   console.log("filter-normalize tests passed");
 }
 

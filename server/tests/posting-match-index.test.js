@@ -289,6 +289,71 @@ async function testMatchDescPaginatesAcrossTheScoredUnscoredBoundary() {
   });
 }
 
+// A second, unrelated resume -- built to answer LOW_MATCH_DESCRIPTION's requirements
+// (Kubernetes, Rust/gRPC, distributed query planners, SRE on-call) that RESUME above never
+// speaks to at all.
+const SECONDARY_RESUME = `Tim Annan
+Distributed Systems Engineer
+Ran Kubernetes at production scale for a global fleet, owning distributed query planners and consensus protocols.
+Deep expertise in Rust and gRPC service implementation.
+Led the SRE on-call rotation, driving incident response for production systems.`;
+
+// Proves posting_match_scores' PK is genuinely (posting_id, resume_key): scoring a second
+// resume must not touch the first resume's rows, both must be independently queryable, and
+// sort_by=match_desc/min_match_percent must be able to rank by either one on request.
+async function testTwoResumesAreScoredAndRankedIndependently() {
+  await withDb(async (db) => {
+    await saveApplicantDocument({ kind: "resume", file_name: "resume.txt", content: Buffer.from(RESUME, "utf8") });
+    await seedPosting(db, { url: "https://x/high", position: "GM High Match", description: HIGH_MATCH_DESCRIPTION, lastSeenOffsetSeconds: 20 });
+    await seedPosting(db, { url: "https://x/low", position: "Eng Low Match", description: LOW_MATCH_DESCRIPTION, lastSeenOffsetSeconds: 10 });
+    await rescoreMatches({ resume_key: "resume" });
+
+    await saveApplicantDocument({
+      kind: "resume_secondary",
+      file_name: "resume-secondary.txt",
+      content: Buffer.from(SECONDARY_RESUME, "utf8")
+    });
+    await rescoreMatches({ resume_key: "resume_secondary" });
+
+    const rows = await db.all(`SELECT posting_id, resume_key, match_percent FROM posting_match_scores ORDER BY posting_id, resume_key;`);
+    assert.strictEqual(rows.length, 4, "each posting must carry one row per resume, not one shared row");
+
+    const primaryHigh = rows.find((row) => row.posting_id === 1 && row.resume_key === "resume");
+    const secondaryHigh = rows.find((row) => row.posting_id === 1 && row.resume_key === "resume_secondary");
+    const primaryLow = rows.find((row) => row.posting_id === 2 && row.resume_key === "resume");
+    const secondaryLow = rows.find((row) => row.posting_id === 2 && row.resume_key === "resume_secondary");
+
+    assert.strictEqual(Number(primaryHigh.match_percent), 75, "scoring the second resume must not disturb the first resume's existing scores");
+    assert.strictEqual(Number(primaryLow.match_percent), 0);
+    assert.ok(
+      Number(secondaryLow.match_percent) > Number(primaryLow.match_percent),
+      "the distributed-systems resume must score the low-for-the-primary-resume posting higher than the primary resume did"
+    );
+    assert.ok(
+      Number(secondaryHigh.match_percent) < Number(primaryHigh.match_percent),
+      "the distributed-systems resume must not score the hospitality-fit posting as well as the primary resume did"
+    );
+
+    // Ranking by the secondary resume must reorder results relative to the default.
+    const rankedBySecondary = await listPostingsWithFilters({ sort_by: "match_desc", resume_key: "resume_secondary" });
+    assert.strictEqual(rankedBySecondary.items[0].job_posting_url, "https://x/low", "resume_secondary ranks the distributed-systems posting first");
+
+    const rankedByDefault = await listPostingsWithFilters({ sort_by: "match_desc" });
+    assert.strictEqual(rankedByDefault.items[0].job_posting_url, "https://x/high", "the default resume key must still rank as before");
+
+    // include_match must expose every resume's score on the row, not just whichever one
+    // drove the ordering.
+    const withAllScores = await listPostingsWithFilters({ include_match: true });
+    const highItem = withAllScores.items.find((item) => item.job_posting_url === "https://x/high");
+    assert.strictEqual(highItem.match_resume, "resume", "the flat match_* fields must say which resume they came from");
+    assert.strictEqual(Math.round(highItem.match_scores.resume.match_percent), 75);
+    assert.ok(
+      Math.round(highItem.match_scores.resume_secondary.match_percent) < 75,
+      "match_scores must carry the other resume's score alongside the one driving match_percent"
+    );
+  });
+}
+
 async function main() {
   testComputeMatchForPostingMatchesTheApplicationFormula();
   await testRescoreMatchesIsIncremental();
@@ -296,6 +361,7 @@ async function main() {
   await testListPostingsSortsByMatchAndFiltersByMinimum();
   await testMatchDescPaginatesAcrossChunks();
   await testMatchDescPaginatesAcrossTheScoredUnscoredBoundary();
+  await testTwoResumesAreScoredAndRankedIndependently();
   console.log("posting-match-index tests passed");
 }
 

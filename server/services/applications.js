@@ -1,7 +1,7 @@
 const { normalizeLikeText, normalizeApplicationStatus, normalizeApplicationFit, normalizeAppliedByType, normalizeAppliedByLabel, APPLICATION_STATUS_OPTIONS } = require("../helpers/normalize-strings");
 const { parseNonNegativeInteger, nowEpochSeconds } = require("../helpers/normalize-numbers");
 const { markPostingAppliedState } = require("./postings.js");
-const { getApplicantDocument } = require("./applicant-documents.js");
+const { getApplicantDocument, DEFAULT_DOCUMENT_KEY } = require("./applicant-documents.js");
 const { computeMatchForPosting, getMatchesByPostingIds } = require("./posting-match.js");
 const { getDb, getReadDb, setDb, runInWriteTransaction } = require("../services/runtime-context")
 
@@ -537,7 +537,7 @@ async function computeJobFitByApplicationId(applicationRows) {
     Array.from(postingByUrl.values()).map((posting) => posting.id)
   );
 
-  const resumeDocument = await getApplicantDocument("resume");
+  const resumeDocument = await getApplicantDocument(DEFAULT_DOCUMENT_KEY);
   const resumeText = String(resumeDocument?.text || "").trim();
 
   for (const row of applicationRows) {

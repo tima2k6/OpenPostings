@@ -32,51 +32,115 @@ async function ensureMatchTables() {
   const db = getDb();
   await db.exec(`
     CREATE TABLE IF NOT EXISTS posting_match_scores (
-      posting_id INTEGER NOT NULL PRIMARY KEY,
+      posting_id INTEGER NOT NULL,
+      resume_key TEXT NOT NULL DEFAULT '${DEFAULT_DOCUMENT_KEY}',
       resume_uploaded_at TEXT NOT NULL,
       requirements_total INTEGER NOT NULL DEFAULT 0,
       requirements_matched INTEGER NOT NULL DEFAULT 0,
       match_percent REAL,
       overlap_terms_json TEXT NOT NULL DEFAULT '[]',
       unmatched_requirements_json TEXT NOT NULL DEFAULT '[]',
-      computed_at TEXT NOT NULL DEFAULT (datetime('now'))
+      computed_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (posting_id, resume_key)
     );
 
     CREATE TABLE IF NOT EXISTS posting_match_state (
-      id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+      resume_key TEXT NOT NULL PRIMARY KEY,
       last_scored_id INTEGER NOT NULL DEFAULT 0,
       resume_uploaded_at TEXT NOT NULL DEFAULT '',
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
-    INSERT INTO posting_match_state (id, last_scored_id, resume_uploaded_at)
-    VALUES (1, 0, '')
-    ON CONFLICT(id) DO NOTHING;
 
     -- Lets sort_by=match_desc in postings.js drive the query from this table (indexed,
     -- already-sorted order) instead of sorting the whole visible Postings set in a temp
-    -- b-tree on every request. See the "scored" phase in listPostingsWithFilters.
+    -- b-tree on every request. See the "scored" phase in listPostingsWithFilters. resume_key
+    -- leads the index because every read filters to one resume before ordering by percent.
     CREATE INDEX IF NOT EXISTS idx_posting_match_scores_percent
-      ON posting_match_scores(match_percent DESC, posting_id DESC);
+      ON posting_match_scores(resume_key, match_percent DESC, posting_id DESC);
   `);
+
+  // Older databases had posting_match_scores keyed by posting_id alone and posting_match_state
+  // as a single id=1 row -- both predate scoring against more than one resume. SQLite can't
+  // ALTER a primary key, so rebuild onto the resume_key-keyed shape, carrying every existing
+  // row forward under DEFAULT_DOCUMENT_KEY so nothing already scored gets silently rescanned
+  // or lost. Same rebuild-in-a-transaction idiom as ensureApplicantDocumentsTable above.
+  const scoreColumns = await db.all(`PRAGMA table_info('posting_match_scores');`);
+  if (!scoreColumns.some((column) => String(column?.name || "") === "resume_key")) {
+    await runInWriteTransaction(async (handle) => {
+      await handle.exec(`
+        CREATE TABLE posting_match_scores_migrated (
+          posting_id INTEGER NOT NULL,
+          resume_key TEXT NOT NULL DEFAULT '${DEFAULT_DOCUMENT_KEY}',
+          resume_uploaded_at TEXT NOT NULL,
+          requirements_total INTEGER NOT NULL DEFAULT 0,
+          requirements_matched INTEGER NOT NULL DEFAULT 0,
+          match_percent REAL,
+          overlap_terms_json TEXT NOT NULL DEFAULT '[]',
+          unmatched_requirements_json TEXT NOT NULL DEFAULT '[]',
+          computed_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (posting_id, resume_key)
+        );
+        INSERT INTO posting_match_scores_migrated
+          (posting_id, resume_key, resume_uploaded_at, requirements_total, requirements_matched,
+           match_percent, overlap_terms_json, unmatched_requirements_json, computed_at)
+        SELECT posting_id, '${DEFAULT_DOCUMENT_KEY}', resume_uploaded_at, requirements_total,
+               requirements_matched, match_percent, overlap_terms_json,
+               unmatched_requirements_json, computed_at
+        FROM posting_match_scores;
+        DROP TABLE posting_match_scores;
+        ALTER TABLE posting_match_scores_migrated RENAME TO posting_match_scores;
+        CREATE INDEX IF NOT EXISTS idx_posting_match_scores_percent
+          ON posting_match_scores(resume_key, match_percent DESC, posting_id DESC);
+      `);
+    });
+  }
+
+  const stateColumns = await db.all(`PRAGMA table_info('posting_match_state');`);
+  if (!stateColumns.some((column) => String(column?.name || "") === "resume_key")) {
+    await runInWriteTransaction(async (handle) => {
+      await handle.exec(`
+        CREATE TABLE posting_match_state_migrated (
+          resume_key TEXT NOT NULL PRIMARY KEY,
+          last_scored_id INTEGER NOT NULL DEFAULT 0,
+          resume_uploaded_at TEXT NOT NULL DEFAULT '',
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO posting_match_state_migrated (resume_key, last_scored_id, resume_uploaded_at, updated_at)
+        SELECT '${DEFAULT_DOCUMENT_KEY}', last_scored_id, resume_uploaded_at, updated_at
+        FROM posting_match_state
+        WHERE id = 1;
+        DROP TABLE posting_match_state;
+        ALTER TABLE posting_match_state_migrated RENAME TO posting_match_state;
+      `);
+    });
+  }
 }
 
-async function readMatchState() {
+async function readMatchState(resumeKey) {
   const db = getDb();
   await ensureMatchTables();
-  const row = await db.get(`SELECT last_scored_id, resume_uploaded_at FROM posting_match_state WHERE id = 1;`);
+  const row = await db.get(
+    `SELECT last_scored_id, resume_uploaded_at FROM posting_match_state WHERE resume_key = ?;`,
+    [resumeKey]
+  );
   return {
     last_scored_id: Number(row?.last_scored_id || 0),
     resume_uploaded_at: String(row?.resume_uploaded_at || "")
   };
 }
 
-async function writeMatchState(lastScoredId, resumeUploadedAt) {
+// Upserts rather than updating a pre-seeded row -- there is no longer one singleton row to
+// seed at table-creation time, since each resume key gets its own row on first use.
+async function writeMatchState(resumeKey, lastScoredId, resumeUploadedAt) {
   const db = getDb();
   await db.run(
-    `UPDATE posting_match_state
-     SET last_scored_id = ?, resume_uploaded_at = ?, updated_at = datetime('now')
-     WHERE id = 1;`,
-    [lastScoredId, resumeUploadedAt]
+    `INSERT INTO posting_match_state (resume_key, last_scored_id, resume_uploaded_at, updated_at)
+     VALUES (?, ?, ?, datetime('now'))
+     ON CONFLICT(resume_key) DO UPDATE SET
+       last_scored_id = excluded.last_scored_id,
+       resume_uploaded_at = excluded.resume_uploaded_at,
+       updated_at = datetime('now');`,
+    [resumeKey, lastScoredId, resumeUploadedAt]
   );
 }
 
@@ -104,7 +168,12 @@ function computeMatchForPosting({ description, resume_text, posting } = {}) {
 // Incremental: only postings above last_scored_id are scored, so a run after a sync pass is
 // cheap. A resume re-upload is detected by comparing its uploaded_at against the state row
 // and treated as an implicit rebuild -- callers never need to invalidate this explicitly.
+//
+// resume_key selects which uploaded document to score against (see DEFAULT_DOCUMENT_KEY and
+// listResumeDocumentKeys in applicant-documents.js); each key keeps its own state row and its
+// own rows in posting_match_scores, scored independently.
 async function rescoreMatches({
+  resume_key: resumeKeyOption = DEFAULT_DOCUMENT_KEY,
   rebuild = false,
   batch_size = MATCH_INDEX_BATCH_SIZE,
   max_batches = Number.POSITIVE_INFINITY
@@ -112,7 +181,8 @@ async function rescoreMatches({
   const db = getDb();
   await ensureMatchTables();
 
-  const resumeDocument = await getApplicantDocument(DEFAULT_DOCUMENT_KEY);
+  const resumeKey = String(resumeKeyOption || "").trim() || DEFAULT_DOCUMENT_KEY;
+  const resumeDocument = await getApplicantDocument(resumeKey);
   const resumeText = String(resumeDocument?.text || "").trim();
   const resumeUploadedAt = String(resumeDocument?.uploaded_at || "");
 
@@ -121,15 +191,15 @@ async function rescoreMatches({
     ? Math.max(1, Math.floor(Number(max_batches)))
     : Number.POSITIVE_INFINITY;
 
-  const state = await readMatchState();
+  const state = await readMatchState(resumeKey);
   // A new (or newly removed) resume invalidates every score computed against the old one --
   // restart the walk from the top rather than leaving stale rows mixed in with fresh ones.
   const resumeChanged = state.resume_uploaded_at !== resumeUploadedAt;
   const effectiveRebuild = rebuild || resumeChanged;
 
   if (effectiveRebuild) {
-    await db.exec(`DELETE FROM posting_match_scores;`);
-    await writeMatchState(0, resumeUploadedAt);
+    await db.run(`DELETE FROM posting_match_scores WHERE resume_key = ?;`, [resumeKey]);
+    await writeMatchState(resumeKey, 0, resumeUploadedAt);
   }
 
   let lastId = effectiveRebuild ? 0 : state.last_scored_id;
@@ -162,10 +232,10 @@ async function rescoreMatches({
         });
         await handle.run(
           `INSERT INTO posting_match_scores
-             (posting_id, resume_uploaded_at, requirements_total, requirements_matched,
+             (posting_id, resume_key, resume_uploaded_at, requirements_total, requirements_matched,
               match_percent, overlap_terms_json, unmatched_requirements_json, computed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-           ON CONFLICT(posting_id) DO UPDATE SET
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+           ON CONFLICT(posting_id, resume_key) DO UPDATE SET
              resume_uploaded_at = excluded.resume_uploaded_at,
              requirements_total = excluded.requirements_total,
              requirements_matched = excluded.requirements_matched,
@@ -175,6 +245,7 @@ async function rescoreMatches({
              computed_at = datetime('now');`,
           [
             row.id,
+            resumeKey,
             resumeUploadedAt,
             match.requirements_total,
             match.requirements_matched,
@@ -186,7 +257,7 @@ async function rescoreMatches({
         lastId = Number(row.id);
         scored += 1;
       }
-      await writeMatchState(lastId, resumeUploadedAt);
+      await writeMatchState(resumeKey, lastId, resumeUploadedAt);
     });
     batches += 1;
 
@@ -197,6 +268,7 @@ async function rescoreMatches({
   }
 
   return {
+    resume_key: resumeKey,
     scored,
     since_id: effectiveRebuild ? 0 : state.last_scored_id,
     last_id: lastId,
@@ -233,8 +305,9 @@ function mapMatchRow(row) {
 
 // On the reader connection, not the writer -- see personal-info.js's getPersonalInformation
 // for why. Used by computeJobFitByApplicationId (applications.js) to read cached scores
-// instead of recomputing the brief live for every application on every request.
-async function getMatchesByPostingIds(postingIds) {
+// instead of recomputing the brief live for every application on every request, and by the
+// match_desc sort phase in postings.js, both of which only ever need one resume's scores.
+async function getMatchesByPostingIds(postingIds, resumeKey = DEFAULT_DOCUMENT_KEY) {
   const ids = Array.from(new Set((postingIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)));
   if (ids.length === 0) return new Map();
 
@@ -244,8 +317,8 @@ async function getMatchesByPostingIds(postingIds) {
     `SELECT posting_id, match_percent, requirements_total, requirements_matched,
             overlap_terms_json, unmatched_requirements_json, computed_at
      FROM posting_match_scores
-     WHERE posting_id IN (${placeholders});`,
-    ids
+     WHERE resume_key = ? AND posting_id IN (${placeholders});`,
+    [resumeKey, ...ids]
   );
 
   const byId = new Map();
@@ -256,11 +329,44 @@ async function getMatchesByPostingIds(postingIds) {
   return byId;
 }
 
+// Like getMatchesByPostingIds, but for every resume key at once -- used to attach every
+// uploaded resume's score to a page of rows (see listPostingsWithFilters's include_match
+// handling), so a caller sees how a posting scores against each resume without one query per
+// resume. Returns posting_id -> (resume_key -> match row), only for pairs that have been
+// scored.
+async function getMatchesByPostingIdsForKeys(postingIds, resumeKeys) {
+  const byPosting = new Map();
+  const ids = Array.from(new Set((postingIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)));
+  const keys = Array.from(new Set((resumeKeys || []).map((key) => String(key || "").trim()).filter(Boolean)));
+  if (ids.length === 0 || keys.length === 0) return byPosting;
+
+  const db = getReadDb();
+  const idPlaceholders = ids.map(() => "?").join(", ");
+  const keyPlaceholders = keys.map(() => "?").join(", ");
+  const rows = await db.all(
+    `SELECT posting_id, resume_key, match_percent, requirements_total, requirements_matched,
+            overlap_terms_json, unmatched_requirements_json, computed_at
+     FROM posting_match_scores
+     WHERE posting_id IN (${idPlaceholders}) AND resume_key IN (${keyPlaceholders});`,
+    [...ids, ...keys]
+  );
+
+  for (const row of rows) {
+    const mapped = mapMatchRow(row);
+    if (!mapped) continue;
+    const resumeKey = String(row.resume_key || "");
+    if (!byPosting.has(mapped.posting_id)) byPosting.set(mapped.posting_id, new Map());
+    byPosting.get(mapped.posting_id).set(resumeKey, mapped);
+  }
+  return byPosting;
+}
+
 module.exports = {
   ensureMatchTables,
   computeMatchForPosting,
   rescoreMatches,
   getMatchesByPostingIds,
+  getMatchesByPostingIdsForKeys,
   MAX_OVERLAP_TERMS,
   MAX_UNMATCHED_REQUIREMENTS
 };

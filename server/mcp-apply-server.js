@@ -451,6 +451,7 @@ async function findCandidates(options = {}) {
     limit,
     offset: parseNonNegativeInteger(options.offset),
     sort_by: options.sort_by,
+    resume_key: normalizeDocumentKind(options.resume),
     ats: normalizeAtsArgument(options.ats),
     industries: resolveListFilter(options.industries, settings.preferred_industries, useSettings),
     compensation_types: normalizeStringArray(options.compensation_types),
@@ -825,7 +826,7 @@ async function main() {
     "find_posting_candidates",
     {
       description:
-        "Find postings to prepare, using the same filter engine as the app's job list. Any filter left empty falls back to the saved MCP preference for it; pass use_settings=false to ignore saved preferences entirely. Applied, ignored and dead postings are excluded by default (include_dead=true to see verified-gone ones). Postings hidden only because their posting date is older than the freshness window are excluded too but remain applyable -- include_stale_dated=true brings them back. Rows carry canonical freshness, confidence and review state alongside compatibility fields such as hidden_reason and ignored. Pay ranges keep postings with no published pay figure -- pay_unknown_count reports how many -- unless include_unknown_pay=false. Rows carry location_conflict, which flags a posting whose description restricts hiring to fewer places than its header lists. Job descriptions are omitted unless include_descriptions=true. Use cities for city-level targeting: values are City|ST (get_filter_options lists them per state, busiest first) and they match parsed locations, so Kent|WA cannot return Kent in England or anything in Kentucky. Call get_filter_options for the valid values of the list filters. sort_by=match_desc ranks by match_percent against the uploaded resume (a background job scores every posting with a stored description -- see get_resume; postings not yet scored sort last), with match_percent/match_overlap_terms/match_unmatched_requirements on each row; min_match_percent filters to postings scored at or above a threshold.",
+        "Find postings to prepare, using the same filter engine as the app's job list. Any filter left empty falls back to the saved MCP preference for it; pass use_settings=false to ignore saved preferences entirely. Applied, ignored and dead postings are excluded by default (include_dead=true to see verified-gone ones). Postings hidden only because their posting date is older than the freshness window are excluded too but remain applyable -- include_stale_dated=true brings them back. Rows carry canonical freshness, confidence and review state alongside compatibility fields such as hidden_reason and ignored. Pay ranges keep postings with no published pay figure -- pay_unknown_count reports how many -- unless include_unknown_pay=false. Rows carry location_conflict, which flags a posting whose description restricts hiring to fewer places than its header lists. Job descriptions are omitted unless include_descriptions=true. Use cities for city-level targeting: values are City|ST (get_filter_options lists them per state, busiest first) and they match parsed locations, so Kent|WA cannot return Kent in England or anything in Kentucky. Call get_filter_options for the valid values of the list filters. sort_by=match_desc ranks by match_percent against a resume (a background job scores every posting with a stored description against every uploaded resume -- see get_resume; postings not yet scored sort last); resume picks which uploaded resume drives that ranking and min_match_percent (default 'resume' -- pass e.g. resume='resume_secondary' to rank/filter by a different one). Regardless of which resume drove the ranking, every row's match_scores carries every uploaded resume's {match_percent, match_overlap_terms, match_unmatched_requirements} keyed by resume key, so a call can compare fit against both at once; the top-level match_percent/match_overlap_terms/match_unmatched_requirements fields mirror the resume that was picked. min_match_percent filters to postings scored at or above a threshold against that same picked resume.",
       inputSchema: {
         search: z.string().optional(),
         ats: z
@@ -844,6 +845,7 @@ async function main() {
         regions: z.array(z.enum(MCP_REGION_FILTER_VALUES)).optional(),
         remote: z.enum(MCP_REMOTE_FILTER_VALUES).optional(),
         sort_by: z.enum(MCP_SORT_VALUES).optional(),
+        resume: z.string().optional(),
         min_match_percent: z.number().min(0).max(100).optional(),
         hide_no_date: z.boolean().optional(),
         include_applied: z.boolean().optional(),
@@ -1074,7 +1076,7 @@ async function main() {
     "get_resume",
     {
       description:
-        "The text of one of the applicant's stored documents. Read the relevant one once per run and weigh every posting description against it -- it is the ground truth that the profile fields summarize. Documents are an open-ended keyed set, so several tailored resumes can coexist (for example resume_hospitality and resume_ops) and each application can be drafted from the variant matching the target role. Call with no document key to list the available keys without returning any text. Served from the copy uploaded into the database (POST /settings/applicant-documents), which works no matter where this server runs; the conventional keys 'resume' and 'projects_portfolio' fall back to the file paths in personal information for same-machine installs.",
+        "The text of one of the applicant's stored documents. Read the relevant one once per run and weigh every posting description against it -- it is the ground truth that the profile fields summarize. Documents are an open-ended keyed set, so several tailored resumes can coexist (for example resume_secondary, resume_hospitality, resume_ops) and each application can be drafted from the variant matching the target role. Any key starting with 'resume' is picked up automatically by the background match-scoring scan (see find_posting_candidates' resume argument and match_scores field) with no extra configuration. Call with no document key to list the available keys without returning any text. Served from the copy uploaded into the database (POST /settings/applicant-documents), which works no matter where this server runs; the conventional keys 'resume' and 'projects_portfolio' fall back to the file paths in personal information for same-machine installs.",
       inputSchema: {
         document: z.string().optional()
       }

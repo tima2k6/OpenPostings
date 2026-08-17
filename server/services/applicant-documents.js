@@ -308,6 +308,17 @@ async function listApplicantDocuments() {
   }));
 }
 
+// The set of uploaded keys the match-scoring scan (posting-match.js) treats as resumes.
+// "resume" plus any "resume_*" variant (resume_secondary, resume_hospitality, ...) -- so a
+// new tailored resume gets scanned automatically the moment it is uploaded, no code change
+// needed to add a third one later. Falls back to [DEFAULT_DOCUMENT_KEY] when nothing has
+// been uploaded yet, since rescoreMatches already tolerates an empty resume document.
+async function listResumeDocumentKeys() {
+  const documents = await listApplicantDocuments();
+  const resumeKeys = documents.map((document) => document.key).filter((key) => /^resume(_|$)/.test(key));
+  return resumeKeys.length > 0 ? resumeKeys : [DEFAULT_DOCUMENT_KEY];
+}
+
 async function deleteApplicantDocument(kind) {
   const normalizedKind = normalizeDocumentKind(kind);
   if (!normalizedKind) throw new Error("A document key is required.");
@@ -472,6 +483,7 @@ module.exports = {
   saveApplicantDocument,
   getApplicantDocument,
   listApplicantDocuments,
+  listResumeDocumentKeys,
   deleteApplicantDocument,
   checkConfiguredDocumentPaths,
   normalizeDocumentKind,

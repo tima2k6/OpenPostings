@@ -613,6 +613,14 @@ function getPostingMatchTone(matchPercent) {
   return "critical";
 }
 
+// "resume" -> "resume", "resume_secondary" -> "secondary", "resume_ops" -> "ops" -- short
+// enough to sit next to a percentage in a badge.
+function getResumeMatchLabel(resumeKey) {
+  const key = String(resumeKey || "").trim();
+  if (!key || key === "resume") return "resume";
+  return key.replace(/^resume_/, "").replace(/_/g, " ") || key;
+}
+
 function formatPostingCompensationAmount(value, currencyCode = "") {
   const numericValue = Number(value);
   if (!Number.isFinite(numericValue) || numericValue <= 0) return "";
@@ -1217,6 +1225,12 @@ function PostingCard({
     ? item.match_unmatched_requirements
     : [];
   const hasMatchDetail = matchOverlapTerms.length > 0 || matchUnmatchedRequirements.length > 0;
+  // Every uploaded resume's score other than the one already shown above -- so a second
+  // resume's fit is visible on the card even when it isn't the one driving sort/filter.
+  const otherMatchScores = Object.entries(item?.match_scores || {}).filter(
+    ([resumeKey, score]) =>
+      resumeKey !== item?.match_resume && score && typeof score.match_percent === "number"
+  );
 
   return (
     <View style={[styles.card, reviewState === "ignored" ? styles.cardIgnored : null, menuOpen ? styles.cardMenuOpen : null]}>
@@ -1256,6 +1270,23 @@ function PostingCard({
                 </Text>
               </Pressable>
             ) : null}
+            {otherMatchScores.map(([resumeKey, score]) => (
+              <Text
+                key={resumeKey}
+                style={[
+                  styles.postingMatchBadge,
+                  getPostingMatchTone(score.match_percent) === "good"
+                    ? styles.postingMatchBadgeGood
+                    : getPostingMatchTone(score.match_percent) === "warning"
+                      ? styles.postingMatchBadgeWarning
+                      : getPostingMatchTone(score.match_percent) === "critical"
+                        ? styles.postingMatchBadgeCritical
+                        : null
+                ]}
+              >
+                {`${Math.round(score.match_percent)}% ${getResumeMatchLabel(resumeKey)}`}
+              </Text>
+            ))}
             {confidenceLabels.map((label) => <Text key={label} style={styles.postingConfidenceBadge}>{label}</Text>)}
           </View>
           {matchAvailable && matchDetailsOpen && hasMatchDetail ? (
@@ -1651,6 +1682,21 @@ export default function App() {
   const [syncPerformanceHistory, setSyncPerformanceHistory] = useState([]);
   const [personalInformation, setPersonalInformation] = useState(createEmptyPersonalInformation);
   const [applicantDocuments, setApplicantDocuments] = useState([]);
+  // Every uploaded document whose key is "resume" or "resume_*" -- what the Postings list's
+  // "Rank by" selector offers. Stays at length 1 (just "resume") until a second resume is
+  // uploaded, matching the background scan's own resume-key discovery (listResumeDocumentKeys
+  // in applicant-documents.js).
+  const resumeMatchOptions = useMemo(
+    () =>
+      applicantDocuments
+        .filter((document) => /^resume(_|$)/.test(String(document?.key || document?.kind || "")))
+        .map((document) => {
+          const resumeKey = String(document.key || document.kind);
+          const label = getResumeMatchLabel(resumeKey);
+          return { value: resumeKey, label: label.charAt(0).toUpperCase() + label.slice(1) };
+        }),
+    [applicantDocuments]
+  );
   const [documentUploading, setDocumentUploading] = useState("");
   const [documentNotice, setDocumentNotice] = useState("");
   const [applicationAnswers, setApplicationAnswers] = useState([]);
@@ -3295,7 +3341,8 @@ export default function App() {
       remote: ["all"],
       hide_no_date: false,
       sort_by: "recent",
-      min_match_percent: 0
+      min_match_percent: 0,
+      resume: "resume"
     });
   }, []);
 
@@ -3739,6 +3786,33 @@ export default function App() {
           );
         })}
       </View>
+
+      {/* Only worth showing once a second resume actually exists to rank against -- with
+          just one uploaded, "Rank by" would offer a single, permanently-selected option. */}
+      {resumeMatchOptions.length > 1 ? (
+        <View style={styles.postingsSortRow}>
+          <Text style={styles.postingsSortLabel}>Rank by</Text>
+          {resumeMatchOptions.map((option) => {
+            const selected = String(postingsFilters.resume || "resume") === option.value;
+            return (
+              <Pressable
+                key={option.value}
+                onPress={() =>
+                  setPostingsFilters((prev) => ({
+                    ...prev,
+                    resume: option.value
+                  }))
+                }
+                style={[styles.remoteFilterChip, selected ? styles.remoteFilterChipActive : null]}
+              >
+                <Text style={[styles.remoteFilterChipText, selected ? styles.remoteFilterChipTextActive : null]}>
+                  {option.label}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+      ) : null}
 
       <View style={styles.postingsFiltersHeaderRow}>
         <View style={styles.postingsFiltersLeftGroup}>
@@ -4500,10 +4574,13 @@ export default function App() {
               <Text style={styles.settingsDescription}>
                 Upload your resume once and the application copilot can read it no matter where the server runs.
                 The file paths above stay as a fallback for installs where the server runs on this same machine.
+                Upload a Secondary Resume too if you're targeting more than one kind of role -- postings get
+                scored against both, and the Postings list can rank or filter by either one.
               </Text>
 
               {[
                 { kind: "resume", label: "Resume" },
+                { kind: "resume_secondary", label: "Secondary Resume" },
                 { kind: "projects_portfolio", label: "Projects Portfolio" }
               ].map(({ kind, label }) => {
                 const stored = applicantDocuments.find((item) => (item?.key || item?.kind) === kind);

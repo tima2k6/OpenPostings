@@ -246,6 +246,11 @@ export function fetchPostings(search = "", limit = 500, offset = 0, filters = {}
   if (filters?.min_match_percent) {
     params.set("min_match_percent", String(filters.min_match_percent));
   }
+  // Which uploaded resume drives match_desc/min_match_percent; every uploaded resume's score
+  // still comes back on each row (match_scores) regardless of which one this picks.
+  if (filters?.resume) {
+    params.set("resume", String(filters.resume));
+  }
   // Descriptions dominate the response size, and the listing has a toggle that hides them.
   // When it is off there is no reason to ship them.
   if (filters?.include_descriptions === false) {

@@ -11,7 +11,11 @@ export const DEFAULT_POSTINGS_FILTERS = Object.freeze({
   remote: ["all"],
   hide_no_date: false,
   sort_by: "recent",
-  min_match_percent: 0
+  min_match_percent: 0,
+  // Which uploaded resume drives sort_by=match_desc / min_match_percent. "resume" is always
+  // uploadable; a second resume (e.g. resume_secondary) becomes a selectable value once it
+  // has been uploaded in Settings.
+  resume: "resume"
 });
 
 const REMOTE_FILTER_VALUES = ["all", "remote", "hybrid", "non_remote"];
@@ -57,7 +61,13 @@ export function normalizePersistedFilters(stored) {
       : DEFAULT_POSTINGS_FILTERS.sort_by,
     min_match_percent: MATCH_PERCENT_THRESHOLDS.includes(Number(source.min_match_percent))
       ? Number(source.min_match_percent)
-      : DEFAULT_POSTINGS_FILTERS.min_match_percent
+      : DEFAULT_POSTINGS_FILTERS.min_match_percent,
+    // Which resume key is valid depends on what has been uploaded, which this pure helper
+    // has no access to -- only the slug shape is checked here; the server falls back to the
+    // default resume for a key nothing was ever uploaded under.
+    resume: /^[a-z][a-z0-9_]*$/.test(String(source.resume ?? ""))
+      ? String(source.resume)
+      : DEFAULT_POSTINGS_FILTERS.resume
   };
 }
 

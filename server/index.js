@@ -2661,6 +2661,7 @@ function createServer() {
         limit: Number(req.query.limit || 500),
         offset: Number(req.query.offset || 0),
         sort_by: String(req.query.sort_by || "").trim(),
+        resume_key: String(req.query.resume || "").trim(),
         ats: parseCsvParam(req.query.ats),
         industries: parseCsvParam(req.query.industries),
         compensation_types: parseCsvParam(req.query.compensation_types),
