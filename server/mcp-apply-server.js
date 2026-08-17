@@ -1389,6 +1389,15 @@ async function main() {
     }
   }
 
+  // StdioServerTransport only listens for 'data' and 'error' on stdin, never 'close' or
+  // 'end' -- so when the MCP client disconnects (its end of the pipe closes), this process
+  // never notices and just keeps running with jobs.db held open. Every reconnect from a
+  // client left a fresh orphan behind, and those orphans piled up as independent SQLite
+  // connections to the same file, contending with the live server for locks and stalling
+  // its queries. Watching stdin ourselves is the only way to actually exit on disconnect.
+  process.stdin.on("end", () => process.exit(0));
+  process.stdin.on("close", () => process.exit(0));
+
   const transport = new StdioServerTransport();
   await mcpServer.connect(transport);
 }
