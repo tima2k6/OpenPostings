@@ -446,42 +446,61 @@ async function getMatchesByPostingIdsForKeys(postingIds, resumeKeys) {
 // instant). last_run_at/last_error live in enrichment-runtime.js's in-memory state, which
 // belongs to the API server process, not this one when called from mcp-apply-server.js (a
 // separate process with its own DB connection) -- so this reports only what the database
-// itself can answer: per-resume checkpoint position and scored/pending counts.
+// itself can answer.
+//
+// Deliberately does NOT count postings with a description to report an exact pending count:
+// TRIM(job_description) <> '' has no index to serve it, so COUNT(*) over that predicate is a
+// full scan of a multi-million-row, mostly-TEXT table -- the single biggest thing in this
+// database. Measured directly against the live database: over two minutes, hung long enough
+// to look like a broken MCP server rather than a slow query. posting-match.js's own scoring
+// query gets away with the same predicate only because it is LIMIT-bounded per batch, not a
+// global count. MAX(id) is a different story -- id is the table's primary key, so this is an
+// index lookup, not a scan (measured: ~2ms on the same database) -- and last_scored_id vs.
+// max(id) is a more direct answer to "how caught up is this resume" than scored-vs-
+// description-having-postings would be anyway, since it is exactly the walk's own progress
+// marker.
+//
+// Also deliberately does not call ensureMatchTables -- that runs DDL (PRAGMA table_info, and
+// potentially CREATE/ALTER) against the writer connection on every call, which is fine for
+// the background scoring loop that already pays that cost once per tick, but wrong here: this
+// is read by an interactive MCP call, and by the time anything is worth reporting the tables
+// already exist (the background job created them). Same reasoning
+// getMatchesByPostingIds/getMatchesByPostingIdsForKeys already follow -- read the tables
+// directly, do not touch the writer to ensure they exist first.
 async function getMatchScoringStatus() {
   const db = getReadDb();
-  await ensureMatchTables();
-
-  const totalRow = await db.get(
-    `SELECT COUNT(*) AS n FROM Postings WHERE job_description IS NOT NULL AND TRIM(job_description) <> '';`
-  );
-  const totalWithDescription = Number(totalRow?.n || 0);
+  const maxIdRow = await db.get(`SELECT MAX(id) AS n FROM Postings;`);
+  const maxPostingId = Number(maxIdRow?.n || 0);
 
   const resumeKeys = await listResumeDocumentKeys();
   const perResume = [];
   for (const resumeKey of resumeKeys) {
-    const state = await readMatchState(resumeKey);
-    const scoredRow = await db.get(
-      `SELECT COUNT(*) AS n FROM posting_match_scores WHERE resume_key = ?;`,
-      [resumeKey]
-    );
-    const stateRow = await db.get(
-      `SELECT updated_at FROM posting_match_state WHERE resume_key = ?;`,
-      [resumeKey]
-    );
-    const scoredCount = Number(scoredRow?.n || 0);
-    const pendingCount = Math.max(0, totalWithDescription - scoredCount);
+    const [stateRow, scoredRow] = await Promise.all([
+      db.get(
+        `SELECT last_scored_id, resume_uploaded_at, updated_at FROM posting_match_state WHERE resume_key = ?;`,
+        [resumeKey]
+      ),
+      // Uses idx_posting_match_scores_percent (resume_key leads it), a covering index scan
+      // proportional to this resume's scored-row count -- not free at ~600K+ rows (measured
+      // ~1s), but nowhere near the full-table scan above, and worth it for an exact count.
+      db.get(`SELECT COUNT(*) AS n FROM posting_match_scores WHERE resume_key = ?;`, [resumeKey])
+    ]);
+    const lastScoredId = Number(stateRow?.last_scored_id || 0);
     perResume.push({
       resume_key: resumeKey,
-      resume_uploaded_at: state.resume_uploaded_at,
-      last_scored_id: state.last_scored_id,
+      resume_uploaded_at: String(stateRow?.resume_uploaded_at || ""),
+      last_scored_id: lastScoredId,
       last_run_at: String(stateRow?.updated_at || "") || null,
-      scored_count: scoredCount,
-      pending_count: pendingCount,
-      caught_up: pendingCount === 0
+      scored_count: Number(scoredRow?.n || 0),
+      caught_up: maxPostingId > 0 && lastScoredId >= maxPostingId,
+      // Approximate, not "postings scored / postings with a description": last_scored_id is
+      // the forward walk's own progress marker, so this is directly how far it has gotten
+      // through the corpus by id, cheaply.
+      corpus_coverage_percent: maxPostingId > 0 ? Math.round((lastScoredId / maxPostingId) * 1000) / 10 : null
     });
   }
 
-  return { total_postings_with_description: totalWithDescription, per_resume: perResume };
+  return { max_posting_id: maxPostingId, per_resume: perResume };
 }
 
 module.exports = {

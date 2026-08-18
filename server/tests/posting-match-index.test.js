@@ -17,7 +17,7 @@ const { setDb, getDb, setPostingLocationByJobUrl } = require("../services/runtim
 const { createCanonicalPostingsTable } = require("../services/sync-runtime.js");
 const { listPostingsWithFilters } = require("../services/postings.js");
 const { ensureApplicantDocumentsTable, saveApplicantDocument } = require("../services/applicant-documents.js");
-const { ensureMatchTables, computeMatchForPosting, rescoreMatches } = require("../services/posting-match.js");
+const { ensureMatchTables, computeMatchForPosting, rescoreMatches, getMatchScoringStatus } = require("../services/posting-match.js");
 
 // Based on the fixture cover-letter.test.js uses (same resume, same HIGH/LOW descriptions),
 // with one extra line: computeMatchForPosting scores against
@@ -455,6 +455,36 @@ async function testMatchStatusDistinguishesScoredPendingAndNoRequirements() {
   });
 }
 
+// Regression test for a real production incident: getMatchScoringStatus originally computed
+// an exact pending_count via COUNT(*) FROM Postings WHERE job_description IS NOT NULL AND
+// TRIM(job_description) <> '' -- a predicate with no supporting index, so it was a full scan
+// of the single biggest table in the database. Measured directly against the live 8.5GB
+// database, that took over two minutes and was the actual cause of "the MCP server is slow"
+// (get_applicant_context calls this on every invocation). Pins down the fast replacement
+// shape (max_posting_id + last_scored_id -> corpus_coverage_percent/caught_up, both O(1)
+// lookups) so a future change doesn't reintroduce a full-table scan on this interactive path.
+async function testMatchScoringStatusReportsProgressWithoutScanningPostings() {
+  await withDb(async (db) => {
+    await saveApplicantDocument({ kind: "resume", file_name: "resume.txt", content: Buffer.from(RESUME, "utf8") });
+    await seedPosting(db, { url: "https://x/a", position: "GM", description: HIGH_MATCH_DESCRIPTION });
+    await seedPosting(db, { url: "https://x/b", position: "Eng", description: LOW_MATCH_DESCRIPTION });
+    await rescoreMatches({});
+
+    const status = await getMatchScoringStatus();
+    assert.strictEqual(status.max_posting_id, 2, "MAX(id), not a scan over job_description");
+    assert.strictEqual(status.per_resume.length, 1);
+    const resumeStatus = status.per_resume[0];
+    assert.strictEqual(resumeStatus.resume_key, "resume");
+    assert.strictEqual(resumeStatus.scored_count, 2);
+    assert.strictEqual(resumeStatus.last_scored_id, 2);
+    assert.strictEqual(resumeStatus.caught_up, true);
+    assert.strictEqual(resumeStatus.corpus_coverage_percent, 100);
+    // The expensive, since-removed fields must not quietly come back.
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(status, "total_postings_with_description"), false);
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(resumeStatus, "pending_count"), false);
+  });
+}
+
 async function main() {
   testComputeMatchForPostingMatchesTheApplicationFormula();
   await testRescoreMatchesIsIncremental();
@@ -466,6 +496,7 @@ async function main() {
   await testGapSweepCatchesADescriptionThatArrivesAfterTheCheckpointPassesIt();
   await testGapSweepIsANoOpDuringARebuild();
   await testMatchStatusDistinguishesScoredPendingAndNoRequirements();
+  await testMatchScoringStatusReportsProgressWithoutScanningPostings();
   console.log("posting-match-index tests passed");
 }
 

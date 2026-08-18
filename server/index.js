@@ -2691,7 +2691,12 @@ function createServer() {
         items: sanitizeFrontendValue(result.items),
         count: result.count,
         limit: result.limit,
-        offset: result.offset
+        offset: result.offset,
+        // Present (true/false) only when this request actually needed the wide-scan walk;
+        // true means it hit MAX_WIDE_SCAN_CANDIDATE_ROWS before filling the page, so a short
+        // or empty result may mean "the scan gave up," not "there is nothing more" -- see
+        // postings.js's listPostingsWithFilters.
+        ...(result.scan_bounded !== undefined ? { scan_bounded: result.scan_bounded } : {})
       });
     } catch (error) {
       if (error?.name === "AbortError" || abortController.signal.aborted) return;

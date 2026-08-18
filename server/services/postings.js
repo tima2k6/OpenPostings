@@ -365,6 +365,20 @@ function hasRealSourcePostingDate(rawPostingDate, ats, firstSeenEpoch, lastSeenE
 // the underlying DISTINCT scans the visible set.
 const LOCATION_GEO_OPTIONS_TTL_MS = 60000;
 
+// The wide-scan chunked walk (see the candidateQuery branch below) had no bound on total
+// work: its only exits were "found a full page" or "exhausted every SQL candidate in every
+// phase" -- i.e., the entire visible Postings table, if a filter combination is rare enough
+// that JS-side predicates (industries, states, review_queue's freshness classification...)
+// almost never match. Each chunk yields to the event loop (yieldToEventLoop), so it was
+// never a true infinite loop, but at this table's current size (tens of millions of rows)
+// a genuinely rare combination can still mean tens of thousands of chunks -- observed
+// directly: one such request degraded the whole API to the point of not responding to
+// SIGTERM for 90+ seconds, twice, needing a hard kill. Capping total candidates scanned
+// trades an always-eventually-complete page for a bounded worst case; scan_bounded on the
+// response tells a caller the page may be incomplete because the scan gave up, not because
+// there is truly nothing more to find, so a UI can suggest narrowing the filter.
+const MAX_WIDE_SCAN_CANDIDATE_ROWS = Number(process.env.POSTINGS_WIDE_SCAN_MAX_CANDIDATES || 50000);
+
 async function readDistinctStoredLocations() {
   // Read-only, and called from the filter-options bootstrap request -- getReadDb() keeps it
   // off the sync's write connection so it does not queue behind an in-progress flush.
@@ -1167,6 +1181,7 @@ async function listPostingsWithFilters(options = {}) {
   };
 
   let items;
+  let scanBounded = false;
   if (candidateQuery) {
     // The old wide branch materialised every SQL candidate before applying the exact JS
     // predicates. On the production database that meant hundreds of MB per request and a
@@ -1185,8 +1200,13 @@ async function listPostingsWithFilters(options = {}) {
     // walk moves on to the next one.
     let phaseIndex = 0;
     let cursor = null;
+    let candidatesScanned = 0;
 
     while (matchingRows.length < targetMatchCount && phaseIndex < candidateQuery.phases.length) {
+      if (candidatesScanned >= MAX_WIDE_SCAN_CANDIDATE_ROWS) {
+        scanBounded = true;
+        break;
+      }
       throwIfAborted(signal);
       const phase = candidateQuery.phases[phaseIndex];
       const seek = buildSeekPredicate(phase.seekSortBy, cursor);
@@ -1199,6 +1219,7 @@ async function listPostingsWithFilters(options = {}) {
         cursor = null;
         continue;
       }
+      candidatesScanned += candidateRows.length;
       cursor = extractSeekCursor(phase.seekSortBy, candidateRows[candidateRows.length - 1]);
 
       const filteredRows = await prepareCandidateRows(candidateRows);
@@ -1286,6 +1307,11 @@ async function listPostingsWithFilters(options = {}) {
     pay_unknown_count: items.filter(
       (item) => !(Number(item?.pay_min) > 0) && !(Number(item?.pay_max) > 0)
     ).length,
+    // True only when the wide-scan walk (candidateQuery) hit MAX_WIDE_SCAN_CANDIDATE_ROWS
+    // before filling this page -- the page may be short or empty not because there is
+    // nothing more to find, but because the scan gave up. Absent (not false) for requests
+    // that never needed the wide-scan walk at all, so existing callers see no shape change.
+    ...(candidateQuery ? { scan_bounded: scanBounded } : {}),
     limit,
     offset,
     filters: {
