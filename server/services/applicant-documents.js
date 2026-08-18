@@ -246,6 +246,11 @@ async function ensureApplicantDocumentsTable() {
   if (!columnNames.has("label")) {
     await db.exec(`ALTER TABLE applicant_documents ADD COLUMN label TEXT NOT NULL DEFAULT '';`);
   }
+  // Lets get_resume's listing say what a variant is *for* (e.g. "general/non-hospitality
+  // roles" on resume_secondary) instead of the caller guessing from the key alone.
+  if (!columnNames.has("target_roles")) {
+    await db.exec(`ALTER TABLE applicant_documents ADD COLUMN target_roles TEXT NOT NULL DEFAULT '';`);
+  }
 
   // Older databases pinned `kind` to exactly ('resume','projects_portfolio') with a CHECK
   // constraint, which no ALTER can remove -- so any additional resume variant failed to
@@ -267,11 +272,12 @@ async function ensureApplicantDocumentsTable() {
           truncated INTEGER NOT NULL DEFAULT 0,
           pages INTEGER,
           label TEXT NOT NULL DEFAULT '',
+          target_roles TEXT NOT NULL DEFAULT '',
           uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         INSERT INTO applicant_documents_migrated
-          (kind, file_name, format, content, extracted_text, chars, truncated, pages, label, uploaded_at)
-        SELECT kind, file_name, format, content, extracted_text, chars, truncated, pages, '', uploaded_at
+          (kind, file_name, format, content, extracted_text, chars, truncated, pages, label, target_roles, uploaded_at)
+        SELECT kind, file_name, format, content, extracted_text, chars, truncated, pages, '', '', uploaded_at
         FROM applicant_documents;
         DROP TABLE applicant_documents;
         ALTER TABLE applicant_documents_migrated RENAME TO applicant_documents;
@@ -288,7 +294,7 @@ async function listApplicantDocuments() {
   await ensureApplicantDocumentsTable();
   const db = getReadDb();
   const rows = await db.all(
-    `SELECT kind, file_name, format, chars, truncated, pages, label, uploaded_at
+    `SELECT kind, file_name, format, chars, truncated, pages, label, target_roles, uploaded_at
      FROM applicant_documents
      ORDER BY kind;`
   );
@@ -299,6 +305,10 @@ async function listApplicantDocuments() {
     // the app reporting "Not uploaded yet" for a resume that was sitting in the database.
     kind: String(row.kind || ""),
     label: String(row.label || ""),
+    // Free-text note on what this variant is tailored for (e.g. "general/non-hospitality
+    // roles"), so a caller with several resumes uploaded can pick the right one without
+    // hardcoded assumptions about what a key like resume_secondary means.
+    target_roles: String(row.target_roles || ""),
     file_name: String(row.file_name || ""),
     format: String(row.format || ""),
     chars: Number(row.chars || 0),
@@ -378,7 +388,7 @@ async function checkConfiguredDocumentPaths() {
 // while they can still do something about it, and every later get_resume is a plain read.
 // The original bytes are kept alongside the text so the file itself can be served back to
 // whichever machine is filling in an application form.
-async function saveApplicantDocument({ kind, file_name, content, label }) {
+async function saveApplicantDocument({ kind, file_name, content, label, target_roles }) {
   const normalizedKind = normalizeDocumentKind(kind);
   if (!normalizedKind) {
     throw new Error(
@@ -403,8 +413,8 @@ async function saveApplicantDocument({ kind, file_name, content, label }) {
   const db = getDb();
   await db.run(
     `
-      INSERT INTO applicant_documents (kind, file_name, format, content, extracted_text, chars, truncated, pages, label, uploaded_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      INSERT INTO applicant_documents (kind, file_name, format, content, extracted_text, chars, truncated, pages, label, target_roles, uploaded_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(kind) DO UPDATE SET
         file_name = excluded.file_name,
         format = excluded.format,
@@ -414,6 +424,7 @@ async function saveApplicantDocument({ kind, file_name, content, label }) {
         truncated = excluded.truncated,
         pages = excluded.pages,
         label = excluded.label,
+        target_roles = excluded.target_roles,
         uploaded_at = datetime('now');
     `,
     [
@@ -425,7 +436,8 @@ async function saveApplicantDocument({ kind, file_name, content, label }) {
       extracted.chars,
       extracted.truncated ? 1 : 0,
       extracted.pages ?? null,
-      String(label || "").trim()
+      String(label || "").trim(),
+      String(target_roles || "").trim()
     ]
   );
 
@@ -433,6 +445,7 @@ async function saveApplicantDocument({ kind, file_name, content, label }) {
     kind: normalizedKind,
     key: normalizedKind,
     label: String(label || "").trim(),
+    target_roles: String(target_roles || "").trim(),
     file_name: fileName,
     format: extracted.format,
     bytes: content.length,
@@ -452,7 +465,7 @@ async function getApplicantDocument(kind, { includeContent = false } = {}) {
   const db = getReadDb();
   const row = await db.get(
     `
-      SELECT kind, file_name, format, ${includeContent ? "content," : ""} extracted_text, chars, truncated, pages, label, uploaded_at
+      SELECT kind, file_name, format, ${includeContent ? "content," : ""} extracted_text, chars, truncated, pages, label, target_roles, uploaded_at
       FROM applicant_documents
       WHERE kind = ?
       LIMIT 1;
@@ -465,6 +478,7 @@ async function getApplicantDocument(kind, { includeContent = false } = {}) {
     kind: row.kind,
     key: row.kind,
     label: String(row.label || ""),
+    target_roles: String(row.target_roles || ""),
     file_name: String(row.file_name || ""),
     format: String(row.format || ""),
     text: String(row.extracted_text || ""),

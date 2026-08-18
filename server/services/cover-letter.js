@@ -17,6 +17,9 @@
 // have no support in the resume is what keeps the letter honest and lets the applicant
 // decide whether to address a gap or leave it alone.
 const { parseNonNegativeInteger } = require("../helpers/normalize-numbers");
+// Reused by findUnmatchedRequirementsStrict below for its already-curated discriminative
+// (non-filler) term list -- see that function's comment for why.
+const { tokenize: discriminativeTokenize } = require("./semantic-search.js");
 
 // Deliberately not semantic-search's tokenizer. That one's stopword list is tuned to make
 // BM25 ranking work across a whole corpus, so it strips "team", "experience", "manage",
@@ -235,6 +238,42 @@ function findUnmatchedRequirements(requirements, resumeText) {
   });
 }
 
+// findUnmatchedRequirements's one-shared-stem rule is deliberately generous for its actual
+// job -- flagging gaps in a cover letter, where a missed gap just omits a sentence and a
+// false gap wrongly implies the applicant doesn't qualify. posting-match.js's ranking use
+// case has the opposite failure cost: a bundled, multi-clause requirement bullet ("Organized.
+// Ability to juggle and prioritize workloads, have strong analytical skills") almost always
+// contains at least one filler word ("skills", "analytical") shared with any resume, which is
+// how a $21/hr benefits-clerk posting was scoring 100% against a hotel GM resume -- silence
+// there is actively misleading, not safe.
+//
+// The fix is not "require more words to match": that breaks real matches too, since a
+// requirement and a resume routinely describe the same thing in disjoint wording ("track
+// record of hitting targets you owned" vs. "Owned full P&L... improving margin" share almost
+// no literal tokens despite being the same claim). The actual problem is *which* words are
+// allowed to establish a match on their own. semantic-search.js's STOPWORDS already solves
+// exactly this for BM25 ranking -- it strips the near-universal filler ("skills", "team",
+// "experience"...) that carries no discriminating signal across a whole corpus of resumes and
+// postings. Reusing it here, plus requiring at least two discriminative terms to agree (one is
+// enough only when a bullet has just one discriminative term to begin with -- a single named
+// tool or license is exactly the kind of hard requirement this needs to catch), is what
+// actually separates a real match from an incidental one on real data.
+function findUnmatchedRequirementsStrict(requirements, resumeText) {
+  const resumeStems = new Set(discriminativeTokenize(resumeText).map(stem));
+  // Only requirements with at least one discriminative word are scorable -- a bullet that is
+  // pure soft-skill filler (like SOFT_REQUIREMENT bullets) carries no signal either way, so
+  // it is excluded from the total rather than counted as matched or unmatched.
+  const scorable = requirements.filter(
+    (requirement) => !SOFT_REQUIREMENT.test(requirement) && discriminativeTokenize(requirement).length > 0
+  );
+  const unmatched = scorable.filter((requirement) => {
+    const terms = discriminativeTokenize(requirement);
+    const matchedCount = terms.filter((term) => resumeStems.has(stem(term))).length;
+    return matchedCount < (terms.length === 1 ? 1 : 2);
+  });
+  return { scorable, unmatched };
+}
+
 function buildCoverLetterBrief({ description, resume_text, posting } = {}) {
   const descriptionText = String(description || "").trim();
   const resumeText = String(resume_text || "").trim();
@@ -351,5 +390,6 @@ module.exports = {
   extractSections,
   findOverlapTerms,
   findResumeEvidence,
-  findUnmatchedRequirements
+  findUnmatchedRequirements,
+  findUnmatchedRequirementsStrict
 };

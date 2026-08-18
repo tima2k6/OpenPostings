@@ -64,6 +64,18 @@ function parseJsonArraySafe(value) {
   }
 }
 
+// A plain LEFT JOIN's null match_percent can't distinguish "never scored" from "scored, but
+// nothing to score against" (see posting-match.js's computeMatchForPosting: available:false
+// when requirements_total is 0). Both used to collapse into the same
+// match_available/match_percent shape, which is what let match_available: true ship with a
+// null percent, and let an unscored resume key disappear from match_scores instead of
+// reading as pending. rowExists tells the two apart; descriptionAvailable further splits
+// "not scored yet" from "nothing to score" for a row that was never even attempted.
+function deriveMatchStatus({ rowExists, matchPercent, descriptionAvailable }) {
+  if (!rowExists) return descriptionAvailable ? "pending" : "no_description";
+  return matchPercent === null || matchPercent === undefined ? "no_requirements_detected" : "scored";
+}
+
 function normalizeMatchPercentFilter(value) {
   if (value === undefined || value === null || value === "") return null;
   const numeric = Number(value);
@@ -814,7 +826,8 @@ async function listPostingsWithFilters(options = {}) {
         sql: `
           SELECT ${baseSelect}, m.match_percent AS match_sort_key, m.match_percent AS match_percent,
                  m.overlap_terms_json AS match_overlap_terms_json,
-                 m.unmatched_requirements_json AS match_unmatched_requirements_json
+                 m.unmatched_requirements_json AS match_unmatched_requirements_json,
+                 1 AS match_row_exists
           FROM posting_match_scores m
           CROSS JOIN Postings p ON p.id = m.posting_id
           ${reviewStateJoin}
@@ -836,7 +849,8 @@ async function listPostingsWithFilters(options = {}) {
         : {
             sql: `
               SELECT ${baseSelect}, -1 AS match_sort_key, NULL AS match_percent,
-                     NULL AS match_overlap_terms_json, NULL AS match_unmatched_requirements_json
+                     NULL AS match_overlap_terms_json, NULL AS match_unmatched_requirements_json,
+                     0 AS match_row_exists
               FROM Postings p
               ${reviewStateJoin}
               ${baseWhere}
@@ -865,7 +879,8 @@ async function listPostingsWithFilters(options = {}) {
       const matchSelectSql = needsMatchJoin
         ? `, COALESCE(m.match_percent, -1) AS match_sort_key, m.match_percent AS match_percent,
                m.overlap_terms_json AS match_overlap_terms_json,
-               m.unmatched_requirements_json AS match_unmatched_requirements_json`
+               m.unmatched_requirements_json AS match_unmatched_requirements_json,
+               (m.posting_id IS NOT NULL) AS match_row_exists`
         : "";
       const minMatchPercentSql = minMatchPercentFilter !== null ? "AND COALESCE(m.match_percent, -1) >= ?" : "";
       candidateQuery = {
@@ -991,6 +1006,13 @@ async function listPostingsWithFilters(options = {}) {
       posting_date: rawPostingDate,
       job_description: normalizedJobDescription
     }, classificationOptions);
+    const matchStatus = needsMatchJoin
+      ? deriveMatchStatus({
+          rowExists: Boolean(Number(row?.match_row_exists || 0)),
+          matchPercent: row?.match_percent,
+          descriptionAvailable: Boolean(Number(row?.description_available || 0))
+        })
+      : null;
 
     return {
       ...row,
@@ -1022,7 +1044,12 @@ async function listPostingsWithFilters(options = {}) {
             // caller with more than one resume uploaded tell them apart from the other
             // entries in match_scores without guessing from the percentage alone.
             match_resume: resumeKey,
-            match_available: row?.match_percent !== null && row?.match_percent !== undefined,
+            // match_status distinguishes "scored" from "no requirements to score" from
+            // "not scored yet" from "no description at all" -- see deriveMatchStatus.
+            // match_available stays a plain boolean (true only for "scored") for callers
+            // that don't need the detail.
+            match_status: matchStatus,
+            match_available: matchStatus === "scored",
             match_percent:
               row?.match_percent === null || row?.match_percent === undefined
                 ? null
@@ -1032,6 +1059,7 @@ async function listPostingsWithFilters(options = {}) {
           }
         : {}),
       match_sort_key: undefined,
+      match_row_exists: undefined,
       match_overlap_terms_json: undefined,
       match_unmatched_requirements_json: undefined
     };
@@ -1224,18 +1252,28 @@ async function listPostingsWithFilters(options = {}) {
     items = items.map((item) => {
       const perResume = matchesByPosting.get(item.id);
       const matchScores = {};
-      if (perResume) {
-        for (const [key, match] of perResume) {
-          matchScores[key] = {
-            match_available: true,
-            match_percent:
-              match.match_percent === null || match.match_percent === undefined
-                ? null
-                : Math.round(Number(match.match_percent) * 10) / 10,
-            match_overlap_terms: match.overlap_terms,
-            match_unmatched_requirements: match.unmatched_requirements
-          };
-        }
+      // Every known resume key gets an entry, even one with no row yet -- omitting a key
+      // entirely (the old behavior) is indistinguishable from "this resume doesn't exist"
+      // and is exactly why a freshly-uploaded resume_secondary looked silently absent
+      // instead of pending. See deriveMatchStatus for the same four-state logic used above.
+      for (const key of resumeKeys) {
+        const match = perResume ? perResume.get(key) : undefined;
+        const matchPercent =
+          match && match.match_percent !== null && match.match_percent !== undefined
+            ? Math.round(Number(match.match_percent) * 10) / 10
+            : null;
+        const matchStatus = deriveMatchStatus({
+          rowExists: Boolean(match),
+          matchPercent,
+          descriptionAvailable: Boolean(item.description_available)
+        });
+        matchScores[key] = {
+          match_status: matchStatus,
+          match_available: matchStatus === "scored",
+          match_percent: matchPercent,
+          match_overlap_terms: match ? match.overlap_terms : [],
+          match_unmatched_requirements: match ? match.unmatched_requirements : []
+        };
       }
       return { ...item, match_scores: matchScores };
     });

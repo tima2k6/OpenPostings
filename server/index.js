@@ -2177,6 +2177,7 @@ function createServer() {
         kind,
         file_name: req.body?.file_name,
         label: req.body?.label,
+        target_roles: req.body?.target_roles,
         content
       });
       res.json({ ok: true, ...saved });

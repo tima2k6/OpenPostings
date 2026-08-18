@@ -16,8 +16,8 @@
 // row of a postings list would reintroduce exactly the timeout problem the reader-connection
 // fix elsewhere addresses. Instead it runs as a batched background job (see
 // server/scripts/build-match-index.js), mirroring semantic-search.js's rebuildSemanticIndex.
-const { buildCoverLetterBrief } = require("./cover-letter.js");
-const { getApplicantDocument, DEFAULT_DOCUMENT_KEY } = require("./applicant-documents.js");
+const { buildCoverLetterBrief, findUnmatchedRequirementsStrict } = require("./cover-letter.js");
+const { getApplicantDocument, DEFAULT_DOCUMENT_KEY, listResumeDocumentKeys } = require("./applicant-documents.js");
 const { getDb, getReadDb, runInWriteTransaction } = require("./runtime-context.js");
 
 // How many overlap terms / unmatched requirements to keep per posting. Matches the slice
@@ -27,6 +27,15 @@ const MAX_OVERLAP_TERMS = 10;
 const MAX_UNMATCHED_REQUIREMENTS = 5;
 
 const MATCH_INDEX_BATCH_SIZE = Number(process.env.MATCH_INDEX_BATCH_SIZE || 400);
+
+// The forward walk only ever moves last_scored_id ahead, but the description backfill
+// (posting-page-fetcher.js) runs on its own slower, independent clock (see
+// enrichment-runtime.js) -- a description can arrive for a posting after the forward walk
+// has already passed its id, and would otherwise never be scored short of a full rebuild.
+// This bounds a second, low-priority sweep over the already-scanned range, re-checking for
+// postings that gained a description after the fact. Small and fixed rather than a CLI
+// flag: it is a reconciliation pass, not the primary catch-up mechanism.
+const GAP_SWEEP_MAX_BATCHES = 4;
 
 async function ensureMatchTables() {
   const db = getDb();
@@ -114,46 +123,64 @@ async function ensureMatchTables() {
       `);
     });
   }
+
+  // gap_scanned_id tracks a second, independent cursor (see the gap sweep in rescoreMatches)
+  // over the range the forward walk has already passed -- a posting whose description
+  // arrives after last_scored_id has moved beyond it would otherwise never be revisited.
+  const stateColumnsAfterKeyMigration = await db.all(`PRAGMA table_info('posting_match_state');`);
+  if (!stateColumnsAfterKeyMigration.some((column) => String(column?.name || "") === "gap_scanned_id")) {
+    await runInWriteTransaction(async (handle) => {
+      await handle.exec(`ALTER TABLE posting_match_state ADD COLUMN gap_scanned_id INTEGER NOT NULL DEFAULT 0;`);
+    });
+  }
 }
 
 async function readMatchState(resumeKey) {
   const db = getDb();
   await ensureMatchTables();
   const row = await db.get(
-    `SELECT last_scored_id, resume_uploaded_at FROM posting_match_state WHERE resume_key = ?;`,
+    `SELECT last_scored_id, resume_uploaded_at, gap_scanned_id FROM posting_match_state WHERE resume_key = ?;`,
     [resumeKey]
   );
   return {
     last_scored_id: Number(row?.last_scored_id || 0),
-    resume_uploaded_at: String(row?.resume_uploaded_at || "")
+    resume_uploaded_at: String(row?.resume_uploaded_at || ""),
+    gap_scanned_id: Number(row?.gap_scanned_id || 0)
   };
 }
 
 // Upserts rather than updating a pre-seeded row -- there is no longer one singleton row to
 // seed at table-creation time, since each resume key gets its own row on first use.
-async function writeMatchState(resumeKey, lastScoredId, resumeUploadedAt) {
+async function writeMatchState(resumeKey, lastScoredId, resumeUploadedAt, gapScannedId) {
   const db = getDb();
   await db.run(
-    `INSERT INTO posting_match_state (resume_key, last_scored_id, resume_uploaded_at, updated_at)
-     VALUES (?, ?, ?, datetime('now'))
+    `INSERT INTO posting_match_state (resume_key, last_scored_id, resume_uploaded_at, gap_scanned_id, updated_at)
+     VALUES (?, ?, ?, ?, datetime('now'))
      ON CONFLICT(resume_key) DO UPDATE SET
        last_scored_id = excluded.last_scored_id,
        resume_uploaded_at = excluded.resume_uploaded_at,
+       gap_scanned_id = excluded.gap_scanned_id,
        updated_at = datetime('now');`,
-    [resumeKey, lastScoredId, resumeUploadedAt]
+    [resumeKey, lastScoredId, resumeUploadedAt, gapScannedId]
   );
 }
 
-// Thin wrapper over buildCoverLetterBrief's requirement diff, turned into the same
+// Thin wrapper over buildCoverLetterBrief's requirement extraction, turned into the same
 // match_percent shape computeJobFitByApplicationId already computes (applications.js) --
-// requirements with no keyword support in the resume count against the score, everything
-// else counts for it. Returns available: false when the description has no detectable
-// requirements section, same as the application-side computation.
+// requirements with no discriminative support in the resume count against the score,
+// everything else counts for it. Returns available: false when the description has no
+// scorable requirements, same as the application-side computation.
+//
+// Deliberately uses findUnmatchedRequirementsStrict here, not the same
+// findUnmatchedRequirements draft_cover_letter's brief uses -- see that function's comment
+// in cover-letter.js. This is the one place that distinction matters: a ranking score that
+// reads 100% on a mismatched posting is actively misleading in a way a cover letter that
+// under-flags one gap is not, so this path trades the letter-writing leniency for precision.
 function computeMatchForPosting({ description, resume_text, posting } = {}) {
   const brief = buildCoverLetterBrief({ description, resume_text, posting });
-  const requirementsTotal = brief.requirements.length;
-  const requirementsUnmatched = brief.unmatched_requirements.length;
-  const requirementsMatched = Math.max(0, requirementsTotal - requirementsUnmatched);
+  const { scorable, unmatched } = findUnmatchedRequirementsStrict(brief.requirements, resume_text || "");
+  const requirementsTotal = scorable.length;
+  const requirementsMatched = Math.max(0, requirementsTotal - unmatched.length);
 
   return {
     available: requirementsTotal > 0,
@@ -161,8 +188,42 @@ function computeMatchForPosting({ description, resume_text, posting } = {}) {
     requirements_matched: requirementsMatched,
     match_percent: requirementsTotal > 0 ? (requirementsMatched / requirementsTotal) * 100 : null,
     overlap_terms: brief.overlap_terms.slice(0, MAX_OVERLAP_TERMS).map((entry) => entry.term),
-    unmatched_requirements: brief.unmatched_requirements.slice(0, MAX_UNMATCHED_REQUIREMENTS)
+    unmatched_requirements: unmatched.slice(0, MAX_UNMATCHED_REQUIREMENTS)
   };
+}
+
+// Shared by both the forward walk and the gap sweep below -- same computation, same upsert,
+// just fed by two different queries.
+async function scoreAndUpsertRow(handle, row, resumeKey, resumeUploadedAt, resumeText) {
+  const match = computeMatchForPosting({
+    description: row.job_description,
+    resume_text: resumeText,
+    posting: { position_name: row.position_name, company_name: row.company_name }
+  });
+  await handle.run(
+    `INSERT INTO posting_match_scores
+       (posting_id, resume_key, resume_uploaded_at, requirements_total, requirements_matched,
+        match_percent, overlap_terms_json, unmatched_requirements_json, computed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+     ON CONFLICT(posting_id, resume_key) DO UPDATE SET
+       resume_uploaded_at = excluded.resume_uploaded_at,
+       requirements_total = excluded.requirements_total,
+       requirements_matched = excluded.requirements_matched,
+       match_percent = excluded.match_percent,
+       overlap_terms_json = excluded.overlap_terms_json,
+       unmatched_requirements_json = excluded.unmatched_requirements_json,
+       computed_at = datetime('now');`,
+    [
+      row.id,
+      resumeKey,
+      resumeUploadedAt,
+      match.requirements_total,
+      match.requirements_matched,
+      match.match_percent,
+      JSON.stringify(match.overlap_terms),
+      JSON.stringify(match.unmatched_requirements)
+    ]
+  );
 }
 
 // Incremental: only postings above last_scored_id are scored, so a run after a sync pass is
@@ -199,10 +260,11 @@ async function rescoreMatches({
 
   if (effectiveRebuild) {
     await db.run(`DELETE FROM posting_match_scores WHERE resume_key = ?;`, [resumeKey]);
-    await writeMatchState(resumeKey, 0, resumeUploadedAt);
+    await writeMatchState(resumeKey, 0, resumeUploadedAt, 0);
   }
 
   let lastId = effectiveRebuild ? 0 : state.last_scored_id;
+  let gapCursor = effectiveRebuild ? 0 : state.gap_scanned_id;
   let scored = 0;
   let batches = 0;
   let complete = false;
@@ -225,39 +287,11 @@ async function rescoreMatches({
     // runs on its own clock alongside the sync and any other background writer.
     await runInWriteTransaction(async (handle) => {
       for (const row of rows) {
-        const match = computeMatchForPosting({
-          description: row.job_description,
-          resume_text: resumeText,
-          posting: { position_name: row.position_name, company_name: row.company_name }
-        });
-        await handle.run(
-          `INSERT INTO posting_match_scores
-             (posting_id, resume_key, resume_uploaded_at, requirements_total, requirements_matched,
-              match_percent, overlap_terms_json, unmatched_requirements_json, computed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-           ON CONFLICT(posting_id, resume_key) DO UPDATE SET
-             resume_uploaded_at = excluded.resume_uploaded_at,
-             requirements_total = excluded.requirements_total,
-             requirements_matched = excluded.requirements_matched,
-             match_percent = excluded.match_percent,
-             overlap_terms_json = excluded.overlap_terms_json,
-             unmatched_requirements_json = excluded.unmatched_requirements_json,
-             computed_at = datetime('now');`,
-          [
-            row.id,
-            resumeKey,
-            resumeUploadedAt,
-            match.requirements_total,
-            match.requirements_matched,
-            match.match_percent,
-            JSON.stringify(match.overlap_terms),
-            JSON.stringify(match.unmatched_requirements)
-          ]
-        );
+        await scoreAndUpsertRow(handle, row, resumeKey, resumeUploadedAt, resumeText);
         lastId = Number(row.id);
         scored += 1;
       }
-      await writeMatchState(resumeKey, lastId, resumeUploadedAt);
+      await writeMatchState(resumeKey, lastId, resumeUploadedAt, gapCursor);
     });
     batches += 1;
 
@@ -267,6 +301,50 @@ async function rescoreMatches({
     }
   }
 
+  // Gap sweep: re-check the range the forward walk has already passed for postings whose
+  // description arrived late (see the GAP_SWEEP_MAX_BATCHES comment above). Skipped on a
+  // rebuild -- everything up to lastId was just freshly scanned, so there are no gaps yet.
+  let gapScored = 0;
+  if (!effectiveRebuild) {
+    const ceiling = lastId;
+    let gapBatches = 0;
+    while (gapBatches < GAP_SWEEP_MAX_BATCHES && gapCursor < ceiling) {
+      const gapRows = await db.all(
+        `SELECT p.id, p.position_name, p.company_name, p.job_description
+         FROM Postings p
+         LEFT JOIN posting_match_scores m ON m.posting_id = p.id AND m.resume_key = ?
+         WHERE p.id > ? AND p.id <= ? AND m.posting_id IS NULL
+           AND p.job_description IS NOT NULL AND TRIM(p.job_description) <> ''
+         ORDER BY p.id
+         LIMIT ?;`,
+        [resumeKey, gapCursor, ceiling, batchSize]
+      );
+      if (gapRows.length === 0) {
+        // Nothing left in [gapCursor, ceiling) -- wrap around so the sweep keeps
+        // re-covering the whole scored range over time, not just today's backlog.
+        gapCursor = 0;
+        break;
+      }
+
+      await runInWriteTransaction(async (handle) => {
+        for (const row of gapRows) {
+          await scoreAndUpsertRow(handle, row, resumeKey, resumeUploadedAt, resumeText);
+          gapCursor = Number(row.id);
+          gapScored += 1;
+        }
+        await writeMatchState(resumeKey, lastId, resumeUploadedAt, gapCursor);
+      });
+      gapBatches += 1;
+
+      if (gapRows.length < batchSize) {
+        gapCursor = 0;
+        break;
+      }
+    }
+    if (gapCursor >= ceiling) gapCursor = 0;
+    await writeMatchState(resumeKey, lastId, resumeUploadedAt, gapCursor);
+  }
+
   return {
     resume_key: resumeKey,
     scored,
@@ -274,7 +352,8 @@ async function rescoreMatches({
     last_id: lastId,
     batches,
     complete,
-    rebuilt: effectiveRebuild
+    rebuilt: effectiveRebuild,
+    gap_scored: gapScored
   };
 }
 
@@ -361,12 +440,57 @@ async function getMatchesByPostingIdsForKeys(postingIds, resumeKeys) {
   return byPosting;
 }
 
+// What get_applicant_context surfaces so a caller can tell fresh scores from a backfill
+// still in progress, instead of a freshly-uploaded resume silently reading as broken (see
+// the match-index.conf systemd drop-in: a full corpus rescore is a ~1.5-2 day operation, not
+// instant). last_run_at/last_error live in enrichment-runtime.js's in-memory state, which
+// belongs to the API server process, not this one when called from mcp-apply-server.js (a
+// separate process with its own DB connection) -- so this reports only what the database
+// itself can answer: per-resume checkpoint position and scored/pending counts.
+async function getMatchScoringStatus() {
+  const db = getReadDb();
+  await ensureMatchTables();
+
+  const totalRow = await db.get(
+    `SELECT COUNT(*) AS n FROM Postings WHERE job_description IS NOT NULL AND TRIM(job_description) <> '';`
+  );
+  const totalWithDescription = Number(totalRow?.n || 0);
+
+  const resumeKeys = await listResumeDocumentKeys();
+  const perResume = [];
+  for (const resumeKey of resumeKeys) {
+    const state = await readMatchState(resumeKey);
+    const scoredRow = await db.get(
+      `SELECT COUNT(*) AS n FROM posting_match_scores WHERE resume_key = ?;`,
+      [resumeKey]
+    );
+    const stateRow = await db.get(
+      `SELECT updated_at FROM posting_match_state WHERE resume_key = ?;`,
+      [resumeKey]
+    );
+    const scoredCount = Number(scoredRow?.n || 0);
+    const pendingCount = Math.max(0, totalWithDescription - scoredCount);
+    perResume.push({
+      resume_key: resumeKey,
+      resume_uploaded_at: state.resume_uploaded_at,
+      last_scored_id: state.last_scored_id,
+      last_run_at: String(stateRow?.updated_at || "") || null,
+      scored_count: scoredCount,
+      pending_count: pendingCount,
+      caught_up: pendingCount === 0
+    });
+  }
+
+  return { total_postings_with_description: totalWithDescription, per_resume: perResume };
+}
+
 module.exports = {
   ensureMatchTables,
   computeMatchForPosting,
   rescoreMatches,
   getMatchesByPostingIds,
   getMatchesByPostingIdsForKeys,
+  getMatchScoringStatus,
   MAX_OVERLAP_TERMS,
   MAX_UNMATCHED_REQUIREMENTS
 };

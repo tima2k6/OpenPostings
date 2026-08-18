@@ -11,7 +11,8 @@ const {
   extractSections,
   findOverlapTerms,
   findResumeEvidence,
-  findUnmatchedRequirements
+  findUnmatchedRequirements,
+  findUnmatchedRequirementsStrict
 } = require("../services/cover-letter.js");
 
 const DESCRIPTION = `About the role
@@ -207,6 +208,43 @@ function testDraftIsAScaffoldNotAFinishedLetter() {
   assert.match(bare, /Acme/);
 }
 
+// Modeled on a real posting (Northwest Administrators, "Benefits Eligibility Clerk") that
+// scored 100% against a hotel GM resume in production: every "requirement" here is a
+// generic trait label plus filler ("Organized. Ability to juggle..."), the exact shape that
+// lets one throwaway word ("skills", "excellent") pass the whole bullet under the lenient
+// one-shared-stem rule. The resume below adds the kind of generic self-description
+// adjectives ("excellent", "analytical", "technically") a real, full-length resume
+// incidentally contains -- reproducing the actual failure, not just its shape.
+const GENERIC_TRAIT_REQUIREMENTS = [
+  "Organized. Ability to juggle and prioritize workloads, have strong analytical skills",
+  "Communicator. Excellent interpersonal and communication skills",
+  "Detailed. Strong attention to detail with excellent problem solving skills",
+  "Technically Savvy. Basic proficiency in Excel and Word"
+];
+const RESUME_WITH_GENERIC_ADJECTIVES = `${RESUME}
+Known for excellent follow-through, strong analytical judgment and a technically confident approach to vendor systems.`;
+
+function testStrictMatchingCatchesGenericBulletsTheLenientRuleMisses() {
+  // This is the actual bug: the lenient rule flags nothing here, because each bullet shares
+  // at least one throwaway word with the resume's ordinary self-description vocabulary --
+  // this is what let a $21/hr benefits-clerk posting score 100% against a hotel GM resume.
+  const lenientUnmatched = findUnmatchedRequirements(GENERIC_TRAIT_REQUIREMENTS, RESUME_WITH_GENERIC_ADJECTIVES);
+  assert.strictEqual(
+    lenientUnmatched.length,
+    0,
+    "documents the lenient rule's actual behavior -- posting-match.js's ranking path works around this, draft_cover_letter does not need to"
+  );
+
+  // findUnmatchedRequirementsStrict strips that same filler vocabulary before matching (see
+  // its comment in cover-letter.js) and requires two discriminative terms to agree, so none
+  // of these pass on a single incidental adjective. "Communicator..." is excluded from
+  // scorable entirely (SOFT_REQUIREMENT already matches "communication skills"), not forced
+  // to either side.
+  const { scorable, unmatched } = findUnmatchedRequirementsStrict(GENERIC_TRAIT_REQUIREMENTS, RESUME_WITH_GENERIC_ADJECTIVES);
+  assert.strictEqual(scorable.length, 3, "the dispositional/soft bullet is excluded, not counted");
+  assert.strictEqual(unmatched.length, 3, "every remaining generic trait bullet must be flagged, not silently passed");
+}
+
 function main() {
   testSectionExtraction();
   testGreenhouseStyleAndBoilerplate();
@@ -215,6 +253,7 @@ function main() {
   testUnmatchedRequirementsAreNamed();
   testBriefShape();
   testDraftIsAScaffoldNotAFinishedLetter();
+  testStrictMatchingCatchesGenericBulletsTheLenientRuleMisses();
   console.log("cover-letter tests passed");
 }
 

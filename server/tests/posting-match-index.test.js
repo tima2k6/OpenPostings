@@ -19,15 +19,21 @@ const { listPostingsWithFilters } = require("../services/postings.js");
 const { ensureApplicantDocumentsTable, saveApplicantDocument } = require("../services/applicant-documents.js");
 const { ensureMatchTables, computeMatchForPosting, rescoreMatches } = require("../services/posting-match.js");
 
-// Same fixture cover-letter.test.js uses: a hospitality resume against a role whose
-// requirements are mostly operational (matched) but include a Kubernetes line the resume
-// never speaks to (unmatched) -- 3 of 4 requirements matched, so match_percent is 75.
+// Based on the fixture cover-letter.test.js uses (same resume, same HIGH/LOW descriptions),
+// with one extra line: computeMatchForPosting scores against
+// findUnmatchedRequirementsStrict (see cover-letter.js), which requires two discriminative
+// (non-filler) terms to agree per requirement bullet, not cover-letter.test.js's one-shared-
+// stem rule -- a terse 5-line resume does not give every genuinely-matched bullet two words
+// of overlap on its own. This line adds real, plausible hospitality-GM vocabulary
+// ("growth metrics", "regulatory compliance") that a resume this senior would actually
+// contain, restoring the intended 3-of-4-matched, Kubernetes-is-the-one-gap shape.
 const RESUME = `Tim Annan
 Hotel General Manager and Hospitality Technology Leader
 Owned full P&L for a 220-room property with $18M annual revenue, improving margin through labor cost control and vendor contract renegotiation.
 Led a multi-department team of 85 across front office, housekeeping, food and beverage and engineering.
 Built standard operating procedures, KPI dashboards and weekly business reviews to hold department heads accountable.
-Managed capital projects and third-party vendor partnerships across the property portfolio.`;
+Managed capital projects and third-party vendor partnerships across the property portfolio.
+Tracked growth metrics against clear ownership targets each quarter, and passed every regulatory compliance audit for the property.`;
 
 const HIGH_MATCH_DESCRIPTION = `About the role
 
@@ -354,6 +360,101 @@ async function testTwoResumesAreScoredAndRankedIndependently() {
   });
 }
 
+// The forward walk's WHERE clause only ever selects postings that already have a
+// description, so a posting still missing one at scan time is invisible to it -- its id
+// never advances last_scored_id, but a *later* posting's id can, leaving a gap below the
+// checkpoint. The description backfill (posting-page-fetcher.js) runs on its own,
+// independent, slower clock and can fill one in well after the forward walk has already
+// passed its id -- see the Bug 2 writeup in posting-match.js. The gap sweep exists to catch
+// exactly this.
+async function testGapSweepCatchesADescriptionThatArrivesAfterTheCheckpointPassesIt() {
+  await withDb(async (db) => {
+    await saveApplicantDocument({ kind: "resume", file_name: "resume.txt", content: Buffer.from(RESUME, "utf8") });
+    // No description yet -- invisible to the forward walk's WHERE clause.
+    await seedPosting(db, { url: "https://x/late", position: "Late Description Role", description: null, lastSeenOffsetSeconds: 20 });
+    // Has a description already, and a higher id, so scoring it moves last_scored_id past
+    // the still-description-less posting above.
+    await seedPosting(db, { url: "https://x/early", position: "Early Scored Role", description: HIGH_MATCH_DESCRIPTION, lastSeenOffsetSeconds: 10 });
+
+    const first = await rescoreMatches({});
+    assert.strictEqual(first.scored, 1, "only the posting that already has a description is scored");
+    let rows = await db.all(`SELECT posting_id FROM posting_match_scores;`);
+    assert.strictEqual(rows.length, 1);
+
+    // The description backfill fills it in on its own schedule, after the forward walk has
+    // already moved on.
+    await db.run(`UPDATE Postings SET job_description = ? WHERE job_posting_url = ?;`, [LOW_MATCH_DESCRIPTION, "https://x/late"]);
+
+    const second = await rescoreMatches({});
+    assert.strictEqual(second.scored, 0, "nothing new for the forward walk -- the gap sits below last_scored_id");
+    assert.ok(second.gap_scored >= 1, "the gap sweep must find and score the posting whose description arrived late");
+
+    rows = await db.all(`SELECT posting_id, match_percent FROM posting_match_scores ORDER BY posting_id;`);
+    assert.strictEqual(rows.length, 2, "both postings must be scored now, not just the one the forward walk originally saw");
+  });
+}
+
+// A rebuild (fresh resume upload) re-scans everything from id 0, so there is nothing for the
+// gap sweep to do yet -- it must not error or double-count on a rebuild pass.
+async function testGapSweepIsANoOpDuringARebuild() {
+  await withDb(async (db) => {
+    await saveApplicantDocument({ kind: "resume", file_name: "resume.txt", content: Buffer.from(RESUME, "utf8") });
+    await seedPosting(db, { url: "https://x/a", position: "GM", description: HIGH_MATCH_DESCRIPTION });
+    const summary = await rescoreMatches({ rebuild: true });
+    assert.strictEqual(summary.rebuilt, true);
+    assert.strictEqual(summary.gap_scored, 0);
+  });
+}
+
+// match_status must distinguish four states a caller cannot currently tell apart from a bare
+// match_available boolean: genuinely scored, scored-but-nothing-to-score-against (no
+// requirements section detected), not-yet-scored-but-scorable (pending, e.g. mid-backfill),
+// and no-description-at-all. And a resume key that has never been scored must still appear
+// in match_scores as pending, not be silently omitted -- omission is what made
+// resume_secondary look entirely absent instead of catching up.
+async function testMatchStatusDistinguishesScoredPendingAndNoRequirements() {
+  await withDb(async (db) => {
+    await saveApplicantDocument({ kind: "resume", file_name: "resume.txt", content: Buffer.from(RESUME, "utf8") });
+    await seedPosting(db, { url: "https://x/scored", position: "Scored Role", description: HIGH_MATCH_DESCRIPTION, lastSeenOffsetSeconds: 30 });
+    // Plain prose with no recognisable section header at all -- extractSections finds no
+    // requirements, so a row is still written but with nothing scorable in it.
+    await seedPosting(db, {
+      url: "https://x/norequirements",
+      position: "No Requirements Section Role",
+      description: "This role involves a variety of duties across the organization, working with many stakeholders day to day.",
+      lastSeenOffsetSeconds: 20
+    });
+    await seedPosting(db, { url: "https://x/nodescription", position: "No Description Role", description: null, lastSeenOffsetSeconds: 10 });
+    await rescoreMatches({});
+
+    // A second resume is uploaded but never scored -- it must still show up as pending.
+    await saveApplicantDocument({ kind: "resume_secondary", file_name: "r2.txt", content: Buffer.from(SECONDARY_RESUME, "utf8") });
+
+    const listed = await listPostingsWithFilters({ include_match: true });
+    const byUrl = (url) => listed.items.find((item) => item.job_posting_url === url);
+
+    const scored = byUrl("https://x/scored");
+    assert.strictEqual(scored.match_scores.resume.match_status, "scored");
+    assert.strictEqual(scored.match_scores.resume.match_available, true);
+    assert.strictEqual(scored.match_scores.resume_secondary.match_status, "pending");
+    assert.strictEqual(scored.match_scores.resume_secondary.match_available, false);
+    assert.strictEqual(scored.match_scores.resume_secondary.match_percent, null);
+
+    const noRequirements = byUrl("https://x/norequirements");
+    assert.strictEqual(noRequirements.match_scores.resume.match_status, "no_requirements_detected");
+    assert.strictEqual(
+      noRequirements.match_scores.resume.match_available,
+      false,
+      "a scored row with no detectable requirements must not read as available"
+    );
+    assert.strictEqual(noRequirements.match_scores.resume.match_percent, null);
+
+    const noDescription = byUrl("https://x/nodescription");
+    assert.strictEqual(noDescription.match_scores.resume.match_status, "no_description");
+    assert.strictEqual(noDescription.match_scores.resume.match_available, false);
+  });
+}
+
 async function main() {
   testComputeMatchForPostingMatchesTheApplicationFormula();
   await testRescoreMatchesIsIncremental();
@@ -362,6 +463,9 @@ async function main() {
   await testMatchDescPaginatesAcrossChunks();
   await testMatchDescPaginatesAcrossTheScoredUnscoredBoundary();
   await testTwoResumesAreScoredAndRankedIndependently();
+  await testGapSweepCatchesADescriptionThatArrivesAfterTheCheckpointPassesIt();
+  await testGapSweepIsANoOpDuringARebuild();
+  await testMatchStatusDistinguishesScoredPendingAndNoRequirements();
   console.log("posting-match-index tests passed");
 }
 
