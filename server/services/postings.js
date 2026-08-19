@@ -379,6 +379,38 @@ const LOCATION_GEO_OPTIONS_TTL_MS = 60000;
 // there is truly nothing more to find, so a UI can suggest narrowing the filter.
 const MAX_WIDE_SCAN_CANDIDATE_ROWS = Number(process.env.POSTINGS_WIDE_SCAN_MAX_CANDIDATES || 50000);
 
+// MAX_WIDE_SCAN_CANDIDATE_ROWS alone does not bound this walk, because it counts the rows a
+// chunk *returns* while the cost lives in the rows SQLite had to *examine* to produce them.
+// The two diverge exactly when a term is selective: measured 2026-08-19 against the live
+// database (1.88M postings, 1.05M visible+fresh), one chunk searching for "kubernetes" took
+// 65.5s and came back with 150 rows -- charging 150 against a 50,000 budget for a minute of
+// disk. A search that returns nothing at all charges nothing at all. So a request could, and
+// did, spend 15 minutes inside a "bounded" walk: three such queries queued behind
+// runExclusiveWideScan on 2026-08-19 left /health taking 243s and the description backfill
+// failing 200/200 until they drained.
+//
+// A wall-clock budget bounds the thing that actually hurts. It is checked between chunks --
+// node-sqlite3 exposes no way to interrupt one statement without interrupting every other
+// query on the same connection -- so the real worst case is this budget plus one in-flight
+// chunk, not the budget exactly. That still turns an unbounded stall into a bounded one,
+// which is the difference between "the API is down" and "this page came back short".
+//
+// 15s, not something tighter, because cutting a walk short is not free: it returns a short
+// page with scan_bounded set, and a budget below the cost of a couple of honest chunks would
+// make ordinary queries look broken. sort_by=match_desc's first phase measures 4.0s per chunk
+// on the live database, and paging past the first screen needs more than one chunk, so a 5s
+// budget would truncate a query that was going to converge. The ceiling is the client's own
+// 30s timeout: staying well under it means the response still arrives, while three of these
+// queued behind runExclusiveWideScan cost ~45s instead of the 15 minutes observed on
+// 2026-08-19.
+//
+// The cost per chunk is dominated by random table row lookups, not by the LIKE itself: the
+// same predicate over the whole table runs in 2-4s when an index covers the columns it reads
+// (measured on idx_postings_position_name). A covering index over the searched columns plus
+// the sort keys is the structural fix and would make this budget close to unreachable; until
+// that exists, this keeps a rare search from taking the whole process down with it.
+const MAX_WIDE_SCAN_MILLIS = Number(process.env.POSTINGS_WIDE_SCAN_MAX_MILLIS || 15000);
+
 async function readDistinctStoredLocations() {
   // Read-only, and called from the filter-options bootstrap request -- getReadDb() keeps it
   // off the sync's write connection so it does not queue behind an in-progress flush.
@@ -1201,9 +1233,18 @@ async function listPostingsWithFilters(options = {}) {
     let phaseIndex = 0;
     let cursor = null;
     let candidatesScanned = 0;
+    const scanStartedAt = Date.now();
 
     while (matchingRows.length < targetMatchCount && phaseIndex < candidateQuery.phases.length) {
+      // Two bounds, because they fail in opposite directions: the row cap catches a walk
+      // that keeps finding candidates JS then discards, and the time budget catches a walk
+      // whose chunks are individually expensive but return almost nothing (see
+      // MAX_WIDE_SCAN_MILLIS -- the case that actually took the API down).
       if (candidatesScanned >= MAX_WIDE_SCAN_CANDIDATE_ROWS) {
+        scanBounded = true;
+        break;
+      }
+      if (Date.now() - scanStartedAt >= MAX_WIDE_SCAN_MILLIS) {
         scanBounded = true;
         break;
       }
@@ -1307,10 +1348,13 @@ async function listPostingsWithFilters(options = {}) {
     pay_unknown_count: items.filter(
       (item) => !(Number(item?.pay_min) > 0) && !(Number(item?.pay_max) > 0)
     ).length,
-    // True only when the wide-scan walk (candidateQuery) hit MAX_WIDE_SCAN_CANDIDATE_ROWS
-    // before filling this page -- the page may be short or empty not because there is
-    // nothing more to find, but because the scan gave up. Absent (not false) for requests
-    // that never needed the wide-scan walk at all, so existing callers see no shape change.
+    // True only when the wide-scan walk (candidateQuery) hit either of its bounds --
+    // MAX_WIDE_SCAN_CANDIDATE_ROWS or MAX_WIDE_SCAN_MILLIS -- before filling this page. The
+    // page may be short or empty not because there is nothing more to find, but because the
+    // scan gave up. One flag covers both on purpose: a caller can only do the one thing
+    // about it either way (narrow the filter), and splitting it would change a shape callers
+    // already read. Absent (not false) for requests that never needed the wide-scan walk at
+    // all, so existing callers see no shape change.
     ...(candidateQuery ? { scan_bounded: scanBounded } : {}),
     limit,
     offset,
