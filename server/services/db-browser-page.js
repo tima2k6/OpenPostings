@@ -879,16 +879,36 @@ ORDER BY n DESC</textarea>
       var stateOptions = '<label class="facet-pick"><span class="facet-name">State</span>' +
         '<select data-facet="states"><option value="">\u2014 any \u2014</option>' +
         (data.all_states || []).map(function (st) {
-          return '<option value="' + esc(st.value) + '">' + esc(st.value) + "</option>";
+          // The count is exact when present (it comes from posting_location_states, not from
+          // a sample), so it is safe to show even in the narrowing branch. Picking a state
+          // blind was the whole problem: 51 identical-looking codes, one of which has 75,000
+          // postings behind it and another 300.
+          var n = typeof st.count === "number" ? st.count : null;
+          return '<option value="' + esc(st.value) + '">' + esc(st.value) +
+            (n === null ? "" : " (" + n.toLocaleString() + ")") + "</option>";
         }).join("") + "</select></label>";
 
       if (data.needs_narrowing) {
+        // Companies are counted exactly here too when nothing is narrowed yet -- same
+        // reasoning as the state counts above. City and title breakdowns still need the
+        // scan, so they remain the thing narrowing buys you.
+        var wideCompanies = (data.facets && data.facets.companies) || [];
+        var companyOptions = wideCompanies.length
+          ? '<label class="facet-pick"><span class="facet-name">Company ' +
+            '<span class="n">' + wideCompanies.length + "</span></span>" +
+            '<select data-facet="companies"><option value="">\u2014 any \u2014</option>' +
+            wideCompanies.map(function (it) {
+              return '<option value="' + esc(it.value) + '">' + esc(it.value) +
+                " (" + it.count.toLocaleString() + ")</option>";
+            }).join("") + "</select></label>"
+          : "";
         out.innerHTML =
-          '<p class="hint"><b>' + data.total.toLocaleString() + " rows.</b> Company and title breakdowns " +
-          "are only shown once the set is small enough to count exactly \u2014 over a set this size they " +
-          "would describe a fraction of it and read as if they described all of it. Pick a state, or add a " +
-          "title or date filter, and they appear.</p>" +
-          '<div class="facet-row">' + stateOptions + "</div>";
+          '<p class="hint"><b>' + data.total.toLocaleString() + " rows.</b> State and company counts below are " +
+          "exact for the whole database. City and title breakdowns need a scan of the matching rows, so they " +
+          "appear once that set is small enough to count exactly \u2014 over a set this size they would describe a " +
+          "fraction of it and read as if they described all of it. A company, title or date filter gets there " +
+          "fastest; a state on its own often does not, since the biggest states are still too broad.</p>" +
+          '<div class="facet-row">' + stateOptions + companyOptions + "</div>";
         wireFacetSelects(out);
         return;
       }

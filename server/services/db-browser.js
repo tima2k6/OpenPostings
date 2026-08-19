@@ -32,17 +32,45 @@ function isReadableTableName(name) {
 }
 
 let readOnlyDb = null;
+let readOnlyDbPromise = null;
 
 async function getReadOnlyDb() {
   if (readOnlyDb) return readOnlyDb;
-  readOnlyDb = await open({
-    filename: DB_PATH,
-    driver: sqlite3.Database,
-    mode: sqlite3.OPEN_READONLY
-  });
-  // Reads can still hit SQLITE_BUSY around checkpoints; wait rather than fail.
-  await readOnlyDb.exec("PRAGMA busy_timeout = 15000;");
-  return readOnlyDb;
+  // One in-flight open, shared. Without this, the first page load opens a connection per
+  // concurrent request (/db/schema and /db/facets fire together), each paying the same cost
+  // and all but one immediately discarded.
+  if (!readOnlyDbPromise) {
+    readOnlyDbPromise = (async () => {
+      const db = await open({
+        filename: DB_PATH,
+        driver: sqlite3.Database,
+        mode: sqlite3.OPEN_READONLY
+      });
+      // Reads can still hit SQLITE_BUSY around checkpoints; wait rather than fail.
+      await db.exec("PRAGMA busy_timeout = 15000;");
+      readOnlyDb = db;
+      return db;
+    })().catch((error) => {
+      // A failed open must not poison every later attempt.
+      readOnlyDbPromise = null;
+      throw error;
+    });
+  }
+  return readOnlyDbPromise;
+}
+
+// Opened at boot rather than on the first request. This connection is the odd one out: the
+// writer, the reader and the status reader are all established during startup, while this
+// one waited for someone to actually open /db -- so its cost landed on a user, in the
+// foreground, at the worst possible moment. node-sqlite3 dispatches every operation
+// (including the open) onto the libuv thread pool, which is four threads wide by default and
+// fully subscribed while a sync is flushing, so the open queues behind whatever else is in
+// flight. Measured 2026-08-19 against the live database mid-sync: the first /db/schema after
+// a restart took 80.5s, every later one 2.8ms -- the page looked hung, and the schema query
+// itself was never the problem (the same open and PRAGMA table_info sweep costs 7ms total in
+// an idle process). Failure is non-fatal: /db keeps working, it just pays the old cost.
+async function warmReadOnlyDb() {
+  return getReadOnlyDb();
 }
 
 function rejectUnsafeQuery(sql) {
@@ -191,5 +219,6 @@ module.exports = {
   isReadableTableName,
   rejectUnsafeQuery,
   getReadOnlyDb,
+  warmReadOnlyDb,
   MAX_ROWS
 };

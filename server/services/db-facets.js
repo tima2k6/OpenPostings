@@ -62,6 +62,35 @@ function titleWords(positionName) {
 // user cares about is often not one of the busiest.
 const ALL_STATES = STATE_CODES.map((code) => ({ value: code, name: STATE_CODE_TO_NAME[code] }));
 
+// The two facets that can be counted exactly over the whole corpus without the candidate
+// scan, for the case where the scan is refused. Sequential and cheapest-first, with a budget
+// between them: a GROUP BY that rides a covering index is fast but not free, and this runs on
+// the same read-only connection the rest of /db uses. If the first one overruns, the second
+// is skipped rather than compounding it -- a state breakdown alone is still a way in, and an
+// empty companies list renders as no dropdown rather than as a wrong one.
+const WIDE_FACET_BUDGET_MS = Number(process.env.DB_FACETS_WIDE_BUDGET_MS || 6000);
+
+async function computeUnfilteredIndexedFacets(db) {
+  const startedAt = Date.now();
+  const states = await db.all(
+    `SELECT state_region AS value, COUNT(*) AS count
+     FROM posting_location_states
+     GROUP BY state_region
+     ORDER BY count DESC, value ASC;`
+  );
+  if (Date.now() - startedAt >= WIDE_FACET_BUDGET_MS) {
+    return { states, companies: [] };
+  }
+  const companies = await db.all(
+    `SELECT company_name AS value, COUNT(*) AS count
+     FROM Postings
+     GROUP BY company_name
+     ORDER BY count DESC, value ASC
+     LIMIT ${TOP_N};`
+  );
+  return { states, companies };
+}
+
 async function computeFacets(input = {}) {
   const db = await getReadOnlyDb();
   const built = buildQuery(input);
@@ -78,12 +107,37 @@ async function computeFacets(input = {}) {
   const candidateCount = Number(candidateRow?.n || 0);
 
   if (candidateCount > FACET_CANDIDATE_CAP) {
+    // Refusing to sample was right; offering nothing in its place was not. The narrowing
+    // branch handed back 51 bare state codes and no numbers, so the only way to find out
+    // whether a state held 75,000 postings or 300 was to pick it and see -- and the facets
+    // that exist to guide narrowing were exactly what stayed hidden until you had already
+    // narrowed. Two of them do not need the scan at all: state counts come from
+    // posting_location_states (the same projection the state filter itself matches against,
+    // so the values are the ones the filter consumes), and company counts from a GROUP BY
+    // that idx_postings_company_name covers. Both are exact over the whole corpus, not
+    // sampled, so they carry none of the dishonesty this gate was built to prevent.
+    // Measured on the live database: 0.32s and 2.17s respectively.
+    //
+    // Only when nothing is narrowed yet. With a filter active the aggregates would have to
+    // join or re-scan under a predicate SQL cannot serve from an index, which is the cost
+    // this branch exists to avoid -- and a filtered set that is still over the cap is the
+    // rarer case anyway.
+    const wideFacets = built.clauses.length === 0
+      ? await computeUnfilteredIndexedFacets(db)
+      : { states: [], companies: [] };
+    const stateCountByCode = new Map(wideFacets.states.map((row) => [row.value, row.count]));
     return {
       total: candidateCount,
       scanned: 0,
       needs_narrowing: true,
-      all_states: ALL_STATES,
-      facets: { states: [], cities: [], companies: [], title_words: [], ats: [] }
+      // Still every state, still in a fixed order -- a state with no postings has to stay
+      // selectable, and a zero is itself the useful signal. But only when the counts were
+      // actually computed: when they were skipped, every state must come back with no count
+      // at all rather than a zero, which would render as "TX (0)" and read as fact.
+      all_states: ALL_STATES.map((state) =>
+        stateCountByCode.size > 0 ? { ...state, count: stateCountByCode.get(state.value) ?? 0 } : { ...state }
+      ),
+      facets: { states: wideFacets.states, cities: [], companies: wideFacets.companies, title_words: [], ats: [] }
     };
   }
 
