@@ -97,7 +97,7 @@ function escapeLikeTerm(term) {
 // narrow silently loses postings. Only filters that can be proven superset-safe against a
 // stored column are included; ats, industry, location and remote all match on values
 // derived at read time (inferred from the URL, joined from companies) and are left to JS.
-function buildCandidatePrefilter({ searchTerms, payMinFilter, payMaxFilter, payPeriods, stateCodes, stateLocationFallbackUrls = [], includeUnknownPay = true }) {
+function buildCandidatePrefilter({ searchTerms, payMinFilter, payMaxFilter, payPeriods, stateCodes, stateLocationFallbackUrls = [], searchEmptyLocationUrlsByTerm = [], includeUnknownPay = true }) {
   const clauses = [];
   const params = [];
 
@@ -106,17 +106,57 @@ function buildCandidatePrefilter({ searchTerms, payMinFilter, payMaxFilter, payP
   // whenever the stored column is non-empty it is exactly what JS compares against, and a
   // LIKE on the column is faithful. When the column is empty the enriched value can come
   // from somewhere this query cannot see, so those rows are always kept as candidates.
-  for (const term of searchTerms) {
+  // Keeping every empty-location row was correct and enormously wasteful: 160,383 of the
+  // 1,039,785 visible+fresh rows have no stored location, and the wide-scan walk dragged all
+  // of them through the JS filter on every search. What the JS filter actually compares
+  // against is `storedLocation || mappedLocation || inferredLocation` (enrichRowForFiltering),
+  // and for an empty stored location the other two collapse to a small, knowable set:
+  // inferPostingLocationFromJobUrl parses the URL only for myworkdayjobs.com and otherwise
+  // returns postingLocationByJobUrl.get(url), the same in-memory map mappedLocation reads.
+  //
+  // So an empty-location row can only match a search term through its location if its URL is
+  // in that map, or it is a Workday URL. Every other empty-location row enriches to "" and
+  // could never have matched -- excluding them drops no result that the JS filter would have
+  // kept. Measured: only 274 of those 160,383 are Workday.
+  //
+  // The map lives in this process, so the callers resolve which of its URLs match the term
+  // and pass them in; `null` for a term means "too many to enumerate", and that term falls
+  // back to the old keep-everything clause rather than risk losing a row to a bound.
+  for (let index = 0; index < searchTerms.length; index += 1) {
+    const term = searchTerms[index];
+    const pattern = `%${escapeLikeTerm(term)}%`;
+    const fallbackUrls = searchEmptyLocationUrlsByTerm[index];
+
+    if (!Array.isArray(fallbackUrls)) {
+      clauses.push(`
+        AND (
+          LOWER(company_name) LIKE ? ESCAPE '\\'
+          OR LOWER(position_name) LIKE ? ESCAPE '\\'
+          OR LOWER(COALESCE(location, '')) LIKE ? ESCAPE '\\'
+          OR location IS NULL
+          OR TRIM(location) = ''
+        )`);
+      params.push(pattern, pattern, pattern);
+      continue;
+    }
+
+    const urlInClause = fallbackUrls.length > 0
+      ? `OR job_posting_url IN (${fallbackUrls.map(() => "?").join(", ")})`
+      : "";
     clauses.push(`
       AND (
         LOWER(company_name) LIKE ? ESCAPE '\\'
         OR LOWER(position_name) LIKE ? ESCAPE '\\'
         OR LOWER(COALESCE(location, '')) LIKE ? ESCAPE '\\'
-        OR location IS NULL
-        OR TRIM(location) = ''
+        OR (
+          (location IS NULL OR TRIM(location) = '')
+          AND (
+            LOWER(job_posting_url) LIKE '%myworkdayjobs.com%'
+            ${urlInClause}
+          )
+        )
       )`);
-    const pattern = `%${escapeLikeTerm(term)}%`;
-    params.push(pattern, pattern, pattern);
+    params.push(pattern, pattern, pattern, ...fallbackUrls);
   }
 
   // Mirrors rowMatchesCompensationRangeFilter, including its treatment of unknown pay:
@@ -410,6 +450,29 @@ const MAX_WIDE_SCAN_CANDIDATE_ROWS = Number(process.env.POSTINGS_WIDE_SCAN_MAX_C
 // the sort keys is the structural fix and would make this budget close to unreachable; until
 // that exists, this keeps a rare search from taking the whole process down with it.
 const MAX_WIDE_SCAN_MILLIS = Number(process.env.POSTINGS_WIDE_SCAN_MAX_MILLIS || 15000);
+
+// Which of the runtime location map's URLs could let an empty-location row match this search
+// term. The map is this process's own memory (postings whose location is known at runtime but
+// not yet stored), so the answer is exact -- see the empty-location clause in
+// buildCandidatePrefilter for why that is the only way such a row can match.
+//
+// Returns null when the term matches more of the map than can be sent as bound parameters, in
+// which case the caller keeps the old clause and every empty-location row stays a candidate.
+// That is the safe direction: slow, never missing. Truncating to fit the limit instead would
+// silently drop postings, which is the one outcome the prefilter must never produce.
+const MAX_EMPTY_LOCATION_FALLBACK_URLS = 900;
+
+function resolveEmptyLocationUrlsForTerm(postingLocationByJobUrl, term) {
+  const needle = String(term || "").toLowerCase();
+  if (!needle) return [];
+  const urls = [];
+  for (const [jobPostingUrl, location] of postingLocationByJobUrl.entries()) {
+    if (!String(location || "").toLowerCase().includes(needle)) continue;
+    urls.push(jobPostingUrl);
+    if (urls.length > MAX_EMPTY_LOCATION_FALLBACK_URLS) return null;
+  }
+  return urls;
+}
 
 async function readDistinctStoredLocations() {
   // Read-only, and called from the filter-options bootstrap request -- getReadDb() keeps it
@@ -795,13 +858,17 @@ async function listPostingsWithFilters(options = {}) {
     // (~110ms): the cost is fetching the rows, materialising them in the driver, the GC
     // that follows, and enriching rows that are about to be discarded. Dropping rows in
     // SQL is the only thing that touches all four at once.
+    const prefilterSearchTerms = search.toLowerCase().split(/\s+/).filter(Boolean);
     const prefilter = buildCandidatePrefilter({
-      searchTerms: search.toLowerCase().split(/\s+/).filter(Boolean),
+      searchTerms: prefilterSearchTerms,
       payMinFilter,
       payMaxFilter,
       payPeriods,
       stateCodes,
       stateLocationFallbackUrls,
+      searchEmptyLocationUrlsByTerm: prefilterSearchTerms.map((term) =>
+        resolveEmptyLocationUrlsForTerm(postingLocationByJobUrl, term)
+      ),
       includeUnknownPay
     });
     const reviewStateSql = reviewQueue === "new"
