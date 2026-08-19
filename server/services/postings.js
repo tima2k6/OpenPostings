@@ -842,7 +842,6 @@ async function listPostingsWithFilters(options = {}) {
                p.requires_account, p.hidden, p.hidden_reason, p.compensation_type,
                p.education_levels, p.pay_min, p.pay_max, p.pay_currency, p.pay_period,
                p.pay_raw, p.first_seen_epoch, p.last_seen_epoch,
-               CASE WHEN p.job_description IS NOT NULL AND TRIM(p.job_description) <> '' THEN 1 ELSE 0 END AS description_available,
                ${reviewStateSelect} AS _review_state`;
     const baseWhere = `WHERE ${reviewVisibilitySql}
           AND NOT EXISTS (
@@ -1279,6 +1278,32 @@ async function listPostingsWithFilters(options = {}) {
     items = matchingRows.slice(offset, targetMatchCount);
   } else {
     items = await prepareCandidateRows(rows);
+  }
+
+  // description_available used to be a CASE over job_description in the wide-scan SELECT
+  // above, which quietly undid the reason that SELECT omits the column in the first place:
+  // SQLite has to evaluate it for every row it *examines*, not just the ones it returns, and
+  // job_description lives in overflow pages. Measured on the live database, the same chunk
+  // searching for "kubernetes": 65s with the CASE, 2.0s without it. (An unfiltered LIMIT
+  // test misses this entirely -- it only ever touches as many rows as it returns, so the
+  // cost only appears once a selective predicate makes SQLite walk past rows it discards.)
+  //
+  // Only the two match consumers need it (deriveMatchStatus in buildPostingDisplayFields,
+  // and the per-resume match_scores block below), both of which run on the returned page,
+  // so one keyed lookup over this page's ids answers it for a fraction of the cost.
+  if (needsMatchJoin && items.length > 0) {
+    const pageIds = items.map((item) => Number(item?.id)).filter((id) => Number.isFinite(id) && id > 0);
+    if (pageIds.length > 0) {
+      const availabilityRows = await db.all(
+        `SELECT id,
+                CASE WHEN job_description IS NOT NULL AND TRIM(job_description) <> '' THEN 1 ELSE 0 END AS description_available
+         FROM Postings
+         WHERE id IN (${pageIds.map(() => "?").join(", ")});`,
+        pageIds
+      );
+      const availableById = new Map(availabilityRows.map((row) => [Number(row.id), Number(row.description_available || 0)]));
+      items = items.map((item) => ({ ...item, description_available: availableById.get(Number(item.id)) ?? 0 }));
+    }
   }
 
   // Only now, on the page that is actually being returned, is it worth building the

@@ -70,7 +70,7 @@ const ALL_STATES = STATE_CODES.map((code) => ({ value: code, name: STATE_CODE_TO
 // empty companies list renders as no dropdown rather than as a wrong one.
 const WIDE_FACET_BUDGET_MS = Number(process.env.DB_FACETS_WIDE_BUDGET_MS || 6000);
 
-async function computeUnfilteredIndexedFacets(db) {
+async function computeIndexedFacets(db, stateCodes = []) {
   const startedAt = Date.now();
   const states = await db.all(
     `SELECT state_region AS value, COUNT(*) AS count
@@ -81,13 +81,35 @@ async function computeUnfilteredIndexedFacets(db) {
   if (Date.now() - startedAt >= WIDE_FACET_BUDGET_MS) {
     return { states, companies: [] };
   }
-  const companies = await db.all(
-    `SELECT company_name AS value, COUNT(*) AS count
-     FROM Postings
-     GROUP BY company_name
-     ORDER BY count DESC, value ASC
-     LIMIT ${TOP_N};`
-  );
+  // Scoped to the chosen states when there are any, by driving from the projection rather
+  // than from the state filter's own SQL clause. That clause is a deliberate superset: it
+  // keeps every row with no parsed location so the refine pass can try URL inference on it,
+  // which is 299,010 of WA's 308,696 candidates -- 97% of the scan, and the reason a state
+  // filter alone can never get under the cap. Driving from posting_location_states instead
+  // reads WA's 20,468 rows.
+  //
+  // What that leaves out is exactly those URL-inferred matches, so these counts are a floor
+  // for the state, not a total, and the page says so. That trade is confined to the facet
+  // panel: the posting list and the filters themselves still run the full refine and are
+  // unchanged. A floor you can act on beats an empty panel you cannot.
+  const companies = stateCodes.length > 0
+    ? await db.all(
+        `SELECT p.company_name AS value, COUNT(*) AS count
+         FROM posting_location_states s
+         JOIN Postings p ON p.id = s.posting_id
+         WHERE s.state_region IN (${stateCodes.map(() => "?").join(", ")})
+         GROUP BY p.company_name
+         ORDER BY count DESC, value ASC
+         LIMIT ${TOP_N};`,
+        stateCodes
+      )
+    : await db.all(
+        `SELECT company_name AS value, COUNT(*) AS count
+         FROM Postings
+         GROUP BY company_name
+         ORDER BY count DESC, value ASC
+         LIMIT ${TOP_N};`
+      );
   return { states, companies };
 }
 
@@ -122,8 +144,14 @@ async function computeFacets(input = {}) {
     // join or re-scan under a predicate SQL cannot serve from an index, which is the cost
     // this branch exists to avoid -- and a filtered set that is still over the cap is the
     // rarer case anyway.
-    const wideFacets = built.clauses.length === 0
-      ? await computeUnfilteredIndexedFacets(db)
+    // Nothing narrowed yet, or narrowed by state alone -- the two cases the projection can
+    // answer exactly. A state filter contributes exactly one clause however many states it
+    // names, so clauses.length === 1 alongside stateCodes means state is the only filter;
+    // any other filter present would not be reflected in the projection aggregates, and a
+    // count that silently ignores an active filter is worse than no count.
+    const stateOnly = built.stateCodes.length > 0 && built.clauses.length === 1;
+    const wideFacets = built.clauses.length === 0 || stateOnly
+      ? await computeIndexedFacets(db, stateOnly ? built.stateCodes : [])
       : { states: [], companies: [] };
     const stateCountByCode = new Map(wideFacets.states.map((row) => [row.value, row.count]));
     return {
@@ -137,6 +165,9 @@ async function computeFacets(input = {}) {
       all_states: ALL_STATES.map((state) =>
         stateCountByCode.size > 0 ? { ...state, count: stateCountByCode.get(state.value) ?? 0 } : { ...state }
       ),
+      // True when the company counts cover only the postings whose state is resolved in the
+      // projection, so the page can label them as a floor rather than a total.
+      companies_are_state_floor: stateOnly,
       facets: { states: wideFacets.states, cities: [], companies: wideFacets.companies, title_words: [], ats: [] }
     };
   }

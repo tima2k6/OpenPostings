@@ -894,7 +894,8 @@ ORDER BY n DESC</textarea>
         // scan, so they remain the thing narrowing buys you.
         var wideCompanies = (data.facets && data.facets.companies) || [];
         var companyOptions = wideCompanies.length
-          ? '<label class="facet-pick"><span class="facet-name">Company ' +
+          ? '<label class="facet-pick"><span class="facet-name">' +
+            (data.companies_are_state_floor ? "Company in state" : "Company") + " " +
             '<span class="n">' + wideCompanies.length + "</span></span>" +
             '<select data-facet="companies"><option value="">\u2014 any \u2014</option>' +
             wideCompanies.map(function (it) {
@@ -902,12 +903,21 @@ ORDER BY n DESC</textarea>
                 " (" + it.count.toLocaleString() + ")</option>";
             }).join("") + "</select></label>"
           : "";
+        // Two different provenances for the company counts, and the difference matters
+        // enough to say out loud: unscoped they are exact for the whole database, scoped to
+        // a state they cover only the postings whose state is resolved in the projection,
+        // which makes them a floor. Saying "at least" is the honest form of that.
+        var companyNote = data.companies_are_state_floor
+          ? "Company counts are for postings whose location resolves to the selected state, so they are a " +
+            "floor rather than a total \u2014 postings whose state is only inferable from their URL are counted " +
+            "by the filter but not here."
+          : "State and company counts below are exact for the whole database.";
         out.innerHTML =
-          '<p class="hint"><b>' + data.total.toLocaleString() + " rows.</b> State and company counts below are " +
-          "exact for the whole database. City and title breakdowns need a scan of the matching rows, so they " +
+          '<p class="hint"><b>' + data.total.toLocaleString() + " rows.</b> " + companyNote +
+          " City and title breakdowns need a scan of the matching rows, so they " +
           "appear once that set is small enough to count exactly \u2014 over a set this size they would describe a " +
-          "fraction of it and read as if they described all of it. A company, title or date filter gets there " +
-          "fastest; a state on its own often does not, since the biggest states are still too broad.</p>" +
+          "fraction of it and read as if they described all of it. Picking a company from the list below is " +
+          "usually the fastest way there.</p>" +
           '<div class="facet-row">' + stateOptions + companyOptions + "</div>";
         wireFacetSelects(out);
         return;
