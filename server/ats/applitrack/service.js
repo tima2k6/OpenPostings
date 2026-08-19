@@ -121,13 +121,39 @@ async function collectPostingsForApplitrackCompany(company) {
   return parseApplitrackPostings(pageHtml, siteRoot, companyName);
 }
 
+// Applitrack hosts every employer on the same domain and distinguishes them by the first
+// path segment: www.applitrack.com/**aacs**/onlineapp/. Returning only siteRoot left
+// extractSeededCompanyIdentifier (server/index.js) with nothing it recognises -- siteRoot is
+// a URL-shaped field, so the identifier fell through to the URL itself and the suggested
+// company name came out as "https://www.applitrack.com/aacs/onlineapp/". Whatever consumed
+// that reduced it to the hostname's first label, which is why 1,323 distinct Applitrack
+// employers were all stored as the company "www", sharing one bucket of 43,404 postings.
+//
+// companySlug is already a first-class key in that identifier's preferred list, so exposing
+// the segment is all that is needed for the name to come out as the tenant.
 function parseApplitrackCompanySource(urlString) {
   try {
     const siteRoot = normalizeApplitrackUrl(urlString);
-    return siteRoot ? { siteRoot } : null;
+    if (!siteRoot) return null;
+    const companySlug = extractApplitrackCompanySlug(siteRoot);
+    return companySlug ? { siteRoot, companySlug } : { siteRoot };
   } catch {
     return null;
   }
 }
 
-module.exports = { collectPostingsForApplitrackCompany, parseApplitrackCompanySource };
+// The tenant is the first path segment. "onlineapp" is Applitrack's own directory, never an
+// employer, so a URL that somehow starts there yields nothing rather than a wrong name.
+function extractApplitrackCompanySlug(siteRootUrl) {
+  const parsed = parseUrl(String(siteRootUrl || ""));
+  if (!parsed) return "";
+  const segments = String(parsed.pathname || "")
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  const slug = segments[0] || "";
+  if (!slug || slug.toLowerCase() === "onlineapp") return "";
+  return slug;
+}
+
+module.exports = { collectPostingsForApplitrackCompany, parseApplitrackCompanySource, extractApplitrackCompanySlug };
