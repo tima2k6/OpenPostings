@@ -31,6 +31,20 @@ function run() {
   assert.equal(invalid.supported, false, "Invalid URL should not be supported");
   assert.equal(invalid.reason, "unrecognized_or_not_seeded", "Unknown URL should be treated as unsupported seeded source");
 
+  // Applitrack puts every employer on one domain and distinguishes them by the first path
+  // segment. Returning only siteRoot left the identifier falling through to the URL itself,
+  // and 1,323 distinct employers ended up stored as the company "www" (see
+  // server/scripts/repair-applitrack-company-names.js). The identifier has to be the tenant.
+  const applitrack = classifySeededCompanySourceUrl("https://www.applitrack.com/aacs/onlineapp/default.aspx?all=1");
+  assert.equal(applitrack.supported, true, "Applitrack URL should be supported");
+  assert.equal(applitrack.ats, "applitrack", "Applitrack ATS should be detected");
+  assert.equal(applitrack.company_identifier, "aacs", "Applitrack identifier should be the tenant path segment");
+  assert.equal(applitrack.company_identifier_key, "companySlug", "Applitrack identifier should come from companySlug");
+  assert.ok(
+    !/^https?:/i.test(String(applitrack.suggested_company_name || "")),
+    "Applitrack suggested name must never be a URL -- that is what produced the 'www' companies"
+  );
+
   assert.ok(SEEDED_ATS_OPTIONS.has("workday"), "workday should exist in seeded ATS set");
   assert.ok(!SEEDED_ATS_OPTIONS.has("smartrecruiters"), "dynamic ATS should not exist in seeded ATS set");
 
