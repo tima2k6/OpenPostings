@@ -120,7 +120,7 @@ const path = require("path");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const { openDatabase, getSqliteReadOnlyMode } = require("./db/open-database.js");
-const { findCompanies, findPostings, runReadOnlyQuery, listReadableSchema, rejectUnsafeQuery, MAX_ROWS } = require("./services/db-browser.js");
+const { findCompanies, findPostings, runReadOnlyQuery, listReadableSchema, rejectUnsafeQuery, warmReadOnlyDb, MAX_ROWS } = require("./services/db-browser.js");
 const { DB_BROWSER_PAGE } = require("./services/db-browser-page.js");
 const { runQuery: runPostingQuery } = require("./services/db-query.js");
 const { computeFacets } = require("./services/db-facets.js");
@@ -756,6 +756,18 @@ async function initDb() {
     console.log("[OpenPostings API] status reader connection open (status polling does not queue behind wide-scan postings queries)");
   } catch (error) {
     console.error("[OpenPostings API] status reader connection unavailable, falling back to the shared reader:", error?.message || error);
+  }
+
+  // A fifth connection: the read-only /db browser's. It used to open itself on the first
+  // request, which put a thread-pool-queued open in front of a user who had just clicked
+  // "DB" -- 80.5s mid-sync, against 2.8ms for every request after it. Opening it here costs
+  // the same work at a moment nobody is waiting on it. Non-fatal: /db still works without
+  // it, just as slowly on the first hit as it did before.
+  try {
+    await warmReadOnlyDb();
+    console.log("[OpenPostings API] db browser connection open (first /db request does not pay for the open)");
+  } catch (error) {
+    console.error("[OpenPostings API] db browser connection unavailable, /db will open one on demand:", error?.message || error);
   }
 
   // A third connection, dedicated to the periodic WAL truncate checkpoint below. TRUNCATE
