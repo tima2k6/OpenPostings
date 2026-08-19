@@ -49,6 +49,7 @@
     "test:backend:microsoft-parser": "node server/tests/microsoft-parser.test.js",
     "test:backend:board-sweep-bounds": "node server/tests/board-sweep-bounds.test.js",
     "test:backend:sync-flush-queue": "node server/tests/sync-flush-queue.test.js",
+    "test:backend:empty-location-prefilter": "node server/tests/posting-empty-location-prefilter.test.js",
     "test:backend:wide-scan-bounds": "node server/tests/posting-wide-scan-bound.test.js && node server/tests/posting-wide-scan-time-bound.test.js",
     "apply": "./scripts/apply.sh",
     "apply:status": "./scripts/apply.sh status",
