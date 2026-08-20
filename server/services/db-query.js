@@ -33,6 +33,26 @@ const MAX_ROWS = 1000;
 // count was exact -- the same query reported 1,895 rows in one place and 6,744 in the
 // other. Two numbers for one question is worse than one slow number.
 const STATE_CANDIDATE_CAP = 250000;
+// Same pattern as runReadOnlyQuery's timeout in db-browser.js. This does not cancel the
+// underlying SQLite work -- node-sqlite3 has no way to interrupt one statement on a
+// connection shared by other callers without risking killing someone else's query, so an
+// abandoned query keeps running against the connection until it finishes on its own. What
+// this buys: the caller gets a fast, honest error instead of hanging indefinitely, for the
+// one case the id-narrowing rewrite above cannot help -- a filter set with no clauses at
+// all (no predicate to narrow by), where COUNT/SUM has no choice but to touch every row.
+const QUERY_TIMEOUT_MS = 15000;
+
+function withQueryTimeout(promise, label) {
+  return Promise.race([
+    promise,
+    new Promise((_resolve, reject) =>
+      setTimeout(
+        () => reject(new Error(`${label} exceeded ${QUERY_TIMEOUT_MS / 1000}s and was abandoned.`)),
+        QUERY_TIMEOUT_MS
+      )
+    )
+  ]);
+}
 
 const SORTABLE = new Map([
   ["last_seen", "last_seen_epoch"],
@@ -255,7 +275,19 @@ function buildQuery(input = {}) {
     ? Math.min(MAX_ROWS, Math.floor(requestedLimit))
     : 200;
 
-  const where = clauses.length ? `WHERE ${clauses.join("\n  AND ")}` : "";
+  const rawWhere = clauses.length ? `WHERE ${clauses.join("\n  AND ")}` : "";
+  // Every consumer of `where` below (this file's own queries, and db-facets.js's
+  // `FROM Postings ${built.where}` queries) filters the full 18+-column row directly against
+  // this clause list, which forces SQLite to fetch a row's complete width just to test
+  // whether it matches -- discarding whatever narrow index exists on the columns actually
+  // searched (position_name, company_name, location all have one; the combined covering
+  // index built for the app's own search covers all three at once). Narrowing to matching
+  // ids first -- a subquery answerable from an index alone, since id is all it selects --
+  // before rejoining for the rest keeps table lookups to the number of actual matches, not
+  // the number of candidate rows scanned. Measured 2026-08-20 on the live database (~1.7M
+  // rows, one title term): the results query went from hanging indefinitely to ~0.5-3s, and
+  // db-facets.js's paired COUNT(*) from 103.9s to under 1s.
+  const where = rawWhere ? `WHERE id IN (SELECT id FROM Postings ${rawWhere})` : "";
   const sql =
     `SELECT id, company_name, position_name, location, posting_date,\n` +
     `       city, state_region, country, is_remote, locations_json,\n` +
@@ -284,7 +316,7 @@ function needsRefinePass(built) {
 async function runQuery(input = {}) {
   const db = await getReadOnlyDb();
   const built = buildQuery(input);
-  const { where, limit, stateCodes, countryFilters, regionFilters, atsFilters, locationAnyTerms, cityTerms } = built;
+  const { where, clauses, limit, stateCodes, countryFilters, regionFilters, atsFilters, locationAnyTerms, cityTerms } = built;
   const params = built.params.slice();
 
   const readable = built.sql.replace(/\?/g, () => {
@@ -295,13 +327,40 @@ async function runQuery(input = {}) {
   // No location or ATS filter: SQL is the whole predicate, so counts come straight from the
   // table.
   if (!needsRefinePass(built)) {
-    const rows = await db.all(built.sql, params);
-    const totals = await db.get(
-      `SELECT COUNT(*) AS total,
-              SUM(CASE WHEN hidden = 0 THEN 1 ELSE 0 END) AS visible,
-              SUM(CASE WHEN pay_min IS NULL AND pay_max IS NULL THEN 1 ELSE 0 END) AS pay_unknown
-       FROM Postings ${where};`,
-      params
+    const rows = await withQueryTimeout(db.all(built.sql, params), "Query");
+
+    // No clause at all -- nothing to narrow the id-subquery by, so the totals query below
+    // would have to visit pay_min/pay_max on every row in the table to sum them (id-narrowing
+    // only helps once there is an id set worth narrowing to). This is the one shape of
+    // request this rewrite cannot fix: measured 2026-08-20, it ran past 100s and, abandoned by
+    // its own caller mid-query, kept the shared read-only connection busy long enough to queue
+    // out every other /db request behind it and drive the process toward its memory ceiling
+    // twice in one night. /db/postings already exists as the fast, unfiltered browse view, so
+    // rather than pay that cost for a request this page was never meant to serve, skip the
+    // aggregate and say so.
+    if (clauses.length === 0) {
+      return {
+        rows,
+        total: null,
+        visible: null,
+        pay_unknown_count: null,
+        shown: rows.length,
+        limit,
+        approximate: true,
+        needs_narrowing: true,
+        sql: readable
+      };
+    }
+
+    const totals = await withQueryTimeout(
+      db.get(
+        `SELECT COUNT(*) AS total,
+                SUM(CASE WHEN hidden = 0 THEN 1 ELSE 0 END) AS visible,
+                SUM(CASE WHEN pay_min IS NULL AND pay_max IS NULL THEN 1 ELSE 0 END) AS pay_unknown
+         FROM Postings ${where};`,
+        params
+      ),
+      "Totals query"
     );
     return {
       rows,
@@ -321,7 +380,7 @@ async function runQuery(input = {}) {
   // in JS -- the segment-aware location matcher, and the ATS inferred from the URL.
   const candidateSql = built.sql
     .replace(/LIMIT \d+$/, `LIMIT ${STATE_CANDIDATE_CAP}`);
-  const candidates = await db.all(candidateSql, params);
+  const candidates = await withQueryTimeout(db.all(candidateSql, params), "Query");
 
   const countryCodes = countryFilters.map((filter) => String(filter?.value || "").trim().toUpperCase()).filter(Boolean);
   const matched = [];
