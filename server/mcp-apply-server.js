@@ -336,6 +336,7 @@ async function ensureTables() {
       ["hiring_locations_json", "ALTER TABLE Postings ADD COLUMN hiring_locations_json TEXT;"],
       ["location_conflict", "ALTER TABLE Postings ADD COLUMN location_conflict INTEGER NOT NULL DEFAULT 0;"],
       ["description_fetched_at", "ALTER TABLE Postings ADD COLUMN description_fetched_at INTEGER;"],
+      ["description_fetch_failed_at", "ALTER TABLE Postings ADD COLUMN description_fetch_failed_at INTEGER;"],
       ["status", "ALTER TABLE Postings ADD COLUMN status TEXT NOT NULL DEFAULT 'unverified';"],
       ["dead_since_epoch", "ALTER TABLE Postings ADD COLUMN dead_since_epoch INTEGER;"],
       ["requires_account", "ALTER TABLE Postings ADD COLUMN requires_account INTEGER;"],
@@ -1408,6 +1409,15 @@ async function main() {
   // its queries. Watching stdin ourselves is the only way to actually exit on disconnect.
   process.stdin.on("end", () => process.exit(0));
   process.stdin.on("close", () => process.exit(0));
+
+  // A supervisor or a direct `kill` bypasses stdin entirely -- same orphaned-connection risk
+  // as above, just a different exit path, so it needs its own handler and its own db.close().
+  const shutdown = (signal) => {
+    console.error(`[openpostings-apply-agent] ${signal} received; closing database`);
+    db.close().finally(() => process.exit(0));
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 
   const transport = new StdioServerTransport();
   await mcpServer.connect(transport);

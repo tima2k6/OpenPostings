@@ -997,6 +997,11 @@ async function ensurePostingsTable() {
   if (!existingColumns.has("description_fetched_at")) {
     await db.exec(`ALTER TABLE Postings ADD COLUMN description_fetched_at INTEGER;`);
   }
+  // When a description fetch last failed. Left NULL on success; lets the backfill back off
+  // a permanently-failing host instead of retrying it every cycle forever.
+  if (!existingColumns.has("description_fetch_failed_at")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN description_fetch_failed_at INTEGER;`);
+  }
 
   // Liveness: 'active' (verified reachable), 'dead' (404 or soft-404), 'unverified'
   // (never checked). Dead postings are excluded from candidate lists by default.

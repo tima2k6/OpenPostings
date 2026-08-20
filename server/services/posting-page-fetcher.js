@@ -388,7 +388,17 @@ async function persistInspection(row, inspection) {
   const db = getDb();
   const now = nowEpochSeconds();
 
-  if (!inspection.ok) return { url: row.job_posting_url, ok: false, error: inspection.error };
+  if (!inspection.ok) {
+    // Left untouched, this row (description_fetched_at still NULL) reappears at the front
+    // of every single backfill cycle -- a host that reliably 500s or 406s (session-gated
+    // Taleo pages, TheApplicantManager's content negotiation) burned ~45% of every cycle's
+    // budget retrying the same doomed URLs forever. Recording the failure lets the query
+    // back off for DESCRIPTION_FETCH_FAILURE_COOLDOWN_SECONDS instead, freeing that budget
+    // for postings that can actually succeed, while still retrying occasionally in case the
+    // host recovers.
+    await db.run(`UPDATE Postings SET description_fetch_failed_at = ? WHERE id = ?;`, [now, row.id]);
+    return { url: row.job_posting_url, ok: false, error: inspection.error };
+  }
 
   if (inspection.dead) {
     await db.run(
@@ -458,6 +468,14 @@ async function refreshPostingFromPage(row) {
   return persistInspection(row, inspection);
 }
 
+// A permanently-failing host (session-gated Taleo detail pages, TheApplicantManager's
+// content negotiation) would otherwise sit at the front of "newest, no description" and
+// fail again on every single cycle forever. This is how long a failed row sits out before
+// being retried, in case the host recovers.
+const DESCRIPTION_FETCH_FAILURE_COOLDOWN_SECONDS = Number(
+  process.env.DESCRIPTION_FETCH_FAILURE_COOLDOWN_SECONDS || 24 * 60 * 60
+);
+
 // The backfill: rows with no description at all, newest first, bounded.
 //
 // Scope is deliberate. A page fetch establishes several things at once -- description,
@@ -472,20 +490,23 @@ async function refreshPostingFromPage(row) {
 async function runDescriptionBackfill({ limit = 200, concurrency = 4, refresh_all = false, max_age_seconds = 7 * 86400 } = {}) {
   const db = getDb();
   const cutoff = nowEpochSeconds() - Math.max(3600, Number(max_age_seconds) || 7 * 86400);
+  const failureCutoff = nowEpochSeconds() - DESCRIPTION_FETCH_FAILURE_COOLDOWN_SECONDS;
   const rows = await db.all(
     refresh_all
       ? `SELECT id, job_posting_url, locations_json, pay_min, pay_max
          FROM Postings
          WHERE hidden = 0 AND (description_fetched_at IS NULL OR description_fetched_at < ?)
+           AND (description_fetch_failed_at IS NULL OR description_fetch_failed_at < ?)
          ORDER BY (description_fetched_at IS NOT NULL), last_seen_epoch DESC
          LIMIT ?;`
       : `SELECT id, job_posting_url, locations_json, pay_min, pay_max
          FROM Postings
          WHERE hidden = 0 AND description_fetched_at IS NULL
            AND (job_description IS NULL OR TRIM(job_description) = '')
+           AND (description_fetch_failed_at IS NULL OR description_fetch_failed_at < ?)
          ORDER BY last_seen_epoch DESC
          LIMIT ?;`,
-    refresh_all ? [cutoff, limit] : [limit]
+    refresh_all ? [cutoff, failureCutoff, limit] : [failureCutoff, limit]
   );
 
   const summary = { scanned: rows.length, updated: 0, dead: 0, failed: 0, pay_parsed: 0, conflicts: 0 };

@@ -2007,6 +2007,7 @@ async function createCanonicalPostingsTable() {
       hiring_locations_json TEXT,
       location_conflict INTEGER NOT NULL DEFAULT 0,
       description_fetched_at INTEGER,
+      description_fetch_failed_at INTEGER,
       status TEXT NOT NULL DEFAULT 'unverified',
       dead_since_epoch INTEGER,
       requires_account INTEGER,
