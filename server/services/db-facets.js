@@ -13,7 +13,7 @@
 // in JS is both simpler and the only option that keeps every facet consistent with the
 // others.
 const { getReadOnlyDb } = require("./db-browser.js");
-const { buildQuery, needsRefinePass } = require("./db-query.js");
+const { buildQuery, fetchMatchedCandidates, withQueryTimeout, STATE_CANDIDATE_CAP } = require("./db-query.js");
 const { rowMatchesLocationFilters, STATE_CODE_TO_NAME } = require("../helpers/description-filters.js");
 const { inferPostingLocationFromJobUrl, inferAtsFromJobPostingUrl } = require("../helpers/normalize-ats.js");
 const { parseLocationsJson, parsePostingLocation } = require("../helpers/parse-location.js");
@@ -22,7 +22,11 @@ const { parseLocationsJson, parsePostingLocation } = require("../helpers/parse-l
 // superset a state filter produces before the real matcher runs is far larger than the set
 // it ends up matching -- WA narrows 189,807 candidates down to 1,895. Capping below the
 // candidate count would refuse to build facets for a result set of under two thousand.
-const FACET_CANDIDATE_CAP = 250000;
+// Shared with db-query.js's runQuery rather than kept as its own constant: the two used to
+// be separate numbers that had to be "kept equal" by convention, and drifted once (1,895 vs
+// 6,744 for the same query) before that convention was written down as a comment. Importing
+// the one constant instead of matching it by hand removes the chance of that happening again.
+const FACET_CANDIDATE_CAP = STATE_CANDIDATE_CAP;
 // Facets populate dropdowns rather than a truncated chip list, so every observed value is
 // returned. The bound exists only to stop a pathological set producing an unbounded
 // response; on this data the largest facet (title words) is well under it.
@@ -125,10 +129,26 @@ async function computeFacets(input = {}) {
   // is bounded and has no ORDER BY, so without this it was describing an arbitrary 3% of
   // the table while presenting the counts as the breakdown. Saying "narrow first" is more
   // honest than a number that is quietly a sample.
-  const candidateRow = await db.get(`SELECT COUNT(*) AS n FROM Postings ${built.where};`, built.params);
-  const candidateCount = Number(candidateRow?.n || 0);
+  //
+  // Getting there needs its own count first, though, and a broad predicate with no indexed
+  // search term (visibility=open alone, this page's own default state on every load,
+  // matches ~90% of the table) has no LIMIT to stop that count early and no index that helps
+  // an OR across an unindexed column -- measured 2026-08-20, it ran well past 25s under
+  // load. hasIndexedSearchTerm already tells us the answer would come back over the cap
+  // without spending that cost to confirm it, so skip straight to the same narrowing branch
+  // this gate exists to reach.
+  const candidateCount = built.hasIndexedSearchTerm
+    ? Number(
+        (
+          await withQueryTimeout(
+            db.get(`SELECT COUNT(*) AS n FROM Postings ${built.where};`, built.params),
+            "Facet candidate count"
+          )
+        )?.n || 0
+      )
+    : null;
 
-  if (candidateCount > FACET_CANDIDATE_CAP) {
+  if (candidateCount === null || candidateCount > FACET_CANDIDATE_CAP) {
     // Refusing to sample was right; offering nothing in its place was not. The narrowing
     // branch handed back 51 bare state codes and no numbers, so the only way to find out
     // whether a state held 75,000 postings or 300 was to pick it and see -- and the facets
@@ -172,21 +192,18 @@ async function computeFacets(input = {}) {
     };
   }
 
-  const sql =
-    `SELECT company_name, position_name, location, locations_json, hidden, pay_min, pay_max, job_posting_url\n` +
-    `FROM Postings\n${built.where}\nLIMIT ${FACET_CANDIDATE_CAP}`;
-  const rows = await db.all(sql, built.params);
+  // Same fetch-plus-refine runQuery's own location/ATS branch uses (see fetchMatchedCandidates
+  // in db-query.js) -- previously this file carried a second, independent copy of the refine
+  // predicates, which is how the ATS half of it went missing and made these counts disagree
+  // with the postings list whenever an ATS filter was set. One implementation, called from
+  // both places, means that class of drift cannot recur.
+  const { rows: matchedRows, candidateCount: refineCandidateCount, approximate } = await fetchMatchedCandidates(
+    db,
+    built,
+    built.params,
+    FACET_CANDIDATE_CAP
+  );
 
-  const activeStates = built.stateCodes || [];
-  const activeCountries = built.countryFilters || [];
-  const activeRegions = built.regionFilters || [];
-  const activeAts = built.atsFilters || [];
-  const hasLocationFilter = activeStates.length > 0 || activeCountries.length > 0 || activeRegions.length > 0;
-  // The same refine runQuery applies, so the facet totals describe the set the postings list
-  // is showing rather than the SQL superset it was drawn from. The ATS half of it was
-  // previously left out, which made these counts disagree with the result count whenever an
-  // ATS filter was set.
-  const refine = needsRefinePass(built);
   const byState = new Map();
   const byCompany = new Map();
   const byWord = new Map();
@@ -194,7 +211,6 @@ async function computeFacets(input = {}) {
   const byCity = new Map();
   let visible = 0;
   let withPay = 0;
-  let matched = 0;
 
   // Location strings repeat heavily, and the state matcher is the expensive part of this
   // loop, so each distinct string is resolved once and reused.
@@ -216,22 +232,7 @@ async function computeFacets(input = {}) {
     return matched;
   };
 
-  for (const row of rows) {
-    if (refine) {
-      const location =
-        String(row.location || "").trim() || inferPostingLocationFromJobUrl(row.job_posting_url) || "";
-      if (hasLocationFilter && !rowMatchesLocationFilters(location, activeStates, [], activeCountries, activeRegions)) {
-        continue;
-      }
-      if (
-        activeAts.length > 0 &&
-        !activeAts.includes(String(inferAtsFromJobPostingUrl(row.job_posting_url) || "").toLowerCase())
-      ) {
-        continue;
-      }
-    }
-
-    matched += 1;
+  for (const row of matchedRows) {
     if (Number(row.hidden) === 0) visible += 1;
     if (Number(row.pay_max || row.pay_min || 0) > 0) withPay += 1;
 
@@ -256,14 +257,15 @@ async function computeFacets(input = {}) {
 
   return {
     // Rows that survived the JS refine, not the candidate superset that was scanned.
-    total: matched,
-    scanned: rows.length,
+    total: matchedRows.length,
+    scanned: refineCandidateCount,
     needs_narrowing: false,
     all_states: ALL_STATES,
-    // Every candidate was read, so these counts are exact rather than sampled.
-    approximate: false,
+    // False only when the candidate fetch itself was exhaustive (did not hit the cap) --
+    // previously hardcoded, which silently presented a floor as a total whenever it did.
+    approximate,
     visible,
-    hidden: matched - visible,
+    hidden: matchedRows.length - visible,
     with_pay: withPay,
     facets: {
       states: top(byState),

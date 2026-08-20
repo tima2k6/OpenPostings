@@ -128,6 +128,12 @@ function buildQuery(input = {}) {
   if (titleNone.length) clauses.push(noneOf("position_name", titleNone, params));
   if (companyAny.length) clauses.push(anyOf("company_name", companyAny, params));
   if (companyNone.length) clauses.push(noneOf("company_name", companyNone, params));
+  // Whether a term on position_name/company_name is present -- the two text columns the
+  // covering index actually carries. Narrowing via that index only pays off when a clause
+  // like this is doing the selecting; see the id-narrowing comment below for why it can
+  // actively hurt otherwise.
+  const hasIndexedSearchTerm =
+    titleAny.length > 0 || titleAll.length > 0 || titleNone.length > 0 || companyAny.length > 0 || companyNone.length > 0;
 
   // Searching the body text finds roles a title filter structurally cannot: "Manager,
   // Local Markets Growth" never matches an operations-leadership title guess, but its
@@ -278,16 +284,21 @@ function buildQuery(input = {}) {
   const rawWhere = clauses.length ? `WHERE ${clauses.join("\n  AND ")}` : "";
   // Every consumer of `where` below (this file's own queries, and db-facets.js's
   // `FROM Postings ${built.where}` queries) filters the full 18+-column row directly against
-  // this clause list, which forces SQLite to fetch a row's complete width just to test
-  // whether it matches -- discarding whatever narrow index exists on the columns actually
-  // searched (position_name, company_name, location all have one; the combined covering
-  // index built for the app's own search covers all three at once). Narrowing to matching
-  // ids first -- a subquery answerable from an index alone, since id is all it selects --
-  // before rejoining for the rest keeps table lookups to the number of actual matches, not
-  // the number of candidate rows scanned. Measured 2026-08-20 on the live database (~1.7M
-  // rows, one title term): the results query went from hanging indefinitely to ~0.5-3s, and
+  // this clause list by default, which forces SQLite to fetch a row's complete width just to
+  // test whether it matches -- discarding whatever narrow index exists on the searched
+  // columns. Narrowing to matching ids first (a subquery answerable from an index alone,
+  // since id is all it selects) before rejoining for the rest keeps table lookups to the
+  // number of actual matches. Measured 2026-08-20 on the live database (~1.7M rows, one
+  // title term): the results query went from hanging indefinitely to ~0.5-3s, and
   // db-facets.js's paired COUNT(*) from 103.9s to under 1s.
-  const where = rawWhere ? `WHERE id IN (SELECT id FROM Postings ${rawWhere})` : "";
+  //
+  // Only worth it when a term on the indexed columns is actually doing the selecting,
+  // though. Wrapping an unselective predicate this way (visibility=open alone, ~90% of the
+  // table -- the page's own default state on every load) forces SQLite to fully enumerate
+  // every matching id before ORDER BY/LIMIT can even start, throwing away the early exit a
+  // direct `WHERE ... ORDER BY ... LIMIT` gets once it has scanned enough matches: the exact
+  // same default-page-load request went from 15s+ (timing out) wrapped to 2ms unwrapped.
+  const where = rawWhere && hasIndexedSearchTerm ? `WHERE id IN (SELECT id FROM Postings ${rawWhere})` : rawWhere;
   const sql =
     `SELECT id, company_name, position_name, location, posting_date,\n` +
     `       city, state_region, country, is_remote, locations_json,\n` +
@@ -297,7 +308,7 @@ function buildQuery(input = {}) {
     `ORDER BY ${sortColumn} ${direction}, id DESC\n` +
     `LIMIT ${limit}`;
 
-  return { sql, params, where, clauses, limit, stateCodes, countryFilters, regionFilters, atsFilters, locationAnyTerms, cityTerms };
+  return { sql, params, where, clauses, limit, stateCodes, countryFilters, regionFilters, atsFilters, locationAnyTerms, cityTerms, hasIndexedSearchTerm };
 }
 
 // True when the SQL predicate is only a superset of what the caller asked for, so the counts
@@ -316,7 +327,7 @@ function needsRefinePass(built) {
 async function runQuery(input = {}) {
   const db = await getReadOnlyDb();
   const built = buildQuery(input);
-  const { where, clauses, limit, stateCodes, countryFilters, regionFilters, atsFilters, locationAnyTerms, cityTerms } = built;
+  const { where, clauses, limit, stateCodes, countryFilters, regionFilters, atsFilters, locationAnyTerms, cityTerms, hasIndexedSearchTerm } = built;
   const params = built.params.slice();
 
   const readable = built.sql.replace(/\?/g, () => {
@@ -329,16 +340,20 @@ async function runQuery(input = {}) {
   if (!needsRefinePass(built)) {
     const rows = await withQueryTimeout(db.all(built.sql, params), "Query");
 
-    // No clause at all -- nothing to narrow the id-subquery by, so the totals query below
-    // would have to visit pay_min/pay_max on every row in the table to sum them (id-narrowing
-    // only helps once there is an id set worth narrowing to). This is the one shape of
-    // request this rewrite cannot fix: measured 2026-08-20, it ran past 100s and, abandoned by
-    // its own caller mid-query, kept the shared read-only connection busy long enough to queue
-    // out every other /db request behind it and drive the process toward its memory ceiling
-    // twice in one night. /db/postings already exists as the fast, unfiltered browse view, so
-    // rather than pay that cost for a request this page was never meant to serve, skip the
-    // aggregate and say so.
-    if (clauses.length === 0) {
+    // No indexed search term -- either no clause at all, or only broad ones like
+    // visibility=open (the page's own default state on every load, matching ~90% of the
+    // table). Either way there is no id set narrow enough to make the totals query cheap:
+    // SUM(pay_min/pay_max) has no LIMIT to stop early on and must visit every matching row's
+    // pay columns, which id-narrowing cannot help since it only trims candidates before a
+    // table lookup, not the lookup itself. Measured 2026-08-20: the visibility=open totals
+    // query alone ran past 25s under load, on top of the plain no-filter case which ran past
+    // 100s and, abandoned by its own caller mid-query, kept the shared read-only connection
+    // busy long enough to queue out every other /db request and drive the process toward its
+    // memory ceiling twice in one night. db-facets.js already made this exact tradeoff for
+    // the same reason ("refusing to sample was right; offering nothing in its place was
+    // not") -- skip the aggregate and say so, rather than pay a cost this page was never
+    // meant to charge for its own default state.
+    if (!hasIndexedSearchTerm) {
       return {
         rows,
         total: null,
@@ -377,9 +392,36 @@ async function runQuery(input = {}) {
   }
 
   // Location or ATS filter: take the SQL superset, then apply the predicates that only exist
-  // in JS -- the segment-aware location matcher, and the ATS inferred from the URL.
-  const candidateSql = built.sql
-    .replace(/LIMIT \d+$/, `LIMIT ${STATE_CANDIDATE_CAP}`);
+  // in JS -- the segment-aware location matcher, and the ATS inferred from the URL. Shared
+  // with computeFacets (db-facets.js) via fetchMatchedCandidates below: that file used to
+  // carry its own second copy of this exact matching logic, and the two drifted at least
+  // once in practice (an ATS filter's absence from the facets copy made its counts disagree
+  // with what the postings list actually showed). One implementation means the list and the
+  // facets panel can no longer disagree about which rows matched.
+  const { rows: matched, approximate } = await fetchMatchedCandidates(db, built, params, STATE_CANDIDATE_CAP);
+
+  const visible = matched.filter((row) => Number(row.hidden) === 0).length;
+  const payUnknown = matched.filter((row) => row.pay_min === null && row.pay_max === null).length;
+  return {
+    rows: matched.slice(0, limit),
+    total: matched.length,
+    visible,
+    pay_unknown_count: payUnknown,
+    shown: Math.min(matched.length, limit),
+    limit,
+    // True when the superset filled the candidate cap, so counts are a floor not a total.
+    approximate,
+    sql: readable
+  };
+}
+
+// The JS refine pass shared by runQuery's location/ATS branch and computeFacets: fetches up
+// to `cap` SQL-superset candidates and applies the predicates SQL cannot express (the
+// segment-aware location matcher, and ATS inferred from the URL). One copy of this logic
+// means the postings list and the facets panel classify the same row the same way, always.
+async function fetchMatchedCandidates(db, built, params, cap) {
+  const { stateCodes, countryFilters, regionFilters, atsFilters, locationAnyTerms, cityTerms } = built;
+  const candidateSql = built.sql.replace(/LIMIT \d+$/, `LIMIT ${cap}`);
   const candidates = await withQueryTimeout(db.all(candidateSql, params), "Query");
 
   const countryCodes = countryFilters.map((filter) => String(filter?.value || "").trim().toUpperCase()).filter(Boolean);
@@ -418,19 +460,18 @@ async function runQuery(input = {}) {
     matched.push({ ...row, location: row.location || location });
   }
 
-  const visible = matched.filter((row) => Number(row.hidden) === 0).length;
-  const payUnknown = matched.filter((row) => row.pay_min === null && row.pay_max === null).length;
-  return {
-    rows: matched.slice(0, limit),
-    total: matched.length,
-    visible,
-    pay_unknown_count: payUnknown,
-    shown: Math.min(matched.length, limit),
-    limit,
-    // True when the superset filled the candidate cap, so counts are a floor not a total.
-    approximate: candidates.length >= STATE_CANDIDATE_CAP,
-    sql: readable
-  };
+  // True when the superset filled the candidate cap, so counts drawn from `matched` are a
+  // floor rather than a total.
+  return { rows: matched, candidateCount: candidates.length, approximate: candidates.length >= cap };
 }
 
-module.exports = { buildQuery, runQuery, needsRefinePass, SORTABLE, MAX_ROWS };
+module.exports = {
+  buildQuery,
+  runQuery,
+  needsRefinePass,
+  fetchMatchedCandidates,
+  SORTABLE,
+  MAX_ROWS,
+  STATE_CANDIDATE_CAP,
+  withQueryTimeout
+};

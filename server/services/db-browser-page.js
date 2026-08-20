@@ -745,16 +745,19 @@ ORDER BY n DESC</textarea>
         if (r.hidden_reason === "outside_date_window") staleDated += 1;
         else delisted += 1;
       });
-      var hiddenTotal = data.total - data.visible;
       var breakdown = "";
-      if (hiddenTotal > 0 && (staleDated || delisted)) {
+      if ((staleDated || delisted)) {
         // Derived from the returned page, not the whole match set, so say so rather than
         // implying these are totals.
         breakdown = " (of those shown: " + staleDated + " still listed, " + delisted + " delisted)";
       }
-      document.getElementById("posting-count").textContent =
-        (data.approximate ? "at least " : "") + data.total + " matched \u00b7 " + data.visible +
-        " visible, " + hiddenTotal + " hidden" + breakdown + " \u00b7 showing " + data.shown;
+      // data.total is null when the filter had nothing narrow enough to count exactly
+      // without a full-table scan (see db-query.js's hasIndexedSearchTerm) -- add a title
+      // or company term to see exact totals.
+      document.getElementById("posting-count").textContent = data.total === null
+        ? "showing " + data.shown + " (add a title or company term for an exact match count)" + breakdown
+        : (data.approximate ? "at least " : "") + data.total + " matched \u00b7 " + data.visible +
+          " visible, " + (data.total - data.visible) + " hidden" + breakdown + " \u00b7 showing " + data.shown;
       document.getElementById("posting-sqlout").textContent = data.sql;
       renderSortBar();
       document.getElementById("posting-out").innerHTML = postingList(data.rows);
@@ -912,8 +915,12 @@ ORDER BY n DESC</textarea>
             "floor rather than a total \u2014 postings whose state is only inferable from their URL are counted " +
             "by the filter but not here."
           : "State and company counts below are exact for the whole database.";
+        // data.total is null when the predicate was broad enough that counting it exactly
+        // would itself have needed the scan this branch exists to avoid (see db-facets.js's
+        // hasIndexedSearchTerm check) -- add a title or company term to see it.
+        var totalLabel = data.total === null ? "Many" : data.total.toLocaleString();
         out.innerHTML =
-          '<p class="hint"><b>' + data.total.toLocaleString() + " rows.</b> " + companyNote +
+          '<p class="hint"><b>' + totalLabel + " rows.</b> " + companyNote +
           " City and title breakdowns need a scan of the matching rows, so they " +
           "appear once that set is small enough to count exactly \u2014 over a set this size they would describe a " +
           "fraction of it and read as if they described all of it. Picking a company from the list below is " +
