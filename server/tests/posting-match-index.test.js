@@ -103,6 +103,46 @@ async function withDb(run) {
   }
 }
 
+// A real production incident: sort_by=match_desc showed 100% for a Custodian posting, a
+// Software Engineer posting and a Care Worker posting against the same resume -- all
+// completely unrelated to each other and to the resume. Root cause: each had only 1-2
+// extracted "requirements" (in the Custodian's case, the same interview-process paragraph
+// duplicated, not a real requirement at all), and a 1-2-sample percentage is close to a coin
+// flip -- measured live, 1-requirement postings hit 100% 57% of the time. This pins down
+// that a small sample no longer produces a percent at all, while still reporting the honest
+// underlying counts.
+function testTooFewRequirementsWithholdsThePercentRatherThanCoinFlipping() {
+  const oneRequirement = computeMatchForPosting({
+    description: `About the role\n\nWhat you'll need\n\n- Bachelor's degree from an accredited university in computer science or a related science or technical field.`,
+    resume_text: RESUME,
+    posting: { position_name: "Software Engineer" }
+  });
+  assert.strictEqual(oneRequirement.requirements_total, 1);
+  assert.strictEqual(oneRequirement.available, false, "one requirement is not enough sample to trust a percent");
+  assert.strictEqual(oneRequirement.match_percent, null);
+
+  const threeRequirements = computeMatchForPosting({
+    description: `About the role\n\nWhat you'll need\n\n- Kubernetes and distributed systems experience at production scale.\n- Deep expertise in Rust, gRPC and consensus protocols.\n- Prior work on distributed query planners and consensus protocols.`,
+    resume_text: RESUME,
+    posting: { position_name: "Distributed Systems Engineer" }
+  });
+  assert.strictEqual(threeRequirements.requirements_total, 3);
+  assert.strictEqual(threeRequirements.available, false, "three requirements is still below the confidence floor");
+  assert.strictEqual(threeRequirements.match_percent, null);
+
+  // The existing HIGH_MATCH_DESCRIPTION fixture has exactly 4 -- right at the floor, and
+  // must still produce a real percent (this is what
+  // testComputeMatchForPostingMatchesTheApplicationFormula below already pins at 75%).
+  const fourRequirements = computeMatchForPosting({
+    description: HIGH_MATCH_DESCRIPTION,
+    resume_text: RESUME,
+    posting: { position_name: "General Manager, Compliance Software" }
+  });
+  assert.strictEqual(fourRequirements.requirements_total, 4);
+  assert.strictEqual(fourRequirements.available, true, "four requirements clears the confidence floor");
+  assert.strictEqual(fourRequirements.match_percent, 75);
+}
+
 function testComputeMatchForPostingMatchesTheApplicationFormula() {
   // computeJobFitByApplicationId (applications.js) computes
   // (requirements_total - unmatched) / total * 100 from the same brief -- this is that
@@ -486,6 +526,7 @@ async function testMatchScoringStatusReportsProgressWithoutScanningPostings() {
 }
 
 async function main() {
+  testTooFewRequirementsWithholdsThePercentRatherThanCoinFlipping();
   testComputeMatchForPostingMatchesTheApplicationFormula();
   await testRescoreMatchesIsIncremental();
   await testResumeReuploadForcesARescore();

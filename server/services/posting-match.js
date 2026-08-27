@@ -165,11 +165,28 @@ async function writeMatchState(resumeKey, lastScoredId, resumeUploadedAt, gapSca
   );
 }
 
+// A percentage computed from too few requirements is not a percentage, it's a coin flip --
+// measured directly against the live database (resume key, ~320K scored postings): postings
+// with exactly 1 extracted requirement hit 100% match 57.2% of the time, 2 requirements
+// 21.0%, 3 requirements 16.9%, then a sharp knee to 6.6% at 4 and a smooth decline from
+// there (5.5%, 4.4%, 3.9%, 3.1%, 2.2%...) -- the rate above 4 looks like genuine signal, the
+// rate at 1-3 looks like noise from a small sample landing on all-matched or all-unmatched by
+// chance. A Custodian posting and a Software Engineer posting both scored 100% against the
+// same resume this way: the Custodian's only two "requirements" were the same interview-
+// process paragraph extracted twice (not a real requirement at all), and the Software
+// Engineer's one requirement ("Bachelor's degree... computer science or related science or
+// technical field") happened to share two discriminative words with an unrelated resume.
+const MIN_REQUIREMENTS_FOR_CONFIDENT_MATCH = 4;
+
 // Thin wrapper over buildCoverLetterBrief's requirement extraction, turned into the same
 // match_percent shape computeJobFitByApplicationId already computes (applications.js) --
 // requirements with no discriminative support in the resume count against the score,
-// everything else counts for it. Returns available: false when the description has no
-// scorable requirements, same as the application-side computation.
+// everything else counts for it. Returns available: false when the description has too few
+// scorable requirements to score with any confidence (see
+// MIN_REQUIREMENTS_FOR_CONFIDENT_MATCH), same as when it has none at all -- requirements_total/
+// requirements_matched/unmatched_requirements still report the real, honest counts either way,
+// only match_percent and available are gated on the sample being large enough to mean
+// anything.
 //
 // Deliberately uses findUnmatchedRequirementsStrict here, not the same
 // findUnmatchedRequirements draft_cover_letter's brief uses -- see that function's comment
@@ -181,12 +198,13 @@ function computeMatchForPosting({ description, resume_text, posting } = {}) {
   const { scorable, unmatched } = findUnmatchedRequirementsStrict(brief.requirements, resume_text || "");
   const requirementsTotal = scorable.length;
   const requirementsMatched = Math.max(0, requirementsTotal - unmatched.length);
+  const hasEnoughSignal = requirementsTotal >= MIN_REQUIREMENTS_FOR_CONFIDENT_MATCH;
 
   return {
-    available: requirementsTotal > 0,
+    available: hasEnoughSignal,
     requirements_total: requirementsTotal,
     requirements_matched: requirementsMatched,
-    match_percent: requirementsTotal > 0 ? (requirementsMatched / requirementsTotal) * 100 : null,
+    match_percent: hasEnoughSignal ? (requirementsMatched / requirementsTotal) * 100 : null,
     overlap_terms: brief.overlap_terms.slice(0, MAX_OVERLAP_TERMS).map((entry) => entry.term),
     unmatched_requirements: unmatched.slice(0, MAX_UNMATCHED_REQUIREMENTS)
   };
