@@ -84,9 +84,25 @@ async function getExistingAppliedApplicationByPostingUrl(jobPostingUrl) {
   return getApplicationById(lastApplicationId);
 }
 
-function mapApplicationRow(row) {
+// extra is only populated by listApplications' include_job_fit path -- getApplicationById
+// (single-row reads: create/update responses) never has a batch to compute job_fit or
+// last_status_change_epoch against cheaply, so those keys are simply absent there rather
+// than paying for a per-row lookup nothing asked for.
+function mapApplicationRow(row, extra = {}) {
   if (!row) return null;
+  // status stays exactly as before -- normalizeApplicationStatus, which collapses anything
+  // outside APPLICATION_STATUS_OPTIONS (including legacy free text like "rejected") to
+  // "applied". That default is safe for display/editing (an unrecognized status has to
+  // resolve to *something* valid to show in the status dropdown), but it is wrong for
+  // grouping: it would show a legacy-denied application as "applied" and then sort it into
+  // the active list -- the opposite of what a status-priority view is for. status_bucket
+  // uses resolveStatusBucket instead, the same legacy-aliasing (LEGACY_STATUS_ALIASES:
+  // "rejected" -> denied, "submitted" -> applied) getApplicationDenialStats already relies
+  // on for its denial-rate math, so both views agree on what actually counts as denied.
+  // null means genuinely unrecognized, not a guess -- callers that group by bucket treat
+  // that as its own "other" case rather than silently defaulting it into "applied".
   const status = normalizeApplicationStatus(row?.status);
+  const statusBucket = resolveStatusBucket(row?.status);
   const appliedByType = normalizeAppliedByType(row?.applied_by_type);
   return {
     id: Number(row?.id || 0),
@@ -97,10 +113,15 @@ function mapApplicationRow(row) {
     position_name: String(row?.position_name || "").trim(),
     application_date: Number(row?.application_date || 0),
     status,
+    status_bucket: statusBucket,
     job_posting_url: String(row?.job_posting_url || "").trim(),
     fit_assessment: normalizeApplicationFit(row?.fit_assessment),
     applied_by_type: appliedByType,
-    applied_by_label: normalizeAppliedByLabel(row?.applied_by_label, appliedByType)
+    applied_by_label: normalizeAppliedByLabel(row?.applied_by_label, appliedByType),
+    ...(extra.jobFit !== undefined ? { job_fit: extra.jobFit } : {}),
+    ...(extra.lastStatusChangeEpoch !== undefined
+      ? { last_status_change_epoch: extra.lastStatusChangeEpoch }
+      : {})
   };
 }
 
@@ -134,10 +155,18 @@ async function getApplicationById(applicationId) {
 
 // On the reader connection, not the writer -- see personal-info.js's getPersonalInformation
 // for why.
+//
+// include_job_fit is opt-in and off by default: it adds a match-percent computation
+// (computeJobFitByApplicationId, the same one getApplicationDenialStats already uses) and a
+// last-status-change lookup over this page's rows. Neither is free, and the list_applications
+// MCP tool -- an agent tracking what it has already applied to, not the redesigned Applications
+// page -- has no use for either, so it (and any other existing caller) sees no shape change
+// unless it explicitly asks. Mirrors postings.js's include_match.
 async function listApplications(options = {}) {
   const limit = Math.max(1, Math.min(2000, Number(options?.limit || 500)));
   const offset = Math.max(0, Number(options?.offset || 0));
   const status = normalizeLikeText(options?.status);
+  const includeJobFit = Boolean(options?.include_job_fit);
   const db = getReadDb()
 
   let rows = [];
@@ -192,7 +221,43 @@ async function listApplications(options = {}) {
     );
   }
 
-  const items = rows.map(mapApplicationRow).filter(Boolean);
+  let jobFitByApplicationId = new Map();
+  let lastStatusChangeByApplicationId = new Map();
+  if (includeJobFit && rows.length > 0) {
+    jobFitByApplicationId = await computeJobFitByApplicationId(rows);
+
+    const ids = rows.map((row) => Number(row.id)).filter((id) => Number.isFinite(id) && id > 0);
+    const placeholders = ids.map(() => "?").join(", ");
+    // Same table and MIN(changed_at_epoch)-for-denials shape getApplicationDenialStats
+    // already uses (see below) -- MAX here instead, since this wants the most recent change
+    // regardless of what it changed to, not specifically when a denial landed.
+    const changeRows = ids.length
+      ? await db.all(
+          `
+            SELECT application_id, MAX(changed_at_epoch) AS last_changed_epoch
+            FROM application_status_history
+            WHERE application_id IN (${placeholders})
+            GROUP BY application_id;
+          `,
+          ids
+        )
+      : [];
+    lastStatusChangeByApplicationId = new Map(
+      changeRows.map((row) => [Number(row.application_id), Number(row.last_changed_epoch)])
+    );
+  }
+
+  const items = rows
+    .map((row) => {
+      const applicationId = Number(row?.id || 0);
+      return mapApplicationRow(row, {
+        jobFit: includeJobFit ? jobFitByApplicationId.get(applicationId) || { available: false } : undefined,
+        lastStatusChangeEpoch: includeJobFit
+          ? lastStatusChangeByApplicationId.get(applicationId) ?? null
+          : undefined
+      });
+    })
+    .filter(Boolean);
   return {
     items,
     count: items.length,

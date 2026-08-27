@@ -267,7 +267,7 @@ export function fetchPostingFilterOptions() {
   return request("/postings/filter-options");
 }
 
-export function fetchApplications(limit = 500, offset = 0, status = "") {
+export function fetchApplications(limit = 500, offset = 0, status = "", options = {}) {
   const params = new URLSearchParams({
     limit: String(limit),
     offset: String(offset),
@@ -275,6 +275,12 @@ export function fetchApplications(limit = 500, offset = 0, status = "") {
   });
   if (String(status || "").trim()) {
     params.set("status", String(status).trim());
+  }
+  // Adds match-percent and last-status-change to each item -- opt in, since most callers
+  // (list_applications' own MCP tool included) have no use for either. See listApplications'
+  // own comment in server/services/applications.js.
+  if (options?.includeJobFit) {
+    params.set("include_job_fit", "1");
   }
   return request(`/applications?${params.toString()}`);
 }

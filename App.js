@@ -235,6 +235,38 @@ const POSTING_REVIEW_QUEUES = Object.freeze([
   { value: "shortlisted", label: "Shortlisted" },
   { value: "reviewed", label: "Reviewed" }
 ]);
+// Same tab pattern as POSTING_REVIEW_QUEUES above. Denied gets its own tab rather than a
+// section in Active: a resolved application needing no further action shouldn't compete
+// for attention with ones still in flight, but it also shouldn't be hard to get back to.
+const APPLICATIONS_QUEUES = Object.freeze([
+  { value: "active", label: "Active" },
+  { value: "denied", label: "Denied" },
+  { value: "all", label: "All" }
+]);
+// Section order within the Active tab -- most actionable/time-sensitive first. Anything
+// status_bucket resolves to null for (a genuinely unrecognized legacy status -- see
+// resolveStatusBucket server-side) lands in its own "other" section rather than being
+// silently dropped or folded into "applied".
+const APPLICATION_ACTIVE_STATUS_ORDER = [
+  "interview scheduled",
+  "awaiting response",
+  "offer received",
+  "applied",
+  "withdrawn",
+  "other"
+];
+const APPLICATION_STATUS_SECTION_LABELS = {
+  "interview scheduled": "Interview scheduled",
+  "awaiting response": "Awaiting response",
+  "offer received": "Offer received",
+  applied: "Applied",
+  withdrawn: "Withdrawn",
+  other: "Other"
+};
+// Not a setting -- same "fixed constant, not exposed to configure" choice the freshness
+// window elsewhere in the app makes. An application sitting in Applied/Awaiting response
+// with no status change in two weeks is a reasonable, uncontroversial "check on this" signal.
+const APPLICATION_FOLLOW_UP_STALE_DAYS = 14;
 const MIN_SYNC_INTERVAL_SECONDS = 60;
 const MAX_SYNC_INTERVAL_SECONDS = 24 * 60 * 60;
 const SYNC_PERFORMANCE_SAMPLE_INTERVAL_MS = 15 * 1000;
@@ -546,15 +578,98 @@ function formatApplicationDate(value) {
 
 function normalizeApplicationItem(item) {
   const source = item && typeof item === "object" ? item : {};
+  // Only present when the request opted into include_job_fit (see fetchApplications) --
+  // absent entirely otherwise, so this guards the shape rather than assuming it is there.
+  const jobFitSource = source.job_fit && typeof source.job_fit === "object" ? source.job_fit : null;
+  const jobFit = jobFitSource
+    ? {
+        available: Boolean(jobFitSource.available),
+        match_percent:
+          jobFitSource.match_percent === null || jobFitSource.match_percent === undefined
+            ? null
+            : Number(jobFitSource.match_percent)
+      }
+    : null;
+  const lastStatusChangeEpoch =
+    source.last_status_change_epoch === null || source.last_status_change_epoch === undefined
+      ? null
+      : Number(source.last_status_change_epoch);
+  // Unlike status (which the server already defaults to "applied" for anything it doesn't
+  // recognize -- safe for the status dropdown, wrong for grouping), status_bucket is null
+  // for a genuinely unrecognized value on purpose, so grouping can put it in its own "other"
+  // section instead of silently mixing it into "applied".
+  const statusBucket =
+    typeof source.status_bucket === "string" && APPLICATION_STATUS_OPTIONS.includes(source.status_bucket)
+      ? source.status_bucket
+      : null;
   return {
     ...source,
     id: Number(source.id || 0),
     company_name: sanitizeDisplayText(source.company_name, ""),
     position_name: sanitizeDisplayText(source.position_name, ""),
     status: sanitizeDisplayText(source.status, "applied"),
+    status_bucket: statusBucket,
     fit_assessment: sanitizeDisplayText(source.fit_assessment, ""),
-    applied_by_label: sanitizeDisplayText(source.applied_by_label, "")
+    applied_by_label: sanitizeDisplayText(source.applied_by_label, ""),
+    job_fit: jobFit,
+    last_status_change_epoch: lastStatusChangeEpoch
   };
+}
+
+function getApplicationStatusBucketKey(application) {
+  return application?.status_bucket || "other";
+}
+
+// applied/awaiting response with no status change in a while -- the two buckets an
+// applicant can actually still act on (a nudge, a check-in) as opposed to offer/interview
+// (the employer clearly still has it) or withdrawn/denied (already resolved).
+function isApplicationStale(application) {
+  const bucket = getApplicationStatusBucketKey(application);
+  if (bucket !== "applied" && bucket !== "awaiting response") return false;
+  const referenceEpoch = Number(application?.last_status_change_epoch) || Number(application?.application_date) || 0;
+  if (!referenceEpoch) return false;
+  const daysSince = (Date.now() / 1000 - referenceEpoch) / 86400;
+  return daysSince >= APPLICATION_FOLLOW_UP_STALE_DAYS;
+}
+
+function daysSinceApplicationStatusChange(application) {
+  const referenceEpoch = Number(application?.last_status_change_epoch) || Number(application?.application_date) || 0;
+  if (!referenceEpoch) return null;
+  return Math.max(0, (Date.now() / 1000 - referenceEpoch) / 86400);
+}
+
+// Buckets every application (minus denied, which is its own tab -- see APPLICATIONS_QUEUES)
+// into APPLICATION_ACTIVE_STATUS_ORDER's sections, most recent first within each. A status
+// resolveStatusBucket could not place (server-side, genuinely unrecognized legacy text)
+// lands in "other" here too, rather than vanishing.
+function groupActiveApplicationsByStatus(applications) {
+  const groups = new Map(APPLICATION_ACTIVE_STATUS_ORDER.map((key) => [key, []]));
+  for (const application of applications) {
+    const bucket = getApplicationStatusBucketKey(application);
+    if (bucket === "denied") continue;
+    const key = groups.has(bucket) ? bucket : "other";
+    groups.get(key).push(application);
+  }
+  for (const list of groups.values()) {
+    list.sort((a, b) => Number(b.application_date || 0) - Number(a.application_date || 0));
+  }
+  return groups;
+}
+
+// Feeds the summary strip -- counts from the same already-loaded list, no extra fetch.
+function summarizeApplications(applications) {
+  let active = 0;
+  let denied = 0;
+  let needsFollowUp = 0;
+  for (const application of applications) {
+    if (getApplicationStatusBucketKey(application) === "denied") {
+      denied += 1;
+    } else {
+      active += 1;
+      if (isApplicationStale(application)) needsFollowUp += 1;
+    }
+  }
+  return { active, denied, needsFollowUp, total: applications.length };
 }
 
 function normalizePostingItem(item, index = 0) {
@@ -1649,6 +1764,8 @@ export default function App() {
   const [applications, setApplications] = useState([]);
   const [applicationsLoading, setApplicationsLoading] = useState(false);
   const [applicationsNotice, setApplicationsNotice] = useState("");
+  // "active" hides denied by default -- see APPLICATIONS_QUEUES.
+  const [applicationsQueue, setApplicationsQueue] = useState("active");
   const [applicationStats, setApplicationStats] = useState(null);
   const [applicationStatsLoading, setApplicationStatsLoading] = useState(false);
   // Failures the server recorded that cost the user something -- an application submitted
@@ -2247,7 +2364,7 @@ export default function App() {
     try {
       let response;
       try {
-        response = await fetchApplications(1000, 0);
+        response = await fetchApplications(1000, 0, "", { includeJobFit: true });
       } catch (e) {
         // A one-off collision with the sync's writer (a periodic WAL checkpoint, a busy
         // moment) looks identical to a real outage from here. One short retry tells them
@@ -2256,7 +2373,7 @@ export default function App() {
         if (requestSequence !== applicationsRequestSequenceRef.current) {
           return;
         }
-        response = await fetchApplications(1000, 0);
+        response = await fetchApplications(1000, 0, "", { includeJobFit: true });
       }
       if (requestSequence !== applicationsRequestSequenceRef.current) {
         return;
@@ -4156,170 +4273,286 @@ export default function App() {
     </>
   );
 
-  const renderApplicationsPage = () => (
-    <ScrollView contentContainerStyle={styles.settingsContent}>
-      <View style={styles.settingsCard}>
-        <Text style={styles.settingsTitle}>Applications</Text>
-        <Text style={styles.settingsDescription}>
-          Track jobs you applied to. Entries added from Postings are marked as manual applications.
-        </Text>
+  const renderApplicationCard = (application) => {
+    const statusMenuOpen = openApplicationStatusForId === application.id;
+    const fitMenuOpen = openApplicationFitForId === application.id;
+    const isUpdatingStatus = Boolean(updatingApplicationIds[application.id]);
+    const isUpdatingFit = Boolean(updatingApplicationFitIds[application.id]);
+    const isDeleting = Boolean(deletingApplicationIds[application.id]);
+    const appliedDate = formatApplicationDate(application?.application_date);
+    const positionName = sanitizeDisplayText(application?.position_name, "Unknown position");
+    const companyName = sanitizeDisplayText(application?.company_name, "Unknown company");
+    const appliedByLabel = sanitizeDisplayText(application?.applied_by_label, "Manually applied by user");
+    const statusLabel = sanitizeDisplayText(application?.status, "applied");
+    const fitLabel = sanitizeDisplayText(application?.fit_assessment, "");
+    const jobFit = application?.job_fit;
+    const matchPercent =
+      jobFit?.available && jobFit.match_percent !== null && jobFit.match_percent !== undefined
+        ? Number(jobFit.match_percent)
+        : null;
+    const matchTone = getPostingMatchTone(matchPercent);
+    const stale = isApplicationStale(application);
+    const daysSinceChange = stale ? daysSinceApplicationStatusChange(application) : null;
 
-        {/* Applications that were submitted but could not be recorded. This is the whole
-            point of the error log: the failure used to exist only as a line in an agent
-            reply, so submissions went untracked with nothing in the app to say so. Each
-            entry carries what it needs to be re-entered by hand. */}
-        {systemErrors.length > 0 ? (
-          <View style={styles.errorBanner}>
-            <Text style={styles.errorBannerTitle}>
-              {systemErrors.length === 1
-                ? "1 problem needs your attention"
-                : `${systemErrors.length} problems need your attention`}
+    return (
+      <View key={application.id} style={styles.applicationCard}>
+        <Text style={styles.position}>{positionName}</Text>
+        <Text style={styles.company}>{companyName}</Text>
+        <Text style={styles.posted}>Applied: {appliedDate}</Text>
+        <Text style={styles.applicationAttribution}>{appliedByLabel}</Text>
+
+        {/* Fit-assessment (E) and match-percent (B) badges -- visible without opening
+            either dropdown below, same tone system the Postings page already uses for
+            match badges so a percentage means the same thing everywhere it appears. */}
+        <View style={styles.postingBadgesRow}>
+          {matchPercent !== null ? (
+            <Text
+              style={[
+                styles.postingMatchBadge,
+                matchTone === "good"
+                  ? styles.postingMatchBadgeGood
+                  : matchTone === "warning"
+                    ? styles.postingMatchBadgeWarning
+                    : matchTone === "critical"
+                      ? styles.postingMatchBadgeCritical
+                      : null
+              ]}
+            >
+              {`${Math.round(matchPercent)}% JD match`}
             </Text>
-            {systemErrors.slice(0, 5).map((item) => {
-              const context = item?.context && typeof item.context === "object" ? item.context : {};
-              const subject = [context.company_name, context.position_name].filter(Boolean).join(" — ");
-              return (
-                <View key={item.id} style={styles.errorBannerRow}>
-                  <Text style={styles.errorBannerText}>
-                    {sanitizeDisplayText(item.message, "Something failed.")}
-                  </Text>
-                  {subject ? <Text style={styles.errorBannerMeta}>{subject}</Text> : null}
-                  {context.job_posting_url ? (
-                    <Text style={styles.errorBannerMeta}>{String(context.job_posting_url)}</Text>
-                  ) : null}
-                </View>
-              );
-            })}
-            {systemErrors.length > 5 ? (
-              <Text style={styles.errorBannerMeta}>{`and ${systemErrors.length - 5} more`}</Text>
-            ) : null}
-            <Pressable onPress={handleDismissSystemErrors} style={styles.errorBannerButton}>
-              <Text style={styles.errorBannerButtonText}>Dismiss</Text>
+          ) : null}
+          {fitLabel ? <Text style={styles.postingConfidenceBadge}>{fitLabel}</Text> : null}
+          {stale ? (
+            <Text style={styles.applicationFollowUpBadge}>
+              {`No update in ${formatDaysCompact(daysSinceChange)}`}
+            </Text>
+          ) : null}
+        </View>
+
+        <View style={styles.applicationActionsRow}>
+          <View style={styles.applicationStatusWrap}>
+            <Pressable
+              onPress={() => setOpenApplicationStatusForId((prev) => (prev === application.id ? null : application.id))}
+              disabled={isUpdatingStatus}
+              style={styles.applicationStatusBtn}
+            >
+              <Text style={styles.applicationStatusBtnText}>
+                {isUpdatingStatus ? "Updating..." : `Status: ${statusLabel}`}
+              </Text>
             </Pressable>
+
+            {statusMenuOpen ? (
+              <View style={styles.applicationStatusMenu}>
+                {APPLICATION_STATUS_OPTIONS.map((status) => (
+                  <Pressable
+                    key={`${application.id}-${status}`}
+                    onPress={() => handleUpdateApplicationStatus(application.id, status)}
+                    style={[
+                      styles.applicationStatusMenuItem,
+                      application.status === status ? styles.applicationStatusMenuItemActive : null
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.applicationStatusMenuItemText,
+                        application.status === status ? styles.applicationStatusMenuItemTextActive : null
+                      ]}
+                    >
+                      {status}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+            ) : null}
           </View>
-        ) : null}
 
-        {applicationsNotice ? <Text style={styles.settingsNotice}>{applicationsNotice}</Text> : null}
-        {applicationsLoading ? <ActivityIndicator size="small" style={styles.settingsLoader} /> : null}
+          <View style={styles.applicationStatusWrap}>
+            <Pressable
+              onPress={() => setOpenApplicationFitForId((prev) => (prev === application.id ? null : application.id))}
+              disabled={isUpdatingFit}
+              style={styles.applicationStatusBtn}
+            >
+              <Text style={styles.applicationStatusBtnText}>
+                {isUpdatingFit ? "Updating..." : `Fit: ${fitLabel || "not assessed"}`}
+              </Text>
+            </Pressable>
 
-        {!applicationsLoading && applications.length === 0 ? (
-          <Text style={styles.empty}>No applications tracked yet.</Text>
-        ) : null}
-
-        {applications.map((application) => {
-          const statusMenuOpen = openApplicationStatusForId === application.id;
-          const fitMenuOpen = openApplicationFitForId === application.id;
-          const isUpdatingStatus = Boolean(updatingApplicationIds[application.id]);
-          const isUpdatingFit = Boolean(updatingApplicationFitIds[application.id]);
-          const isDeleting = Boolean(deletingApplicationIds[application.id]);
-          const appliedDate = formatApplicationDate(application?.application_date);
-          const positionName = sanitizeDisplayText(application?.position_name, "Unknown position");
-          const companyName = sanitizeDisplayText(application?.company_name, "Unknown company");
-          const appliedByLabel = sanitizeDisplayText(application?.applied_by_label, "Manually applied by user");
-          const statusLabel = sanitizeDisplayText(application?.status, "applied");
-          const fitLabel = sanitizeDisplayText(application?.fit_assessment, "");
-
-          return (
-            <View key={application.id} style={styles.applicationCard}>
-              <Text style={styles.position}>{positionName}</Text>
-              <Text style={styles.company}>{companyName}</Text>
-              <Text style={styles.posted}>Applied: {appliedDate}</Text>
-              <Text style={styles.applicationAttribution}>{appliedByLabel}</Text>
-
-              <View style={styles.applicationActionsRow}>
-                <View style={styles.applicationStatusWrap}>
+            {fitMenuOpen ? (
+              <View style={styles.applicationStatusMenu}>
+                {APPLICATION_FIT_OPTIONS.map((fitOption) => (
                   <Pressable
-                    onPress={() => setOpenApplicationStatusForId((prev) => (prev === application.id ? null : application.id))}
-                    disabled={isUpdatingStatus}
-                    style={styles.applicationStatusBtn}
+                    key={`${application.id}-${fitOption}`}
+                    onPress={() => handleUpdateApplicationFit(application.id, fitOption)}
+                    style={[
+                      styles.applicationStatusMenuItem,
+                      application.fit_assessment === fitOption ? styles.applicationStatusMenuItemActive : null
+                    ]}
                   >
-                    <Text style={styles.applicationStatusBtnText}>
-                      {isUpdatingStatus ? "Updating..." : `Status: ${statusLabel}`}
+                    <Text
+                      style={[
+                        styles.applicationStatusMenuItemText,
+                        application.fit_assessment === fitOption ? styles.applicationStatusMenuItemTextActive : null
+                      ]}
+                    >
+                      {fitOption}
                     </Text>
                   </Pressable>
-
-                  {statusMenuOpen ? (
-                    <View style={styles.applicationStatusMenu}>
-                      {APPLICATION_STATUS_OPTIONS.map((status) => (
-                        <Pressable
-                          key={`${application.id}-${status}`}
-                          onPress={() => handleUpdateApplicationStatus(application.id, status)}
-                          style={[
-                            styles.applicationStatusMenuItem,
-                            application.status === status ? styles.applicationStatusMenuItemActive : null
-                          ]}
-                        >
-                          <Text
-                            style={[
-                              styles.applicationStatusMenuItemText,
-                              application.status === status ? styles.applicationStatusMenuItemTextActive : null
-                            ]}
-                          >
-                            {status}
-                          </Text>
-                        </Pressable>
-                      ))}
-                    </View>
-                  ) : null}
-                </View>
-
-                <View style={styles.applicationStatusWrap}>
-                  <Pressable
-                    onPress={() => setOpenApplicationFitForId((prev) => (prev === application.id ? null : application.id))}
-                    disabled={isUpdatingFit}
-                    style={styles.applicationStatusBtn}
-                  >
-                    <Text style={styles.applicationStatusBtnText}>
-                      {isUpdatingFit ? "Updating..." : `Fit: ${fitLabel || "not assessed"}`}
-                    </Text>
-                  </Pressable>
-
-                  {fitMenuOpen ? (
-                    <View style={styles.applicationStatusMenu}>
-                      {APPLICATION_FIT_OPTIONS.map((fitOption) => (
-                        <Pressable
-                          key={`${application.id}-${fitOption}`}
-                          onPress={() => handleUpdateApplicationFit(application.id, fitOption)}
-                          style={[
-                            styles.applicationStatusMenuItem,
-                            application.fit_assessment === fitOption ? styles.applicationStatusMenuItemActive : null
-                          ]}
-                        >
-                          <Text
-                            style={[
-                              styles.applicationStatusMenuItemText,
-                              application.fit_assessment === fitOption ? styles.applicationStatusMenuItemTextActive : null
-                            ]}
-                          >
-                            {fitOption}
-                          </Text>
-                        </Pressable>
-                      ))}
-                      <Pressable
-                        key={`${application.id}-clear-fit`}
-                        onPress={() => handleUpdateApplicationFit(application.id, "")}
-                        style={styles.applicationStatusMenuItem}
-                      >
-                        <Text style={styles.applicationStatusMenuItemText}>Clear</Text>
-                      </Pressable>
-                    </View>
-                  ) : null}
-                </View>
-
+                ))}
                 <Pressable
-                  onPress={() => handleDeleteApplication(application.id)}
-                  disabled={isDeleting}
-                  style={[styles.applicationDeleteBtn, isDeleting ? styles.applicationDeleteBtnDisabled : null]}
+                  key={`${application.id}-clear-fit`}
+                  onPress={() => handleUpdateApplicationFit(application.id, "")}
+                  style={styles.applicationStatusMenuItem}
                 >
-                  <Text style={styles.applicationDeleteBtnText}>{isDeleting ? "Deleting..." : "Delete"}</Text>
+                  <Text style={styles.applicationStatusMenuItemText}>Clear</Text>
                 </Pressable>
               </View>
-            </View>
-          );
-        })}
+            ) : null}
+          </View>
+
+          <Pressable
+            onPress={() => handleDeleteApplication(application.id)}
+            disabled={isDeleting}
+            style={[styles.applicationDeleteBtn, isDeleting ? styles.applicationDeleteBtnDisabled : null]}
+          >
+            <Text style={styles.applicationDeleteBtnText}>{isDeleting ? "Deleting..." : "Delete"}</Text>
+          </Pressable>
+        </View>
       </View>
-    </ScrollView>
-  );
+    );
+  };
+
+  const renderApplicationsPage = () => {
+    const summary = summarizeApplications(applications);
+    const groupedActive = applicationsQueue === "active" ? groupActiveApplicationsByStatus(applications) : null;
+    const deniedApplications =
+      applicationsQueue === "denied"
+        ? applications
+            .filter((application) => getApplicationStatusBucketKey(application) === "denied")
+            .sort((a, b) => Number(b.application_date || 0) - Number(a.application_date || 0))
+        : [];
+    const allApplications =
+      applicationsQueue === "all"
+        ? [...applications].sort((a, b) => Number(b.application_date || 0) - Number(a.application_date || 0))
+        : [];
+
+    return (
+      <ScrollView contentContainerStyle={styles.settingsContent}>
+        <View style={styles.settingsCard}>
+          <Text style={styles.settingsTitle}>Applications</Text>
+          <Text style={styles.settingsDescription}>
+            Track jobs you applied to. Entries added from Postings are marked as manual applications.
+          </Text>
+
+          {/* Applications that were submitted but could not be recorded. This is the whole
+              point of the error log: the failure used to exist only as a line in an agent
+              reply, so submissions went untracked with nothing in the app to say so. Each
+              entry carries what it needs to be re-entered by hand. */}
+          {systemErrors.length > 0 ? (
+            <View style={styles.errorBanner}>
+              <Text style={styles.errorBannerTitle}>
+                {systemErrors.length === 1
+                  ? "1 problem needs your attention"
+                  : `${systemErrors.length} problems need your attention`}
+              </Text>
+              {systemErrors.slice(0, 5).map((item) => {
+                const context = item?.context && typeof item.context === "object" ? item.context : {};
+                const subject = [context.company_name, context.position_name].filter(Boolean).join(" — ");
+                return (
+                  <View key={item.id} style={styles.errorBannerRow}>
+                    <Text style={styles.errorBannerText}>
+                      {sanitizeDisplayText(item.message, "Something failed.")}
+                    </Text>
+                    {subject ? <Text style={styles.errorBannerMeta}>{subject}</Text> : null}
+                    {context.job_posting_url ? (
+                      <Text style={styles.errorBannerMeta}>{String(context.job_posting_url)}</Text>
+                    ) : null}
+                  </View>
+                );
+              })}
+              {systemErrors.length > 5 ? (
+                <Text style={styles.errorBannerMeta}>{`and ${systemErrors.length - 5} more`}</Text>
+              ) : null}
+              <Pressable onPress={handleDismissSystemErrors} style={styles.errorBannerButton}>
+                <Text style={styles.errorBannerButtonText}>Dismiss</Text>
+              </Pressable>
+            </View>
+          ) : null}
+
+          {applicationsNotice ? <Text style={styles.settingsNotice}>{applicationsNotice}</Text> : null}
+          {applicationsLoading ? <ActivityIndicator size="small" style={styles.settingsLoader} /> : null}
+
+          {/* Summary strip (D): counts from the same already-loaded list, so hiding denied
+              by default in the Active tab doesn't read as data loss -- the count is right
+              here. */}
+          {!applicationsLoading && applications.length > 0 ? (
+            <Text style={styles.applicationsSummaryStrip}>
+              {[
+                summary.needsFollowUp > 0 ? `${summary.needsFollowUp} need follow-up` : null,
+                `${summary.active} active`,
+                `${summary.denied} denied`
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            </Text>
+          ) : null}
+
+          {!applicationsLoading && applications.length > 0 ? (
+            <View style={styles.reviewQueueRow}>
+              {APPLICATIONS_QUEUES.map((queue) => {
+                const selected = applicationsQueue === queue.value;
+                const count =
+                  queue.value === "active" ? summary.active : queue.value === "denied" ? summary.denied : summary.total;
+                return (
+                  <Pressable
+                    key={queue.value}
+                    onPress={() => setApplicationsQueue(queue.value)}
+                    style={[styles.reviewQueueTab, selected ? styles.reviewQueueTabActive : null]}
+                  >
+                    <Text style={[styles.reviewQueueTabText, selected ? styles.reviewQueueTabTextActive : null]}>
+                      {`${queue.label} (${count})`}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+          ) : null}
+
+          {!applicationsLoading && applications.length === 0 ? (
+            <Text style={styles.empty}>No applications tracked yet.</Text>
+          ) : null}
+
+          {!applicationsLoading && applications.length > 0 && applicationsQueue === "active"
+            ? summary.active === 0
+              ? (
+                  <Text style={styles.empty}>
+                    Nothing active right now -- everything tracked is denied. Check the Denied tab.
+                  </Text>
+                )
+              : APPLICATION_ACTIVE_STATUS_ORDER.map((statusKey) => {
+                  const sectionApplications = groupedActive.get(statusKey) || [];
+                  if (sectionApplications.length === 0) return null;
+                  return (
+                    <View key={statusKey}>
+                      <Text style={styles.applicationSectionHeading}>
+                        {`${APPLICATION_STATUS_SECTION_LABELS[statusKey]} (${sectionApplications.length})`}
+                      </Text>
+                      {sectionApplications.map(renderApplicationCard)}
+                    </View>
+                  );
+                })
+            : null}
+
+          {!applicationsLoading && applicationsQueue === "denied"
+            ? deniedApplications.length > 0
+              ? deniedApplications.map(renderApplicationCard)
+              : <Text style={styles.empty}>No denied applications.</Text>
+            : null}
+
+          {!applicationsLoading && applicationsQueue === "all" ? allApplications.map(renderApplicationCard) : null}
+        </View>
+      </ScrollView>
+    );
+  };
 
   const renderApplicationMetricsPage = () => {
     const total = Number(applicationStats?.total || 0);
@@ -6285,6 +6518,30 @@ const styles = StyleSheet.create({
   loadMoreButtonText: { color: "#ffffff", fontSize: 12, fontWeight: "700" },
   paginationEnd: { textAlign: "center", color: "#7a8798", fontSize: 11, marginVertical: 14 },
   reviewDetailNotice: { marginTop: 8, color: "#52606d", fontSize: 11, fontStyle: "italic" },
+  applicationsSummaryStrip: {
+    marginTop: 8,
+    color: "#52606d",
+    fontSize: 12,
+    fontWeight: "600"
+  },
+  applicationSectionHeading: {
+    marginTop: 16,
+    marginBottom: 2,
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#102a43"
+  },
+  // Same shape as postingConfidenceBadge (a plain rounded pill) but a warmer tone -- a
+  // follow-up flag is a mild nudge, not a status or a score, so it shouldn't visually
+  // compete with the match/fit badges next to it.
+  applicationFollowUpBadge: {
+    borderRadius: 999,
+    backgroundColor: "#fff7e6",
+    color: "#92400e",
+    fontSize: 10,
+    paddingHorizontal: 7,
+    paddingVertical: 3
+  },
   applicationCard: {
     marginTop: 12,
     borderWidth: 1,

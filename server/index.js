@@ -2440,11 +2440,15 @@ function createServer() {
     const limit = Math.max(1, Math.min(2000, Number(req.query.limit || 500)));
     const offset = Math.max(0, Number(req.query.offset || 0));
     const status = String(req.query.status || "").trim();
+    // Opt-in: adds a match-percent computation and a status-history lookup per row, which
+    // only the Applications page's redesigned view wants. See listApplications' own comment.
+    const includeJobFit = normalizeBoolean(req.query.include_job_fit, false);
 
     const payload = await listApplications({
       limit,
       offset,
-      status
+      status,
+      include_job_fit: includeJobFit
     });
 
     res.json({
