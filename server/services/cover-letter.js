@@ -172,12 +172,27 @@ function extractSections(descriptionText) {
 // Terms the posting leans on that the resume also uses. Frequency in the description is
 // the only available signal for what the posting cares about; presence in the resume is
 // what makes a term usable as evidence rather than an aspiration.
+//
+// Uses discriminativeTokenize (semantic-search.js's STOPWORDS-filtered tokenizer), not this
+// module's own tokenize -- FUNCTION_WORDS only strips grammatical words (the, and, for...),
+// so generic-but-content-bearing words survive it on purpose (see tokenize's own comment:
+// stripping "team"/"experience" would erase real requirement content). That trade-off is
+// wrong here: "overlap" is meant to show what's actually distinctive about the match, and
+// words like "business", "experience", "team", "leadership" appear in nearly every posting
+// and nearly every resume, so they show up as "overlap" against anything -- confirmed
+// directly, a Bowling Attendant posting's reported overlap with a hospitality-GM resume was
+// ["business","com","experience","management","goals","internal","leadership","strategies",
+// "team","base"], none of it specific to either document. "com" surviving at all is a
+// separate tokenizer bug this shares with the fix below: URL fragments (linkedin.com,
+// staytidygm.com) split into bare words and pass the length filter alone.
+// discriminativeTokenize's STOPWORDS list already excludes both the generic-business-word
+// class and "com"/"org"/"net"/"www"/"http"/"https".
 function findOverlapTerms(descriptionText, resumeText, limit = 25) {
-  const resumeTerms = new Set(tokenize(resumeText));
+  const resumeTerms = new Set(discriminativeTokenize(resumeText));
   if (resumeTerms.size === 0) return [];
 
   const counts = new Map();
-  for (const token of tokenize(descriptionText)) {
+  for (const token of discriminativeTokenize(descriptionText)) {
     if (!resumeTerms.has(token)) continue;
     counts.set(token, (counts.get(token) || 0) + 1);
   }

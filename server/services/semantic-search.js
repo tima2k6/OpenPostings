@@ -25,6 +25,8 @@ const { getDb, getReadDb, runInWriteTransaction } = require("./runtime-context.j
 
 const FTS_TABLE = "postings_fts";
 const MAX_QUERY_TERMS = 60;
+// position_name, company_name, job_description -- must match FTS_TABLE's column order below.
+const BM25_COLUMN_WEIGHTS = "3.0, 0.5, 1.0";
 
 // Terms that appear in nearly every posting or resume carry no discriminating signal, and
 // including them makes BM25 rank on document length instead of relevance.
@@ -127,10 +129,34 @@ async function writeIndexState(lastIndexedId, indexedCount) {
   );
 }
 
+// FTS5's own `rank` pseudo-column gets a query-planner optimization that an explicit
+// bm25(...) function call in ORDER BY does not: confirmed directly via EXPLAIN QUERY PLAN
+// against the live database (1.24M+ indexed documents) -- `ORDER BY bm25(table, weights)`
+// plans as "USE TEMP B-TREE FOR ORDER BY" (materialise and sort every MATCHing row before
+// LIMIT can drop any), while `ORDER BY rank` does not, regardless of any JOIN. This is what
+// made find_similar_postings hang the whole process: toMatchExpression OR's every query term
+// together, so a multi-word query (a resume, a job description -- exactly this function's
+// intended input) routinely matches a large fraction of the index on common words alone
+// ("manager", "operations", ...), and every one of those matches had to be scored and sorted
+// before a 25-row page could be returned.
+//
+// INSERT INTO fts(fts, rank) VALUES ('rank', 'bm25(...)') is FTS5's documented mechanism for
+// configuring a table's *default* rank weighting -- it persists on the table (a metadata
+// write, not a content scan) and 'rank' picks it up automatically afterwards, no per-query
+// change needed. Idempotent: safe to call every time the index is ensured, including against
+// a table that already exists and was created before this configuration existed.
+async function ensureFtsRankConfigured() {
+  const db = getDb();
+  await db.run(`INSERT INTO ${FTS_TABLE}(${FTS_TABLE}, rank) VALUES ('rank', 'bm25(${BM25_COLUMN_WEIGHTS})');`);
+}
+
 async function ensureFtsIndex() {
   const db = getDb();
   await ensureIndexStateTable();
-  if (await ftsIndexExists()) return false;
+  if (await ftsIndexExists()) {
+    await ensureFtsRankConfigured();
+    return false;
+  }
   // External content: the index stores only the inverted terms and points back at
   // Postings.id, so descriptions are not duplicated on disk.
   await db.exec(`
@@ -143,6 +169,7 @@ async function ensureFtsIndex() {
       tokenize='porter unicode61'
     );
   `);
+  await ensureFtsRankConfigured();
   return true;
 }
 
@@ -247,21 +274,44 @@ async function scoreCandidates(queryText, { limit = 50, pool = 500 } = {}) {
   const terms = buildQueryTerms(queryText);
   if (terms.length === 0) return { terms, rows: [] };
 
-  // bm25() returns a negative score where more-negative is a better match, so ascending
-  // order is best-first. Column weights put the title above the body: a term in the title
-  // says more about the role than the same term buried in boilerplate.
+  // rank (not an explicit bm25(...) call -- see ensureFtsRankConfigured) returns a
+  // negative score where more-negative is a better match, so ascending order is best-first.
+  // Column weights (configured once on the table, title over the body: a term in the title
+  // says more about the role than the same term buried in boilerplate) apply automatically.
+  //
+  // The FTS5 MATCH+ORDER BY rank+LIMIT runs as its own subquery, before the JOIN to
+  // Postings: confirmed via EXPLAIN QUERY PLAN that this is what lets SQLite use FTS5's
+  // top-k pruning (only ever materialising `pool` rows) instead of scoring and sorting
+  // every matching row first. toMatchExpression OR's every query term together, so a
+  // multi-word query routinely matches a large fraction of a 1M+-document index on common
+  // words alone -- computing every one of those matches before the JOIN and outer LIMIT is
+  // what made this hang the whole process (measured directly: 30s+ and unresponsive to
+  // everything else on the connection, for a single call).
   const rows = await db.all(
     `SELECT p.id, p.company_name, p.position_name, p.job_posting_url, p.location,
             p.city, p.state_region, p.country, p.is_remote,
             p.pay_min, p.pay_max, p.pay_currency, p.pay_period,
             p.status, p.location_conflict, p.posting_date,
             p.first_seen_epoch, p.last_seen_epoch, p.hidden,
-            bm25(${FTS_TABLE}, 3.0, 0.5, 1.0) AS relevance
-     FROM ${FTS_TABLE}
-     JOIN Postings p ON p.id = ${FTS_TABLE}.rowid
-     WHERE ${FTS_TABLE} MATCH ?
-     ORDER BY relevance
-     LIMIT ?;`,
+            s.relevance
+     FROM (
+       SELECT rowid, rank AS relevance
+       FROM ${FTS_TABLE}
+       WHERE ${FTS_TABLE} MATCH ?
+       ORDER BY rank
+       LIMIT ?
+     ) s
+     JOIN Postings p ON p.id = s.rowid
+     -- ${FTS_TABLE} is an external-content index: its rows are text captured at index time,
+     -- not a live view of Postings. Nothing re-syncs it when job_description is cleared on a
+     -- posting after indexing (a re-fetch finding the listing gone, for one) -- confirmed
+     -- directly against the live database: a DoorDash "Manager, Local Markets Growth" posting
+     -- with job_description now NULL still matched and returned as a result, on title words
+     -- alone, indistinguishable from a real match. Filtering the *current* column here (not
+     -- trusting what was indexed) is the fix that holds regardless of which write path left
+     -- the index stale, without needing to find and patch every one of them.
+     WHERE p.job_description IS NOT NULL AND TRIM(p.job_description) <> ''
+     ORDER BY s.relevance;`,
     [toMatchExpression(terms), Math.max(limit, Math.min(pool, 2000))]
   );
 
