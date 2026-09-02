@@ -1821,9 +1821,13 @@ async function upsertPostings(postings, lastSeenEpoch) {
 const HIDDEN_POSTING_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 
 // Descriptions are dropped at the moment of hiding. They are the bulk of the database
-// (on a 658k-row instance, 435MB of 931MB lived in 96k descriptions) and nothing reads
-// them once a posting is hidden, so keeping them for the whole retention window is pure
-// disk cost. The row itself stays until deleteExpiredHiddenPostings takes it.
+// (on a 658k-row instance, 435MB of 931MB lived in 96k descriptions), so keeping them for
+// the whole retention window is pure disk cost. The row itself stays until
+// deleteExpiredHiddenPostings takes it.
+//
+// The exception is anchors -- see anchorExistsSql below. "Nothing reads a hidden
+// description" held for every posting except the handful the user has a relationship
+// with, and those are precisely the ones read on purpose.
 // Staleness is measured from last_seen_epoch, not first_seen_epoch: the freshness window
 // asks "has the ATS stopped listing this?", not "how long ago did we discover it?". Keying
 // it off first_seen_epoch gave every posting a hard lifetime from discovery and hid roles
@@ -1832,10 +1836,54 @@ const HIDDEN_POSTING_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 // range scan on idx_postings_hidden_last_seen_epoch; wrapping it narrows nothing and makes
 // this walk every visible row. The upsert always stamps last_seen_epoch, so it is never
 // NULL in practice -- a NULL would simply never be pruned, and the read path hides it too.
+
+// A posting the user applied to or shortlisted is an *anchor*: findSimilarPostings seeds a
+// query from its stored description, and the saved MCP instructions name applied roles
+// explicitly ("run find_similar_postings using the strongest previously approved roles").
+// Anchors are the first postings an ATS stops listing, so the blanket "clear the
+// description when hiding" rule destroyed exactly the set that is read on purpose -- and
+// silently, because a source posting with a title but no description still produces a
+// non-empty query and comes back as title-only noise rather than an error.
+//
+// Anchors are still hidden like anything else; they keep their description and their row.
+// The cost is bounded by how many postings the user has acted on (hundreds, not millions),
+// which is why this is a safe exception to a rule that exists to reclaim disk.
+//
+// posting_application_state is created by the API at startup, and shortlisted_at_epoch
+// arrived later as an ALTER TABLE, so the sync can reach the prune paths against a database
+// that has neither, or has the table without that column. The predicate is therefore built
+// from the columns actually present rather than assuming today's schema -- the alternative
+// is a prune that dies on "no such column" mid-sync. "0" means no posting is an anchor,
+// which is exactly the pre-existing behaviour.
+async function anchorExistsSql(db) {
+  let columns = [];
+  try {
+    columns = await db.all(`PRAGMA table_info('posting_application_state');`);
+  } catch {
+    return "0";
+  }
+  const names = new Set((columns || []).map((column) => String(column?.name || "")));
+  if (names.size === 0) return "0";
+
+  const clauses = [];
+  if (names.has("applied")) clauses.push("COALESCE(state.applied, 0) = 1");
+  if (names.has("shortlisted_at_epoch")) clauses.push("state.shortlisted_at_epoch IS NOT NULL");
+  if (clauses.length === 0) return "0";
+
+  return `
+      EXISTS (
+        SELECT 1
+        FROM posting_application_state state
+        WHERE state.job_posting_url = Postings.job_posting_url
+          AND (${clauses.join(" OR ")})
+      )`;
+}
+
 async function pruneExpiredPostings(referenceEpoch = nowEpochSeconds()) {
   const resolvedReferenceEpoch = Number(referenceEpoch || nowEpochSeconds());
   const cutoffEpoch = resolvedReferenceEpoch - getPostingFreshnessWindowSeconds();
   const db = getDb()
+  const anchorExists = await anchorExistsSql(db);
   const result = await db.run(
     `
       UPDATE Postings
@@ -1845,7 +1893,7 @@ async function pruneExpiredPostings(referenceEpoch = nowEpochSeconds()) {
         -- The ATS has stopped listing this. Distinct from a posting that is still listed
         -- but older than the date window; only this kind is genuinely gone.
         hidden_reason = 'delisted',
-        job_description = NULL
+        job_description = CASE WHEN ${anchorExists} THEN job_description ELSE NULL END
       WHERE hidden = 0
         AND last_seen_epoch < ?;
     `,
@@ -1862,13 +1910,17 @@ async function deleteExpiredHiddenPostings(referenceEpoch = nowEpochSeconds()) {
   const cutoffEpoch = resolvedReferenceEpoch - HIDDEN_POSTING_RETENTION_SECONDS;
   const db = getDb();
 
+  const anchorExists = await anchorExistsSql(db);
   const rows = await db.all(
     `
       SELECT id
       FROM Postings
       WHERE hidden = 1
         AND hidden_at_epoch IS NOT NULL
-        AND hidden_at_epoch < ?;
+        AND hidden_at_epoch < ?
+        -- Retention takes the tombstone; it must not take an anchor, or seeding a
+        -- similarity search from a role the user applied to fails outright.
+        AND NOT ${anchorExists};
     `,
     [cutoffEpoch]
   );
@@ -1921,6 +1973,7 @@ async function prunePostingsOutsideDateWindow(referenceEpoch = nowEpochSeconds()
 
   if (idsToHide.length === 0) return 0;
 
+  const anchorExists = await anchorExistsSql(db);
   let totalHidden = 0;
   await runInWriteTransaction(async (handle) => {
     const chunkSize = 800;
@@ -1938,7 +1991,7 @@ async function prunePostingsOutsideDateWindow(referenceEpoch = nowEpochSeconds()
             -- remain applyable, which is why they are worth telling apart from delisted
             -- ones rather than both being a bare hidden = 1.
             hidden_reason = 'outside_date_window',
-            job_description = NULL
+            job_description = CASE WHEN ${anchorExists} THEN job_description ELSE NULL END
           WHERE hidden = 0
             AND id IN (${placeholders});
         `,
@@ -2260,4 +2313,4 @@ module.exports = {
   // observable through the ordering plus the progress marks.
   getCompaniesForSync,
   markCompanySynced,
-  flushCompanySyncMarks, runAtsSync, getSyncScopeStats, pruneExpiredPostings, deleteExpiredHiddenPostings, createCanonicalPostingsTable, ensurePostingLocationStateIndex, upsertPostingsBatch, syncStatus, startSyncStallWatchdog, recoverStalledSync, createSerialFlushQueue };
+  flushCompanySyncMarks, runAtsSync, getSyncScopeStats, pruneExpiredPostings, prunePostingsOutsideDateWindow, deleteExpiredHiddenPostings, createCanonicalPostingsTable, ensurePostingLocationStateIndex, upsertPostingsBatch, syncStatus, startSyncStallWatchdog, recoverStalledSync, createSerialFlushQueue };

@@ -158,10 +158,38 @@ async function testStaleIndexEntryWithClearedDescriptionIsExcluded() {
   );
 }
 
+// Regression: seeding from a posting whose description had been cleared produced a
+// query of two or three title words, and BM25 happily ranked whatever repeated them --
+// "Sr. Manager, In-Store S&O" came back as in-store retail clerks. Noise shaped exactly
+// like results is worse than an error, so this now refuses rather than guessing.
+async function testSeedingFromDescriptionlessPostingFailsLoudly() {
+  await withIndexedPostings(
+    [
+      { id: 1, position_name: "In-Store Sales Representative", job_description: "Greet customers in store and generate retail leads in store." },
+      { id: 2, position_name: "In-Store Merchandiser", job_description: "Maintain in store displays and merchandise retail shelves in store." }
+    ],
+    async (db) => {
+      await db.run(`INSERT INTO Postings (id, position_name, company_name, job_description, job_posting_url, hidden)
+                    VALUES (3, 'Sr. Manager, In-Store S&O', 'DoorDash', NULL, 'https://x/anchor', 1);`);
+
+      await assert.rejects(
+        () => findSimilarPostings({ job_posting_url: "https://x/anchor" }),
+        /no stored description/i,
+        "a title-only seed must raise, not return title-word matches"
+      );
+
+      // The same call with real text still works -- the guard is about the seed, not the search.
+      const ok = await findSimilarPostings({ text: "in store retail merchandising displays", limit: 5 });
+      assert.ok(ok.items.length > 0, "seeding from text is unaffected");
+    }
+  );
+}
+
 async function main() {
   await testFindSimilarPostingsReturnsRankedRelevantResults();
   await testScoringQueryPlanAvoidsTempBTree();
   await testStaleIndexEntryWithClearedDescriptionIsExcluded();
+  await testSeedingFromDescriptionlessPostingFailsLoudly();
   console.log("semantic-search-scoring tests passed");
 }
 

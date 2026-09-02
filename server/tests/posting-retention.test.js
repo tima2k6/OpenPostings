@@ -8,9 +8,12 @@ const { setDb, getDb } = require("../services/runtime-context.js");
 const {
   createCanonicalPostingsTable,
   pruneExpiredPostings,
+  prunePostingsOutsideDateWindow,
   deleteExpiredHiddenPostings,
   upsertPostingsBatch
 } = require("../services/sync-runtime.js");
+
+const { selectAnchorRowsToRecover } = require("../services/posting-page-fetcher.js");
 
 const DAY_SECONDS = 24 * 60 * 60;
 const NOW = 1800000000;
@@ -25,6 +28,37 @@ async function seedPosting(db, { url, firstSeen, lastSeen, hidden = 0, hiddenAt 
       VALUES ('Acme', 'Engineer', ?, ?, ?, ?, ?, ?);
     `,
     [url, description, firstSeen, lastSeen === undefined ? firstSeen : lastSeen, hidden, hiddenAt]
+  );
+}
+
+// The API creates this at startup; the prune paths have to work with and without it, so
+// tests opt in per case rather than it being part of the canonical schema.
+async function createApplicationStateTable(db) {
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS posting_application_state (
+      job_posting_url TEXT NOT NULL PRIMARY KEY,
+      applied INTEGER NOT NULL DEFAULT 0,
+      applied_by_type TEXT NOT NULL DEFAULT '',
+      applied_by_label TEXT NOT NULL DEFAULT '',
+      applied_at_epoch INTEGER,
+      last_application_id INTEGER,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      ignored INTEGER NOT NULL DEFAULT 0,
+      ignored_at_epoch INTEGER,
+      ignored_by_label TEXT NOT NULL DEFAULT '',
+      review_state TEXT NOT NULL DEFAULT 'unseen',
+      review_state_changed_at_epoch INTEGER,
+      viewed_at_epoch INTEGER,
+      shortlisted_at_epoch INTEGER
+    );
+  `);
+}
+
+async function markState(db, url, { applied = 0, ignored = 0, shortlistedAt = null } = {}) {
+  await db.run(
+    `INSERT INTO posting_application_state (job_posting_url, applied, ignored, shortlisted_at_epoch, applied_by_type, applied_by_label)
+     VALUES (?, ?, ?, ?, '', '');`,
+    [url, applied, ignored, shortlistedAt]
   );
 }
 
@@ -188,6 +222,124 @@ async function testDeleteIsNoOpWhenNothingExpired() {
   });
 }
 
+// Regression: hiding a posting cleared its description, which destroyed exactly the
+// postings findSimilarPostings seeds from -- the applied roles the saved MCP instructions
+// name as anchors. Six DoorDash and Expedia anchors were found stripped on the live
+// database, so seeding from them returned title-only noise.
+async function testAppliedPostingKeepsDescriptionWhenDelisted() {
+  await withDb(async (db) => {
+    await createApplicationStateTable(db);
+    await seedPosting(db, { url: "https://x/applied", firstSeen: NOW - 30 * DAY_SECONDS, lastSeen: NOW - 3 * DAY_SECONDS });
+    await seedPosting(db, { url: "https://x/untouched", firstSeen: NOW - 30 * DAY_SECONDS, lastSeen: NOW - 3 * DAY_SECONDS });
+    await markState(db, "https://x/applied", { applied: 1 });
+
+    const hiddenCount = await pruneExpiredPostings(NOW);
+    assert.strictEqual(hiddenCount, 2, "both delisted postings must still be hidden");
+
+    const anchor = await db.get(`SELECT hidden, job_description FROM Postings WHERE job_posting_url = 'https://x/applied';`);
+    assert.strictEqual(Number(anchor.hidden), 1, "an anchor is still hidden -- it is not a live posting");
+    assert.strictEqual(anchor.job_description, "body", "an applied posting must keep its description to seed similarity from");
+
+    const other = await db.get(`SELECT job_description FROM Postings WHERE job_posting_url = 'https://x/untouched';`);
+    assert.strictEqual(other.job_description, null, "postings the user never acted on still give their description back");
+  });
+}
+
+async function testShortlistedPostingIsAlsoAnAnchor() {
+  await withDb(async (db) => {
+    await createApplicationStateTable(db);
+    await seedPosting(db, { url: "https://x/shortlisted", firstSeen: NOW - 30 * DAY_SECONDS, lastSeen: NOW - 3 * DAY_SECONDS });
+    await seedPosting(db, { url: "https://x/ignored", firstSeen: NOW - 30 * DAY_SECONDS, lastSeen: NOW - 3 * DAY_SECONDS });
+    await markState(db, "https://x/shortlisted", { shortlistedAt: NOW - DAY_SECONDS });
+    await markState(db, "https://x/ignored", { ignored: 1 });
+
+    await pruneExpiredPostings(NOW);
+
+    const shortlisted = await db.get(`SELECT job_description FROM Postings WHERE job_posting_url = 'https://x/shortlisted';`);
+    assert.strictEqual(shortlisted.job_description, "body", "a shortlisted posting is a candidate anchor and keeps its description");
+
+    const ignored = await db.get(`SELECT job_description FROM Postings WHERE job_posting_url = 'https://x/ignored';`);
+    assert.strictEqual(ignored.job_description, null, "ignoring a posting is a decision against it, not a reason to keep it");
+  });
+}
+
+async function testAnchorKeepsDescriptionOutsideDateWindow() {
+  await withDb(async (db) => {
+    await createApplicationStateTable(db);
+    const stalePostingDate = new Date((NOW - 400 * DAY_SECONDS) * 1000).toISOString();
+    for (const url of ["https://x/anchor-dated", "https://x/plain-dated"]) {
+      await db.run(
+        `INSERT INTO Postings (company_name, position_name, job_posting_url, job_description,
+           first_seen_epoch, last_seen_epoch, hidden, posting_date)
+         VALUES ('Acme', 'Engineer', ?, 'body', ?, ?, 0, ?);`,
+        [url, NOW - 400 * DAY_SECONDS, NOW, stalePostingDate]
+      );
+    }
+    await markState(db, "https://x/anchor-dated", { applied: 1 });
+
+    await prunePostingsOutsideDateWindow(NOW);
+
+    const anchor = await db.get(`SELECT hidden, job_description FROM Postings WHERE job_posting_url = 'https://x/anchor-dated';`);
+    assert.strictEqual(Number(anchor.hidden), 1, "the date-window prune still hides an anchor");
+    assert.strictEqual(anchor.job_description, "body", "the date-window path must preserve anchors too, not just the delisted path");
+
+    const plain = await db.get(`SELECT job_description FROM Postings WHERE job_posting_url = 'https://x/plain-dated';`);
+    assert.strictEqual(plain.job_description, null, "ordinary postings outside the date window still give their description back");
+  });
+}
+
+// Preserving the description is not enough on its own: retention deletes the whole row 30
+// days after hiding, which would take the anchor with it.
+async function testRetentionNeverDeletesAnAnchor() {
+  await withDb(async (db) => {
+    await createApplicationStateTable(db);
+    await seedPosting(db, { url: "https://x/anchor-old", firstSeen: NOW - 60 * DAY_SECONDS, hidden: 1, hiddenAt: NOW - 31 * DAY_SECONDS });
+    await seedPosting(db, { url: "https://x/plain-old", firstSeen: NOW - 60 * DAY_SECONDS, hidden: 1, hiddenAt: NOW - 31 * DAY_SECONDS });
+    await markState(db, "https://x/anchor-old", { applied: 1 });
+
+    const deleted = await deleteExpiredHiddenPostings(NOW);
+    assert.strictEqual(deleted, 1, "only the non-anchor should be deleted");
+
+    const remaining = await db.all(`SELECT job_posting_url FROM Postings ORDER BY job_posting_url;`);
+    assert.deepStrictEqual(
+      remaining.map((row) => row.job_posting_url),
+      ["https://x/anchor-old"],
+      "a posting the user applied to must outlive the retention window"
+    );
+  });
+}
+
+// The preservation fix stops new anchors being stripped, but 45 existing ones had already
+// lost their text. Only the 'outside_date_window' ones are worth re-fetching: the employer
+// still lists those, whereas a 'delisted' posting is gone from the board.
+async function testAnchorRecoverySelectsOnlyStillListedAnchors() {
+  await withDb(async (db) => {
+    await createApplicationStateTable(db);
+    const cases = [
+      ["https://x/recover-me", 1, "outside_date_window", null],
+      ["https://x/delisted-anchor", 1, "delisted", null],
+      ["https://x/anchor-has-text", 1, "outside_date_window", "body"],
+      ["https://x/not-an-anchor", 0, "outside_date_window", null]
+    ];
+    for (const [url, applied, reason, description] of cases) {
+      await db.run(
+        `INSERT INTO Postings (company_name, position_name, job_posting_url, job_description,
+           first_seen_epoch, last_seen_epoch, hidden, hidden_at_epoch, hidden_reason)
+         VALUES ('Acme', 'Engineer', ?, ?, ?, ?, 1, ?, ?);`,
+        [url, description, NOW - 40 * DAY_SECONDS, NOW - DAY_SECONDS, NOW - DAY_SECONDS, reason]
+      );
+      await markState(db, url, { applied });
+    }
+
+    const rows = await selectAnchorRowsToRecover(db, 50);
+    assert.deepStrictEqual(
+      rows.map((row) => row.job_posting_url),
+      ["https://x/recover-me"],
+      "recovery targets anchors the employer still lists whose description is missing -- nothing else"
+    );
+  });
+}
+
 async function main() {
   await testPruneHidesAndClearsDescriptions();
   await testPruneKeepsOriginalHiddenAtEpoch();
@@ -196,6 +348,11 @@ async function main() {
   await testDeleteRespectsRetentionWindow();
   await testDeleteChunksBeyondOneBatch();
   await testDeleteIsNoOpWhenNothingExpired();
+  await testAppliedPostingKeepsDescriptionWhenDelisted();
+  await testShortlistedPostingIsAlsoAnAnchor();
+  await testAnchorKeepsDescriptionOutsideDateWindow();
+  await testRetentionNeverDeletesAnAnchor();
+  await testAnchorRecoverySelectsOnlyStillListedAnchors();
   console.log("posting-retention tests passed");
 }
 
