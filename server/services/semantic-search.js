@@ -342,8 +342,20 @@ async function findSimilarPostings(options = {}) {
         );
     if (!row) throw new Error(`No posting found for '${postingRef}'.`);
     sourcePosting = { id: row.id, position_name: row.position_name };
+    // A title alone is not a usable seed. BM25 over two or three title words ranks on
+    // whichever postings happen to repeat them, so "Sr. Manager, In-Store S&O" came back
+    // as in-store retail clerks -- results indistinguishable in shape from a real match.
+    // Failing here is the honest outcome: the caller can pass text= instead. Descriptions
+    // used to be cleared from every hidden posting, which is what made this reachable for
+    // the applied roles most worth seeding from; sync-runtime now preserves those anchors.
+    if (!String(row.job_description || "").trim()) {
+      throw new Error(
+        `Posting '${postingRef}' has no stored description to compare against, so only its ` +
+          `title would be matched -- which returns noise rather than similar roles. Pass text= ` +
+          `with the description or a paragraph describing the work instead.`
+      );
+    }
     queryText = `${row.position_name || ""}\n${row.job_description || ""}`.trim();
-    if (!queryText) throw new Error(`Posting '${postingRef}' has no stored description to compare against.`);
   }
 
   if (!queryText) throw new Error("similar_to requires either text or a posting id/url.");

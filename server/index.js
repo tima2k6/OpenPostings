@@ -1543,7 +1543,11 @@ function createServer() {
         await runDescriptionBackfill({
           limit: parseNonNegativeInteger(req.body?.limit) || 200,
           concurrency: parseNonNegativeInteger(req.body?.concurrency) || 4,
-          refresh_all: normalizeBoolean(req.body?.refresh_all, false)
+          refresh_all: normalizeBoolean(req.body?.refresh_all, false),
+          // Recovers descriptions for applied/shortlisted postings that were stripped
+          // before the sync learned to preserve them. Off by default: it is the only mode
+          // that spends fetches on hidden rows.
+          anchors_only: normalizeBoolean(req.body?.anchors_only, false)
         })
       );
     } catch (error) {

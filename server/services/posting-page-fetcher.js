@@ -125,6 +125,160 @@ function extractDescriptionTextFromHtml(html) {
 }
 
 // ---------------------------------------------------------------------------
+// Application-form and legal boilerplate
+// ---------------------------------------------------------------------------
+
+// CONTENT_CONTAINER_PATTERNS deliberately runs a match to the end of the file -- losing
+// body text is worse than over-capturing -- so what gets stored is the role followed by
+// whatever the page puts after it: the EEO self-identification survey, the application
+// form's own UI, and the employer's legal footer.
+//
+// That tail is not inert. buildQueryTerms ranks a similarity query by raw term frequency,
+// and the survey repeats "select", "veteran", "disability", "status", "gender" more often
+// than the role states its own subject. Seeding from a real Strategy & Operations posting
+// produced: ethos, veteran, business, select, disability, across, initiatives, life,
+// product, status, disorder -- twelve of the top twenty-five terms from the form, and
+// results to match. The same text also inflates every description's length, which BM25
+// uses for normalisation.
+//
+// Two passes, because the boilerplate comes in two shapes. Everything from the point the
+// application form starts is dropped outright; scattered legal sentences and form-widget
+// fragments are dropped line by line.
+
+// Lines that mean "the posting has ended and the form begins". Only honoured past
+// TAIL_CUT_MIN_RATIO of the text, so a posting that merely mentions one of these phrases
+// early -- an EEO-forward employer describing its own hiring practice -- keeps its body.
+const APPLICATION_TAIL_MARKERS = [
+  /^voluntary self[-\s]?identification/i,
+  /^self[-\s]?identification of disability/i,
+  /public burden statement/i,
+  /paperwork reduction act/i,
+  /omb control number/i,
+  /^(?:apply for this job|apply now|submit application|start your application|application form)\b/i,
+  /^equal employment opportunity information/i,
+  /^gender\s*\*?\s*select/i,
+  /are you hispanic or latin[xo]\b/i,
+  /^race\s*\*?\s*(?:\(|select)/i,
+  /^(?:protected )?veteran status\s*\*?\s*select/i,
+  /^disability status\s*\*?\s*select/i,
+  /^how do you want to be addressed/i,
+  /all fields marked with \*+ are required/i
+];
+
+// Dropped wherever they appear: form widgets, portal chrome, and the legal notices that
+// are identical across thousands of postings and so carry no distinguishing signal.
+const BOILERPLATE_LINE_PATTERNS = [
+  /select\.\.\./i,
+  /^\s*-?\s*select\s*\*?\s*$/i,
+  /message (?:and data rates may apply|frequency will vary)/i,
+  /logged out due to inactivity/i,
+  /keep your session active/i,
+  /^last refresh:/i,
+  /participates in e-verify/i,
+  /\be-verify\b.*\b(?:social security administration|department of homeland security)\b/i,
+  /^share (?:on|this job)\b/i,
+  /you(?:'|’)?ve already applied for this job/i,
+  /your application has been successfully submitted/i,
+  /^(?:all done!|send|submit|back to all jobs|other jobs|powered by\b).{0,40}$/i,
+  /qualified applicants with (?:arrest or conviction|criminal) records/i,
+  /fair chance (?:ordinance|act|initiative)/i,
+  /lie detector test as a condition of employment/i,
+  /(?:reasonable )?accommodation.{0,80}(?:please )?(?:contact|email|call)\b/i,
+  /if you (?:require|need) (?:an? )?accommodation/i,
+  /^\s*[\w.+-]+@[\w-]+\.[\w.]+\s*$/,
+  /this (?:employer|company) is an equal opportunity employer/i,
+  /\bE\.?O\.?E\.?\b.{0,30}$/
+];
+
+// A protected-class list is the one reliable tell for an EEO statement, whose wording
+// varies too much to enumerate. Three or more classes in a sentence that also carries
+// discrimination language is a legal notice, not a description of the work.
+const PROTECTED_CLASS_TOKENS = /\b(?:race|color|colour|religion|creed|sex|gender identity|gender expression|sexual orientation|national origin|ancestry|age|disabilit(?:y|ies)|veteran status|marital status|pregnancy|genetic information|citizenship|military status|protected class)\b/gi;
+const DISCRIMINATION_CONTEXT = /\b(?:without regard to|regardless of|protected by (?:applicable )?law|equal (?:opportunity|employment)|discriminat|affirmative action)\b/i;
+
+function looksLikeEeoStatement(line) {
+  if (!DISCRIMINATION_CONTEXT.test(line)) return false;
+  const matches = String(line).match(PROTECTED_CLASS_TOKENS);
+  return Boolean(matches && matches.length >= 3);
+}
+
+// Never trust the patterns enough to gut a posting: if stripping removed most of the text,
+// something matched that should not have, and the original is the safer answer.
+const TAIL_CUT_MIN_RATIO = 0.3;
+const STRIP_MIN_KEPT_RATIO = 0.4;
+const STRIP_MIN_KEPT_CHARS = 200;
+// Workday and other JSON-LD boards hand back the whole description as one unbroken line --
+// 10,092 characters with no newline in a measured Expedia posting -- so filtering by line
+// alone would leave every one of them untouched. Long lines are split into sentences and
+// filtered at that granularity, which is also what lets the tail cut land mid-paragraph.
+const SEGMENT_SPLIT_MIN_LINE_CHARS = 300;
+// Some boards store the description with its markup intact, so a "sentence" can come back
+// as a 4,000-character blob that sentence splitting cannot break up. Dropping one of those
+// because a legal notice is buried inside it costs the whole block of real content -- a Bob
+// Evans posting lost its benefits and purpose sections that way. Boilerplate sentences are
+// short; anything this long is mixed content and is kept whatever it matches.
+const MAX_DROPPABLE_SEGMENT_CHARS = 600;
+
+function toSegments(text) {
+  const segments = [];
+  for (const line of String(text).split("\n")) {
+    if (line.length <= SEGMENT_SPLIT_MIN_LINE_CHARS) {
+      segments.push({ text: line, startsLine: true });
+      continue;
+    }
+    const sentences = line.split(/(?<=[.!?])\s+/);
+    sentences.forEach((sentence, index) => {
+      segments.push({ text: sentence, startsLine: index === 0 });
+    });
+  }
+  return segments;
+}
+
+function joinSegments(segments) {
+  let out = "";
+  segments.forEach((segment, index) => {
+    if (index === 0) out = segment.text;
+    else out += segment.startsLine ? `\n${segment.text}` : ` ${segment.text}`;
+  });
+  return out;
+}
+
+function stripApplicationBoilerplate(text) {
+  const original = String(text || "");
+  if (original.length < STRIP_MIN_KEPT_CHARS) return original;
+
+  const segments = toSegments(original);
+  const totalChars = original.length;
+
+  let cutIndex = -1;
+  let consumed = 0;
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index].text.trim();
+    consumed += segments[index].text.length + 1;
+    if (!segment) continue;
+    if (consumed / totalChars < TAIL_CUT_MIN_RATIO) continue;
+    if (APPLICATION_TAIL_MARKERS.some((pattern) => pattern.test(segment))) {
+      cutIndex = index;
+      break;
+    }
+  }
+
+  const kept = (cutIndex >= 0 ? segments.slice(0, cutIndex) : segments).filter((segment) => {
+    const line = segment.text.trim();
+    if (!line) return true;
+    if (line.length > MAX_DROPPABLE_SEGMENT_CHARS) return true;
+    if (BOILERPLATE_LINE_PATTERNS.some((pattern) => pattern.test(line))) return false;
+    if (looksLikeEeoStatement(line)) return false;
+    return true;
+  });
+
+  const stripped = joinSegments(kept).replace(/\n{3,}/g, "\n\n").trim();
+  if (stripped.length < STRIP_MIN_KEPT_CHARS) return original;
+  if (stripped.length / original.length < STRIP_MIN_KEPT_RATIO) return original;
+  return stripped;
+}
+
+// ---------------------------------------------------------------------------
 // Pay from prose
 // ---------------------------------------------------------------------------
 
@@ -356,7 +510,7 @@ async function inspectPostingPage(url) {
   if (description.length < 100) {
     description = extractDescriptionTextFromHtml(html);
   }
-  description = description.slice(0, MAX_DESCRIPTION_CHARS);
+  description = stripApplicationBoilerplate(description).slice(0, MAX_DESCRIPTION_CHARS);
 
   // A single-page app serves the same shell for a live posting and a deleted one, and
   // renders the 404 only after its JS runs -- Dover does exactly this. Server-side there
@@ -487,11 +641,33 @@ const DESCRIPTION_FETCH_FAILURE_COOLDOWN_SECONDS = Number(
 // demand for the handful actually being considered, which is where the liveness and
 // hiring-restriction fields earn their keep. refresh_all widens this to re-visit rows
 // whose fetch has gone stale, which is what notices postings that have died since.
-async function runDescriptionBackfill({ limit = 200, concurrency = 4, refresh_all = false, max_age_seconds = 7 * 86400 } = {}) {
+// anchors_only re-fetches the descriptions of postings the user applied to or shortlisted
+// whose text was cleared before sync-runtime started preserving them. It is deliberately
+// separate from the normal backfill and off by default: those rows are hidden, and the
+// `hidden = 0` guard on the queries below is right for every other purpose -- a hidden
+// posting is not a thing to spend fetches on. It is scoped to 'outside_date_window', the
+// hidden_reason that means the employer still lists the role, because a 'delisted' posting
+// is gone from the board and re-fetching it only burns a request on a 404.
+async function selectAnchorRowsToRecover(db, limit) {
+  return db.all(
+    `SELECT p.id, p.job_posting_url, p.locations_json, p.pay_min, p.pay_max
+       FROM posting_application_state state
+       JOIN Postings p ON p.job_posting_url = state.job_posting_url
+      WHERE (COALESCE(state.applied, 0) = 1 OR state.shortlisted_at_epoch IS NOT NULL)
+        AND p.hidden = 1
+        AND p.hidden_reason = 'outside_date_window'
+        AND (p.job_description IS NULL OR TRIM(p.job_description) = '')
+      ORDER BY p.last_seen_epoch DESC
+      LIMIT ?;`,
+    [limit]
+  );
+}
+
+async function runDescriptionBackfill({ limit = 200, concurrency = 4, refresh_all = false, anchors_only = false, max_age_seconds = 7 * 86400 } = {}) {
   const db = getDb();
   const cutoff = nowEpochSeconds() - Math.max(3600, Number(max_age_seconds) || 7 * 86400);
   const failureCutoff = nowEpochSeconds() - DESCRIPTION_FETCH_FAILURE_COOLDOWN_SECONDS;
-  const rows = await db.all(
+  const rows = anchors_only ? await selectAnchorRowsToRecover(db, limit) : await db.all(
     refresh_all
       ? `SELECT id, job_posting_url, locations_json, pay_min, pay_max
          FROM Postings
@@ -537,6 +713,8 @@ module.exports = {
   inspectPostingPage,
   refreshPostingFromPage,
   runDescriptionBackfill,
+  selectAnchorRowsToRecover,
+  stripApplicationBoilerplate,
   extractPayFromText,
   extractHiringLocations,
   headerConflictsWithHiringLocations,
