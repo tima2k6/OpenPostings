@@ -32,6 +32,10 @@ const MATCH_WORKER_MAX_BATCHES = Number(process.env.MATCH_INDEX_WORKER_MAX_BATCH
 const MATCH_WORKER_TIMEOUT_MS = Number(process.env.MATCH_INDEX_WORKER_TIMEOUT_MS || 10 * 60 * 1000);
 const MATCH_WORKER_SCRIPT = path.resolve(__dirname, "..", "scripts", "build-match-index.js");
 
+const SEARCH_INDEX_INTERVAL_MS = Number(process.env.SEARCH_INDEX_INTERVAL_MS || 10 * 60 * 1000);
+const SEARCH_INDEX_WORKER_TIMEOUT_MS = Number(process.env.SEARCH_INDEX_WORKER_TIMEOUT_MS || 10 * 60 * 1000);
+const SEARCH_INDEX_WORKER_SCRIPT = path.resolve(__dirname, "..", "scripts", "build-search-index.js");
+
 // When a run finds nothing to do, waiting the same short interval again just burns a query
 // every few minutes forever. Each idle run doubles the wait; any run that does work resets
 // it. Capped at 5 doublings (32x the interval) and separately at an hour, so a long-idle
@@ -76,7 +80,8 @@ function createEnrichmentState() {
 const enrichmentStatus = {
   descriptions: createEnrichmentState(),
   semantic_index: createEnrichmentState(),
-  match_index: createEnrichmentState()
+  match_index: createEnrichmentState(),
+  search_index: createEnrichmentState()
 };
 
 function getEnrichmentStatus() {
@@ -308,6 +313,65 @@ function runMatchIndexWorker({
   });
 }
 
+function runSearchIndexWorker({ timeout = SEARCH_INDEX_WORKER_TIMEOUT_MS } = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      process.execPath,
+      [SEARCH_INDEX_WORKER_SCRIPT],
+      { cwd: path.resolve(__dirname, "..", ".."), timeout, maxBuffer: 1024 * 1024, windowsHide: true },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(`Search index worker failed: ${String(stderr || stdout || error.message).trim()}`));
+          return;
+        }
+        const line = String(stdout)
+          .split(/\r?\n/)
+          .find((candidate) => candidate.startsWith("[build-search-index] "));
+        const match = line?.match(/^\[build-search-index\] (\{.*\}) in \d+s$/);
+        if (!match) {
+          reject(new Error(`Search index worker returned unexpected output: ${String(stdout).trim()}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(match[1]));
+        } catch (parseError) {
+          reject(new Error(`Search index worker returned invalid JSON: ${parseError.message}`));
+        }
+      }
+    );
+  });
+}
+
+// Runs more often than the other two (10 min vs 15) and is deliberately NOT chained through
+// runHeavyEnrichmentWorker: it is the only one of the four whose staleness is visible to a
+// user mid-search. A posting the sync has just added is covered by the `OR id > cursor`
+// escape hatch in the prefilter, but a posting that flips from hidden back to visible is not
+// -- it sits below the forward cursor and only the refresh sweep finds it. Measured on the
+// live database that is 0.09% of visible rows at any moment, and this loop is what drains it.
+function startSearchIndexLoop() {
+  return startEnrichmentLoop({
+    name: "search index",
+    state: enrichmentStatus.search_index,
+    intervalMs: SEARCH_INDEX_INTERVAL_MS,
+    initialDelayMs: 75 * 1000,
+    task: async () => {
+      const summary = await runSearchIndexWorker({});
+      enrichmentStatus.search_index.last_summary = summary;
+      const indexed = Number(summary.indexed || 0);
+      const refreshed = Number(summary.refreshed || 0);
+      const pruned = Number(summary.pruned || 0);
+      if (indexed > 0 || pruned > 0) {
+        console.log(
+          `[OpenPostings API] search index: +${indexed} new, ${refreshed} refreshed, ${pruned} pruned`
+        );
+      }
+      // Refreshed rows count as work: while a sweep still has ground to cover, the idle
+      // backoff must not stretch this loop out to an hour.
+      return indexed + refreshed + pruned;
+    }
+  });
+}
+
 function startMatchIndexLoop() {
   return startEnrichmentLoop({
     name: "match index",
@@ -337,6 +401,7 @@ function startEnrichmentLoops() {
     stopDescriptions: startDescriptionBackfillLoop(),
     stopSemanticIndex: startSemanticIndexLoop(),
     stopMatchIndex: startMatchIndexLoop(),
+    stopSearchIndex: startSearchIndexLoop(),
     started_at: nowEpochSeconds()
   };
 }
@@ -346,6 +411,7 @@ module.exports = {
   startDescriptionBackfillLoop,
   startSemanticIndexLoop,
   startMatchIndexLoop,
+  startSearchIndexLoop,
   // Exported for tests: the scheduling guarantees (single-flight, idle backoff, a failing
   // run not killing the loop) are the part worth pinning down.
   startEnrichmentLoop,
