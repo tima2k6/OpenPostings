@@ -97,7 +97,7 @@ const {
 } = require("./services/enrichment-runtime.js");
 const { startWriteLivenessWatchdog, getWriteLivenessStatus } = require("./services/write-liveness.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
-const { listPostingsWithFilters, getPostingsByUrls, setPostingIgnoredState, getCounts, getWideScanStats } = require("./services/postings.js");
+const { listPostingsWithFilters, getPostingsByUrls, setPostingIgnoredState, getCounts, getCachedCounts, getWideScanStats } = require("./services/postings.js");
 const { ensurePostingReviewSchema, setPostingReviewState } = require("./services/posting-review.js");
 const {
   ensureSavedJobSearchesTable,
@@ -110,7 +110,7 @@ const { getPostingFilterOptions } = require("./services/filter-options.js");
 const { extractDocumentText, getApplicantDocument, saveApplicantDocument, listApplicantDocuments, deleteApplicantDocument, checkConfiguredDocumentPaths, normalizeDocumentKind, MAX_DOCUMENT_KEY_LENGTH, APPLICANT_DOCUMENT_KINDS } = require("./services/applicant-documents.js");
 const { ensureApplicationAnswersTable, listApplicationAnswers, setApplicationAnswers, clearApplicationAnswer } = require("./services/application-answers.js");
 const { ensureErrorLogTable, recordError, listErrors, acknowledgeErrors } = require("./services/error-log.js");
-const { getDb, setDb, setReaderDb, setStatusReaderDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
+const { getDb, setDb, setReaderDb, setStatusReaderDb, getStatusReadDb, getSyncPromise, getAtsRequestQueueConcurrency } = require("./services/runtime-context.js");
 const { getAtsRequestQueueStats } = require("./services/queue.js");
 
 const cors = require("cors");
@@ -1638,12 +1638,33 @@ function createServer() {
     res.json({ ...getEnrichmentStatus(), write_liveness: getWriteLivenessStatus() });
   });
 
+  // A liveness probe must not depend on the slowest queries in the process. This used to
+  // await getCounts(), i.e. three COUNT(*) scans, which on a cold page cache made /health
+  // the *first* endpoint to fail rather than the last -- it reported "down" for a server
+  // that was merely warming up, and on 2026-08-19 it took 243s behind a wide scan. The only
+  // two consumers (the Windows launcher readiness probe and the lite benchmark) check the
+  // status code and db_path, never the counts.
+  //
+  // So: confirm the process answers and its status reader is usable, and include counts only
+  // when they are already cached. The refresh is kicked off but never awaited.
   app.get("/health", async (_req, res) => {
-    const counts = await getCounts();
+    try {
+      await getStatusReadDb().get("SELECT 1;");
+    } catch (error) {
+      return res.status(503).json({
+        ok: false,
+        db_path: DB_PATH,
+        error: String(error?.message || error)
+      });
+    }
+
+    const cachedCounts = getCachedCounts();
+    if (!cachedCounts) getCounts().catch(() => {});
+
     res.json({
       ok: true,
       db_path: DB_PATH,
-      ...counts
+      ...(cachedCounts || {})
     });
   });
 

@@ -16,7 +16,8 @@ async function testBoundedIndexingResumesFromPersistedState() {
         id INTEGER PRIMARY KEY,
         position_name TEXT,
         company_name TEXT,
-        job_description TEXT
+        job_description TEXT,
+        hidden INTEGER NOT NULL DEFAULT 0
       );
     `);
     for (let id = 1; id <= 5; id += 1) {
