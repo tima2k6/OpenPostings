@@ -256,9 +256,19 @@ async function rebuildSemanticIndex({
     // of 1.59M indexed documents -- roughly 1.39M documents that no query could ever return.
     // They cannot be deleted retroactively either (see pruneHiddenFromIndex below), so the
     // only way to keep the index from re-filling is never to add them.
+    // NOT INDEXED is load-bearing, not a micro-optimisation. Adding `hidden = 0` to this
+    // query made the planner prefer idx_postings_hidden_last_seen_epoch and then sort the
+    // result by id in a temp b-tree -- materialising every visible row, descriptions and all,
+    // on *every batch*. Measured on the live database: 87,561ms for one 250-row batch, versus
+    // 27ms forcing the rowid scan. A full rebuild would never have finished.
+    //
+    // NOT INDEXED makes SQLite walk the table in rowid order, which already satisfies
+    // ORDER BY id, so it streams and stops at LIMIT. `id > ?` still seeks rather than scans
+    // from zero (the plan reads SEARCH ... USING INTEGER PRIMARY KEY (rowid>?)), so the
+    // incremental pass stays cheap too.
     const rows = await db.all(
       `SELECT id, position_name, company_name, job_description
-       FROM Postings
+       FROM Postings NOT INDEXED
        WHERE id > ?
          AND hidden = 0
          AND job_description IS NOT NULL AND TRIM(job_description) <> ''
@@ -357,9 +367,12 @@ async function gapScanSemanticIndex({
     // trap that made one wide scan cost 65s instead of 2s. Most examined rows are already
     // indexed, so paying overflow reads before the membership test made a 100-row slice take
     // minutes. Ids first, membership second, descriptions only for the few that need them.
+    // NOT INDEXED for the same reason as the forward pass: without it the planner sorts the
+    // visible set by id in a temp b-tree on every batch (96ms vs 0ms here -- cheaper than the
+    // forward pass only because this reads ids alone, so the sort touches no descriptions).
     const candidates = await readDb.all(
       `SELECT id
-       FROM Postings
+       FROM Postings NOT INDEXED
        WHERE id > ? AND id <= ?
          AND hidden = 0
        ORDER BY id
