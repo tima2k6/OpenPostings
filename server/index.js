@@ -98,6 +98,7 @@ const {
 const { startWriteLivenessWatchdog, getWriteLivenessStatus } = require("./services/write-liveness.js");
 const { ensureSyncServiceSettingsTable, loadSyncServiceSettingsIntoRuntime, getSyncServiceSettings, upsertSyncServiceSettings } = require("./services/sync-settings.js");
 const { listPostingsWithFilters, getPostingsByUrls, setPostingIgnoredState, getCounts, getCachedCounts, getWideScanStats } = require("./services/postings.js");
+const { getIndexHealth, getCachedIndexHealth, refreshIndexHealth } = require("./services/index-health.js");
 const { ensurePostingReviewSchema, setPostingReviewState } = require("./services/posting-review.js");
 const {
   ensureSavedJobSearchesTable,
@@ -190,6 +191,16 @@ const FILTERED_QUERY_QUEUE_WARNING_DEPTH = Number(process.env.FILTERED_QUERY_QUE
 // running out of swap entirely" -- regardless of capacity.
 const SWAP_USED_WARNING_PERCENT = Number(process.env.SWAP_USED_WARNING_PERCENT || 80);
 const PROCESS_RSS_WARNING_MB = Number(process.env.PROCESS_RSS_WARNING_MB || 3584);
+// Search-index coverage. postings_fts spent months missing 7.5-22% of the postings it should
+// have contained, and the reason nobody noticed is that no number anywhere said so -- the
+// index existed, counts looked plausible, searches returned results. A watch threshold turns
+// that class of silent rot into the same banner-and-error-log signal as WAL growth.
+// Sampled, not exact: see index-health.js for why an exact count cannot live on a poll path.
+const INDEX_MISS_PERCENT_WARNING = Number(process.env.INDEX_MISS_PERCENT_WARNING || 5);
+// Cheap enough on a timer (~1.4s), never on a request. First run sits behind the enrichment
+// loops' stagger so it does not compete with a cold start.
+const INDEX_HEALTH_REFRESH_INTERVAL_MS = Number(process.env.INDEX_HEALTH_REFRESH_INTERVAL_MS || 10 * 60 * 1000);
+const INDEX_HEALTH_INITIAL_DELAY_MS = Number(process.env.INDEX_HEALTH_INITIAL_DELAY_MS || 3 * 60 * 1000);
 
 function getWalSizeBytes() {
   try {
@@ -251,6 +262,24 @@ async function checkHealthWarnings({ walSizeBytes, hostMemory, filteredQueryQueu
       message: `Host swap usage is ${hostMemory?.swap_used_mb}MB of ${hostMemory?.swap_total_mb}MB (${
         hostMemory?.swap_total_mb > 0 ? Math.round((hostMemory.swap_used_mb / hostMemory.swap_total_mb) * 100) : "?"
       }%), above the ${SWAP_USED_WARNING_PERCENT}% watch threshold -- memory pressure can stall the process independent of any single request.`
+    },
+    {
+      // Reads only what the background timer already produced -- this must never trigger the
+      // computation itself, or /sync/status would pay ~1.4s per poll.
+      key: "index_coverage",
+      active: (() => {
+        const health = getCachedIndexHealth();
+        if (!health) return false;
+        const worst = Math.max(
+          Number(health.search_index?.miss_percent || 0),
+          Number(health.semantic_index?.miss_percent || 0)
+        );
+        return worst > INDEX_MISS_PERCENT_WARNING;
+      })(),
+      message: (() => {
+        const health = getCachedIndexHealth();
+        return `Search index coverage has drifted: ${health?.search_index?.miss_percent}% of sampled visible postings are missing from ${health?.search_index?.table} and ${health?.semantic_index?.miss_percent}% from ${health?.semantic_index?.table}, above the ${INDEX_MISS_PERCENT_WARNING}% watch threshold -- searches are silently returning fewer postings than they should.`;
+      })()
     },
     {
       key: "process_rss",
@@ -1646,6 +1675,19 @@ function createServer() {
 
   // What the background enrichment loops have been doing: page fetches and semantic
   // reindexing. Worth checking when liveness or hiring-location fields look empty.
+  // Index coverage, on demand. Not folded into /sync/status: an exact document count costs
+  // ~1.3s and that endpoint is polled continuously. Serves the background timer's value;
+  // ?refresh=1 forces fresh numbers for when you are actually investigating.
+  app.get("/index/status", async (req, res) => {
+    const wantsFresh = ["1", "true", "yes"].includes(String(req.query.refresh || "").toLowerCase());
+    try {
+      const health = await getIndexHealth({ refresh: wantsFresh });
+      return res.json({ ok: true, ...health, miss_percent_warning_threshold: INDEX_MISS_PERCENT_WARNING });
+    } catch (error) {
+      return res.status(500).json({ ok: false, error: String(error?.message || error) });
+    }
+  });
+
   app.get("/enrichment/status", (_req, res) => {
     res.json({ ...getEnrichmentStatus(), write_liveness: getWriteLivenessStatus() });
   });
@@ -2857,6 +2899,21 @@ async function start() {
   // throws. This is what would have caught the transaction wedge in an hour instead of
   // twenty.
   startWriteLivenessWatchdog();
+
+  // Keeps the index-coverage numbers warm so /index/status and the health warning both read a
+  // recent value without any request paying for the scan.
+  const scheduleIndexHealth = (delayMs) => {
+    const timer = setTimeout(async () => {
+      try {
+        await refreshIndexHealth();
+      } catch (error) {
+        console.error("[OpenPostings API] index health refresh failed:", error?.message || error);
+      }
+      scheduleIndexHealth(INDEX_HEALTH_REFRESH_INTERVAL_MS);
+    }, delayMs);
+    if (typeof timer.unref === "function") timer.unref();
+  };
+  scheduleIndexHealth(INDEX_HEALTH_INITIAL_DELAY_MS);
 
   // An empty database is the exception: there is no cache to protect and nothing to serve,
   // so waiting two minutes would just be two minutes of an empty app. This is the desktop
