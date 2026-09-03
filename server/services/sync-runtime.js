@@ -167,6 +167,38 @@ const SYNC_WORKER_CONCURRENCY =
 
 const SYNC_POSTING_FLUSH_BATCH_SIZE = Number(process.env.SYNC_POSTING_FLUSH_BATCH_SIZE || 100); 
 
+// A flush that hits the write lock used to lose its batch outright: the postings were
+// spliced off the pending list before the write, so nothing held them once upsertPostings
+// threw. Between 2026-08-07 and 2026-09-03 that silently discarded 54,231 collected
+// postings across 306 failures -- the sync reported a healthy pass each time, because
+// progress.current had advanced and only postings_stored knew the difference.
+//
+// SQLITE_BUSY here is never corruption and never permanent: several *separate processes*
+// write to this database (the API writer, build-match-index, build-semantic-index,
+// backfill-descriptions), each with its own 30s busy_timeout, so a batch fails only when
+// one of the others held the write lock for longer than that. On a 12GB database with a
+// cold page cache, a single large write transaction can genuinely exceed 30s. The right
+// response is to wait and write it again, not to throw the rows away.
+const SYNC_POSTING_FLUSH_LOCK_RETRIES = Number(process.env.SYNC_POSTING_FLUSH_LOCK_RETRIES || 3);
+// Bound on how many postings may sit requeued waiting for the lock to clear. Without a cap,
+// a database that stays locked for a whole pass would grow this list without limit and turn
+// a write problem into an out-of-memory kill -- so past the cap, batches are dropped, which
+// is the old behaviour, and it is reported rather than silent.
+const SYNC_POSTING_PENDING_MAX = Number(
+  process.env.SYNC_POSTING_PENDING_MAX || SYNC_POSTING_FLUSH_BATCH_SIZE * 50
+);
+
+// Deliberately narrow. Anything not matched here is a real write error and must keep its
+// existing fail-loudly path -- notably, this must never treat a malformed-database error as
+// retryable. Treating SQLITE_BUSY as evidence of corruption is what dropped the whole
+// Postings table on 2026-07-27; the lesson is that the two are unrelated conditions.
+function isRetryableWriteLockError(error) {
+  const code = String(error?.code || "");
+  const message = String(error?.message || error || "");
+  if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") return true;
+  return /SQLITE_BUSY|SQLITE_LOCKED|database is locked|database table is locked/i.test(message);
+}
+
 function publishActiveSyncTargets() {
   syncStatus.active_targets = Array.from(activeSyncTargetsByWorker.values()).sort(
     (a, b) => Number(a.worker || 0) - Number(b.worker || 0)
@@ -1084,6 +1116,7 @@ async function runAtsSyncInternal() {
   syncStatus.last_progress_at = syncStatus.started_at;
   syncStatus.last_write_at = null;
   syncStatus.flush_failures = 0;
+  syncStatus.postings_requeued = 0;
   syncStatus.last_flush_error = null;
   syncStatus.last_flush_error_at = null;
   syncStatus.active_targets = [];
@@ -1237,14 +1270,43 @@ async function runAtsSyncInternal() {
       }
     };
 
+    // Set when a flush loses the write lock, so the next flush waits instead of hammering a
+    // database that is demonstrably busy. Cleared by the first success.
+    let flushRetryNotBeforeMs = 0;
+    let consecutiveFlushLockFailures = 0;
+
+    // Retries only the lock case, and only while this pass is still the current one -- an
+    // abandoned pass must not keep writing behind its replacement's back.
+    const writeBatchWithLockRetries = async (batch) => {
+      let attempt = 0;
+      while (true) {
+        try {
+          return await upsertPostings(batch, syncReferenceEpoch);
+        } catch (error) {
+          attempt += 1;
+          if (!isRetryableWriteLockError(error)) throw error;
+          if (attempt > SYNC_POSTING_FLUSH_LOCK_RETRIES) throw error;
+          if (syncGeneration !== passGeneration) throw error;
+          const backoffMs = Math.min(8000, 500 * 2 ** (attempt - 1));
+          console.log(
+            `[OpenPostings API] posting flush hit the write lock; retrying ${batch.length} postings in ${backoffMs}ms (attempt ${attempt}/${SYNC_POSTING_FLUSH_LOCK_RETRIES})`
+          );
+          await sleep(backoffMs);
+        }
+      }
+    };
+
     const flushPendingPostings = async (force = false) => {
       if (!Array.isArray(pendingPostingsForUpsert) || pendingPostingsForUpsert.length === 0) return;
       if (!force && pendingPostingsForUpsert.length < SYNC_POSTING_FLUSH_BATCH_SIZE) return;
+      // Backing off after a lock failure. The postings stay pending and a later flush -- or
+      // the forced flush at the end of the pass -- picks them up.
+      if (!force && flushRetryNotBeforeMs > Date.now()) return;
 
       const batch = pendingPostingsForUpsert.splice(0, pendingPostingsForUpsert.length);
       if (batch.length === 0) return;
       try {
-        const writeCounts = await upsertPostings(batch, syncReferenceEpoch);
+        const writeCounts = await writeBatchWithLockRetries(batch);
         // Real wall-clock time of a real write, unlike syncReferenceEpoch.
         const wroteAt = new Date();
         await recordSyncWriteHeartbeat(Math.floor(wroteAt.getTime() / 1000));
@@ -1254,25 +1316,60 @@ async function runAtsSyncInternal() {
           syncStatus.refreshed_postings += Number(writeCounts?.refreshed || 0);
           syncStatus.last_write_at = wroteAt.toISOString();
           syncStatus.flush_failures = 0;
+          syncStatus.postings_requeued = 0;
         }
+        consecutiveFlushLockFailures = 0;
+        flushRetryNotBeforeMs = 0;
       } catch (error) {
-        // The batch was spliced off before the write, so a failure loses it -- the postings
-        // in it are not retried and are only picked up by a later pass. Worth a durable
-        // record, but only on the transition into failure: a pass whose every write fails
-        // would otherwise write thousands of identical rows into the banner.
-        if (syncGeneration === passGeneration) {
+        // The batch was spliced off before the write, so whatever is not put back here is
+        // lost for this pass. A lock failure is transient, so the batch goes back onto the
+        // front of the pending list (ahead of newer postings, to keep it from starving) and
+        // a later flush retries it. Only what genuinely cannot be held is reported dropped.
+        const retryable = isRetryableWriteLockError(error);
+        const stillCurrentPass = syncGeneration === passGeneration;
+        let requeued = 0;
+        let dropped = batch.length;
+
+        if (retryable && stillCurrentPass) {
+          const room = Math.max(0, SYNC_POSTING_PENDING_MAX - pendingPostingsForUpsert.length);
+          requeued = Math.min(batch.length, room);
+          if (requeued > 0) {
+            // Oldest-first order is preserved: the batch is reinserted as a block at the head.
+            pendingPostingsForUpsert.unshift(...batch.slice(0, requeued));
+          }
+          dropped = batch.length - requeued;
+          consecutiveFlushLockFailures += 1;
+          flushRetryNotBeforeMs =
+            Date.now() + Math.min(30000, 1000 * 2 ** (consecutiveFlushLockFailures - 1));
+        }
+
+        if (stillCurrentPass) {
           const firstFailure = syncStatus.flush_failures === 0;
           syncStatus.flush_failures += 1;
+          syncStatus.postings_requeued = Number(syncStatus.postings_requeued || 0) + requeued;
           syncStatus.last_flush_error = String(error?.message || error);
           syncStatus.last_flush_error_at = new Date().toISOString();
-          if (firstFailure) {
+          // Durable record only when postings were actually lost. A batch that was requeued
+          // has not lost anything yet, and recording it would refill the banner with rows
+          // describing a condition that resolved itself.
+          if (dropped > 0 && firstFailure) {
             await recordError({
               source: "sync",
               operation: "flushPendingPostings",
               message: `Sync could not store collected postings: ${String(error?.message || error)}`,
-              context: { dropped_postings: batch.length, started_at: syncStatus.started_at }
+              context: {
+                dropped_postings: dropped,
+                requeued_postings: requeued,
+                started_at: syncStatus.started_at
+              }
             });
           }
+        }
+
+        if (requeued > 0) {
+          console.log(
+            `[OpenPostings API] posting flush deferred: ${requeued} postings requeued behind the write lock, ${dropped} dropped`
+          );
         }
         throw error;
       }
@@ -1456,6 +1553,43 @@ async function runAtsSyncInternal() {
         ats_name: "__system__",
         message: `final queueFlushPendingPostings failed: ${String(error?.message || error)}`
       });
+    }
+
+    // Requeueing only saves a batch if some later flush runs. After the forced flush above
+    // there is no later flush, so anything still pending really is lost with the pass -- and
+    // has not been reported yet, because the requeue path deliberately stays quiet. Retry it
+    // once more, then report whatever is left as dropped rather than letting it vanish the
+    // way the pre-2026-09-03 code did.
+    if (Array.isArray(pendingPostingsForUpsert) && pendingPostingsForUpsert.length > 0) {
+      try {
+        await queueFlushPendingPostings(true);
+      } catch {
+        // Reported below from what is still pending.
+      }
+    }
+
+    const abandonedPostings = Array.isArray(pendingPostingsForUpsert)
+      ? pendingPostingsForUpsert.length
+      : 0;
+    if (abandonedPostings > 0 && syncGeneration === passGeneration) {
+      const abandonedMessage = `Sync ended with ${abandonedPostings} collected postings unwritten: ${String(
+        syncStatus.last_flush_error || "write lock never cleared"
+      )}`;
+      errors.push({
+        company_name: "__system__",
+        ats_name: "__system__",
+        message: abandonedMessage
+      });
+      await recordError({
+        source: "sync",
+        operation: "flushPendingPostings",
+        message: abandonedMessage,
+        context: {
+          dropped_postings: abandonedPostings,
+          started_at: syncStatus.started_at
+        }
+      }).catch(() => {});
+      pendingPostingsForUpsert.length = 0;
     }
 
     try {
@@ -2260,4 +2394,4 @@ module.exports = {
   // observable through the ordering plus the progress marks.
   getCompaniesForSync,
   markCompanySynced,
-  flushCompanySyncMarks, runAtsSync, getSyncScopeStats, pruneExpiredPostings, deleteExpiredHiddenPostings, createCanonicalPostingsTable, ensurePostingLocationStateIndex, upsertPostingsBatch, syncStatus, startSyncStallWatchdog, recoverStalledSync, createSerialFlushQueue };
+  flushCompanySyncMarks, runAtsSync, getSyncScopeStats, pruneExpiredPostings, deleteExpiredHiddenPostings, createCanonicalPostingsTable, ensurePostingLocationStateIndex, upsertPostingsBatch, syncStatus, startSyncStallWatchdog, recoverStalledSync, createSerialFlushQueue, isRetryableWriteLockError };

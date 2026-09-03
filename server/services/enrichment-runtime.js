@@ -240,12 +240,17 @@ function startSemanticIndexLoop() {
       // Serialized against the match index worker -- see runHeavyEnrichmentWorker.
       const summary = await runHeavyEnrichmentWorker(() => runSemanticIndexWorker({}));
       enrichmentStatus.semantic_index.last_summary = summary;
-      if (summary.indexed > 0) {
+      const gapIndexed = Number(summary.gap_indexed || 0);
+      if (summary.indexed > 0 || gapIndexed > 0) {
+        const gapDetail = gapIndexed > 0 ? `, +${gapIndexed} recovered by gap scan` : "";
         console.log(
-          `[OpenPostings API] semantic reindex: +${summary.indexed} documents (${summary.total_indexed} total)`
+          `[OpenPostings API] semantic reindex: +${summary.indexed} documents${gapDetail} (${summary.total_indexed} total)`
         );
       }
-      return summary.indexed;
+      // Gap-scan work counts as work. Returning only the forward-pass count would let the
+      // idle backoff double the interval to an hour while a sweep still had a large backlog
+      // of lost postings to recover.
+      return Number(summary.indexed || 0) + gapIndexed;
     }
   });
 }

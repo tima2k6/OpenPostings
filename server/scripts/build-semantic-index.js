@@ -27,13 +27,36 @@ async function main(argv = process.argv.slice(2)) {
     await db.exec("PRAGMA busy_timeout = 30000;");
     setDb(db);
 
-    const { rebuildSemanticIndex } = require("../services/semantic-search.js");
+    const { rebuildSemanticIndex, gapScanSemanticIndex } = require("../services/semantic-search.js");
     const startedAt = Date.now();
+    const rebuild = argv.includes("--rebuild");
     const summary = await rebuildSemanticIndex({
-      rebuild: argv.includes("--rebuild"),
+      rebuild,
       batch_size: readPositiveIntegerArg(argv, "--batch-size", undefined),
       max_batches: readPositiveIntegerArg(argv, "--max-batches", undefined)
     });
+
+    // The forward pass above only ever moves up. Rows it skipped -- no description yet, or
+    // hidden at the time -- sit below its cursor and it never looks back, so descriptions
+    // filled in later by the backfill were never indexed at all. This sweeps a bounded slice
+    // below the cursor each run, cycling back to the bottom when it catches up. Skipped
+    // after --rebuild, which has just indexed everything eligible from id 0 anyway.
+    if (!rebuild && !argv.includes("--no-gap-scan")) {
+      try {
+        const gap = await gapScanSemanticIndex({
+          batch_size: readPositiveIntegerArg(argv, "--gap-batch-size", undefined),
+          max_batches: readPositiveIntegerArg(argv, "--gap-max-batches", undefined)
+        });
+        summary.gap_indexed = gap.indexed;
+        summary.gap_examined = gap.examined;
+        summary.gap_scanned_id = gap.gap_scanned_id;
+        summary.gap_complete = gap.complete;
+      } catch (error) {
+        // A gap-scan failure must not cost the forward pass its progress, which is already
+        // committed. Report it and let the run succeed.
+        summary.gap_error = String(error?.message || error);
+      }
+    }
     console.log(
       `[build-semantic-index] ${JSON.stringify(summary)} in ${Math.round((Date.now() - startedAt) / 1000)}s`
     );

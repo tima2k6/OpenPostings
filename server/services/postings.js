@@ -1674,7 +1674,59 @@ async function setPostingIgnoredState(payload) {
 }
 
 
+// /sync/status is polled continuously, and every poll used to re-run all three COUNT(*)
+// queries below. On a warm cache that is cheap enough to have gone unnoticed; on a cold one
+// it is three full scans of a 12GB database per poll, which is why a freshly restarted API
+// looks hung to a client that is only asking for status. The counts also barely move -- they
+// change when a sync pass writes, not between two polls seconds apart -- so they are cached.
+//
+// Stale-while-revalidate, deliberately: once a value exists, a stale entry is returned
+// immediately and the refresh runs in the background, so no request ever waits on the scans
+// again after the first. Single-flight on top of that, because the cold start is exactly when
+// several pollers arrive at once and each would otherwise launch its own copy of the scans.
+const COUNTS_CACHE_TTL_MS = Number(process.env.COUNTS_CACHE_TTL_MS || 30000);
+let countsCache = null;
+let countsCacheAtMs = 0;
+let countsRefreshInFlight = null;
+
+function isCountsCacheFresh() {
+  return Boolean(countsCache) && Date.now() - countsCacheAtMs < COUNTS_CACHE_TTL_MS;
+}
+
+function refreshCounts() {
+  // Single-flight: concurrent callers share one set of scans.
+  if (countsRefreshInFlight) return countsRefreshInFlight;
+  countsRefreshInFlight = readCountsFromDb()
+    .then((counts) => {
+      countsCache = counts;
+      countsCacheAtMs = Date.now();
+      return counts;
+    })
+    .finally(() => {
+      countsRefreshInFlight = null;
+    });
+  return countsRefreshInFlight;
+}
+
+// Never queries. Returns null until the first successful read, so a liveness probe can
+// report counts when they happen to be known without ever paying for them.
+function getCachedCounts() {
+  if (!countsCache) return null;
+  return { ...countsCache, counts_cached_age_seconds: Math.max(0, Math.round((Date.now() - countsCacheAtMs) / 1000)) };
+}
+
 async function getCounts() {
+  if (isCountsCacheFresh()) return { ...countsCache };
+  // A stale value is worth far more than a fresh one that takes 8 seconds to produce: kick
+  // the refresh off and answer now. Only the very first call has nothing to serve and waits.
+  if (countsCache) {
+    refreshCounts().catch(() => {});
+    return { ...countsCache };
+  }
+  return { ...(await refreshCounts()) };
+}
+
+async function readCountsFromDb() {
   // Dedicated status reader connection: /sync/status is polled continuously and its COUNT(*)
   // over ~930k postings has no business queueing behind a sync write transaction, or behind
   // an unrelated slow /postings wide scan sharing the general reader connection.
@@ -1708,4 +1760,4 @@ async function getCounts() {
   };
 }
 
-module.exports = { listPostingsWithFilters, setPostingIgnoredState, getCounts, getPostingLocationGeoFilterOptions, markPostingAppliedState, getWideScanStats, buildCandidatePrefilter, getPostingsByUrls, enrichPostingsWithApplicationState }
+module.exports = { listPostingsWithFilters, setPostingIgnoredState, getCounts, getCachedCounts, getPostingLocationGeoFilterOptions, markPostingAppliedState, getWideScanStats, buildCandidatePrefilter, getPostingsByUrls, enrichPostingsWithApplicationState }

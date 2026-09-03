@@ -24,6 +24,9 @@
 const { getDb, getReadDb, runInWriteTransaction } = require("./runtime-context.js");
 
 const FTS_TABLE = "postings_fts";
+// FTS5 shadow table: exactly one row per indexed document, keyed by the content rowid. It is
+// the only reliable membership test for an external content index -- see gapScanSemanticIndex.
+const FTS_DOCSIZE_TABLE = `${FTS_TABLE}_docsize`;
 const MAX_QUERY_TERMS = 60;
 // position_name, company_name, job_description -- must match FTS_TABLE's column order below.
 const BM25_COLUMN_WEIGHTS = "3.0, 0.5, 1.0";
@@ -105,6 +108,18 @@ async function ensureIndexStateTable() {
     VALUES (1, 0, 0)
     ON CONFLICT(id) DO NOTHING;
   `);
+  // gap_scanned_id added 2026-09-03. The forward cursor alone loses rows permanently: it
+  // skips a posting that has no description yet but still advances past it, and the
+  // description backfill then fills that description in place, below the cursor, where
+  // nothing looks again. Sampled on the live database, 7.5-22.2% of postings that have a
+  // description and sit below the cursor were missing from the index, worsening with age.
+  // posting_match_state solved the identical problem with a gap_scanned_id column; this is
+  // the same mechanism.
+  const columns = await db.all(`PRAGMA table_info(semantic_index_state);`);
+  const hasGapColumn = (columns || []).some((column) => String(column?.name) === "gap_scanned_id");
+  if (!hasGapColumn) {
+    await db.exec(`ALTER TABLE semantic_index_state ADD COLUMN gap_scanned_id INTEGER NOT NULL DEFAULT 0;`);
+  }
 }
 
 async function readIndexState() {
@@ -112,10 +127,13 @@ async function readIndexState() {
   // On the reader connection, not the writer -- the table-creation/seed check above stays
   // on the writer since it may CREATE/INSERT.
   const db = getReadDb();
-  const row = await db.get(`SELECT last_indexed_id, indexed_count FROM semantic_index_state WHERE id = 1;`);
+  const row = await db.get(
+    `SELECT last_indexed_id, indexed_count, gap_scanned_id FROM semantic_index_state WHERE id = 1;`
+  );
   return {
     last_indexed_id: Number(row?.last_indexed_id || 0),
-    indexed_count: Number(row?.indexed_count || 0)
+    indexed_count: Number(row?.indexed_count || 0),
+    gap_scanned_id: Number(row?.gap_scanned_id || 0)
   };
 }
 
@@ -126,6 +144,16 @@ async function writeIndexState(lastIndexedId, indexedCount) {
      SET last_indexed_id = ?, indexed_count = ?, updated_at = datetime('now')
      WHERE id = 1;`,
     [lastIndexedId, indexedCount]
+  );
+}
+
+async function writeGapScanState(gapScannedId, indexedCount) {
+  const db = getDb();
+  await db.run(
+    `UPDATE semantic_index_state
+     SET gap_scanned_id = ?, indexed_count = ?, updated_at = datetime('now')
+     WHERE id = 1;`,
+    [gapScannedId, indexedCount]
   );
 }
 
@@ -208,6 +236,9 @@ async function rebuildSemanticIndex({
     // would try to read the content rows back to remove their terms.
     await db.run(`INSERT INTO ${FTS_TABLE}(${FTS_TABLE}) VALUES('delete-all');`);
     await writeIndexState(0, 0);
+    // The gap cursor tracks progress below the forward cursor, so a reset that left it in
+    // place would skip everything under it on the way back up.
+    await writeGapScanState(0, 0);
   }
 
   const state = await readIndexState();
@@ -219,10 +250,18 @@ async function rebuildSemanticIndex({
   let batches = 0;
   let complete = false;
   while (batches < maxBatches) {
+    // hidden = 0 added 2026-09-03. Indexing hidden postings is pure cost: search filters
+    // them out of every result, and nothing ever removes them from the index once they are
+    // in, so they accumulate forever. Sampling the live index put hidden postings at ~87.7%
+    // of 1.59M indexed documents -- roughly 1.39M documents that no query could ever return.
+    // They cannot be deleted retroactively either (see pruneHiddenFromIndex below), so the
+    // only way to keep the index from re-filling is never to add them.
     const rows = await db.all(
       `SELECT id, position_name, company_name, job_description
        FROM Postings
-       WHERE id > ? AND job_description IS NOT NULL AND TRIM(job_description) <> ''
+       WHERE id > ?
+         AND hidden = 0
+         AND job_description IS NOT NULL AND TRIM(job_description) <> ''
        ORDER BY id
        LIMIT ?;`,
       [lastId, batchSize]
@@ -262,6 +301,125 @@ async function rebuildSemanticIndex({
     total_indexed: totalIndexed,
     since_id: since,
     last_id: lastId,
+    batches,
+    complete
+  };
+}
+
+// The forward cursor above is one-way, and rows are skipped for reasons that later stop
+// being true: a posting with no description yet gets its description from the backfill
+// minutes later, and a hidden posting can be re-seen by a sync and become visible again.
+// Both land below the cursor, which never looks back. This walks up from gap_scanned_id
+// re-checking rows the forward pass left behind, and indexes the ones that now qualify.
+//
+// Membership has to be tested against postings_fts_docsize, the shadow table holding one
+// row per indexed document. The obvious test does not work: postings_fts is an external
+// content table, so `SELECT rowid FROM postings_fts WHERE rowid = ?` reads through to
+// Postings and returns a row for postings that were never indexed at all -- verified
+// directly against the live database before relying on it here.
+// Sized for a background sweep, not a catch-up: ~5,000 rows examined per run keeps each
+// slice well under a second while still cycling the whole visible id space over roughly a
+// day and a half of normal 15-minute runs.
+const SEMANTIC_GAP_BATCH_SIZE = Number(process.env.SEMANTIC_INDEX_GAP_BATCH_SIZE || 200);
+const SEMANTIC_GAP_MAX_BATCHES = Number(process.env.SEMANTIC_INDEX_GAP_MAX_BATCHES || 25);
+
+async function gapScanSemanticIndex({
+  batch_size = SEMANTIC_GAP_BATCH_SIZE,
+  max_batches = SEMANTIC_GAP_MAX_BATCHES
+} = {}) {
+  const db = getDb();
+  const readDb = getReadDb();
+  await ensureFtsIndex();
+
+  const batchSize = Math.max(1, Math.floor(Number(batch_size) || SEMANTIC_INDEX_BATCH_SIZE));
+  const maxBatches = Math.max(1, Math.floor(Number(max_batches) || 1));
+
+  const state = await readIndexState();
+  // Never scan past the forward cursor: above it is the forward pass's job.
+  const ceiling = state.last_indexed_id;
+  let cursor = state.gap_scanned_id;
+  let totalIndexed = state.indexed_count;
+  let indexed = 0;
+  let examined = 0;
+  let batches = 0;
+  let complete = false;
+
+  while (batches < maxBatches) {
+    if (cursor >= ceiling) {
+      // Reached the forward cursor: one full sweep done, start the next from the bottom.
+      cursor = 0;
+      complete = true;
+      break;
+    }
+
+    // Deliberately selects no description here. job_description lives in overflow pages, and
+    // SQLite reads them for every row it *examines*, not just the ones it returns -- the same
+    // trap that made one wide scan cost 65s instead of 2s. Most examined rows are already
+    // indexed, so paying overflow reads before the membership test made a 100-row slice take
+    // minutes. Ids first, membership second, descriptions only for the few that need them.
+    const candidates = await readDb.all(
+      `SELECT id
+       FROM Postings
+       WHERE id > ? AND id <= ?
+         AND hidden = 0
+       ORDER BY id
+       LIMIT ?;`,
+      [cursor, ceiling, batchSize]
+    );
+
+    if (candidates.length === 0) {
+      cursor = ceiling;
+      complete = true;
+      break;
+    }
+
+    examined += candidates.length;
+    const ids = candidates.map((row) => Number(row.id));
+    const placeholders = ids.map(() => "?").join(",");
+    const present = await readDb.all(
+      `SELECT id FROM ${FTS_DOCSIZE_TABLE} WHERE id IN (${placeholders});`,
+      ids
+    );
+    const indexedIds = new Set((present || []).map((row) => Number(row.id)));
+    const missingIds = ids.filter((id) => !indexedIds.has(id));
+
+    // Only now, and only for the handful that are actually missing, is the description read.
+    const missing = missingIds.length
+      ? await readDb.all(
+          `SELECT id, position_name, company_name, job_description
+           FROM Postings
+           WHERE id IN (${missingIds.map(() => "?").join(",")})
+             AND job_description IS NOT NULL AND TRIM(job_description) <> '';`,
+          missingIds
+        )
+      : [];
+
+    if (missing.length > 0) {
+      await runInWriteTransaction(async (handle) => {
+        for (const row of missing) {
+          await handle.run(
+            `INSERT INTO ${FTS_TABLE}(rowid, position_name, company_name, job_description)
+             VALUES (?, ?, ?, ?);`,
+            [row.id, row.position_name || "", row.company_name || "", row.job_description || ""]
+          );
+          indexed += 1;
+          totalIndexed += 1;
+        }
+      });
+    }
+
+    cursor = ids[ids.length - 1];
+    await writeGapScanState(cursor, totalIndexed);
+    batches += 1;
+  }
+
+  await writeGapScanState(cursor, totalIndexed);
+
+  return {
+    indexed,
+    examined,
+    gap_scanned_id: cursor,
+    ceiling,
     batches,
     complete
   };
@@ -379,6 +537,7 @@ async function findSimilarPostings(options = {}) {
 module.exports = {
   findSimilarPostings,
   rebuildSemanticIndex,
+  gapScanSemanticIndex,
   ensureFtsIndex,
   ftsIndexExists,
   buildQueryTerms,
