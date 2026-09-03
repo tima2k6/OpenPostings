@@ -134,6 +134,18 @@ const BACKEND_DATA_ROOT = path.dirname(DB_PATH);
 const BACKEND_LOG_DIRECTORY_PATH = path.join(BACKEND_DATA_ROOT, "logs");
 const FRONTEND_LOG_PATH = path.join(BACKEND_LOG_DIRECTORY_PATH, "frontend-client.log");
 const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS || 10 * 60 * 1000);
+// The enrichment loops each stagger their first run (60s/100s/150s) so they do not all land
+// on a process that has just started. The sync did not, and it is by far the heaviest of
+// them: a pass walks tens of thousands of targets and writes continuously. Starting it at
+// t=0 means it competes for disk with every first request at exactly the moment the page
+// cache is empty -- on a 12GB database against 8GB of RAM, that is the difference between a
+// UI that is slow for a minute and one that looks down. On 2026-09-03 a restart at 09:14 put
+// /health at 8s and stacked three filtered queries behind the wide-scan lock; the machine
+// was fine four minutes later with no intervention.
+//
+// Delaying the first pass costs almost nothing: the interval below still fires on schedule,
+// and runAtsSync is single-flight, so nothing overlaps or is skipped.
+const SYNC_STARTUP_DELAY_MS = Number(process.env.SYNC_STARTUP_DELAY_MS || 2 * 60 * 1000);
 // wal_autocheckpoint and journal_size_limit (set in initDb) bound how large the WAL can grow
 // and passively reclaim its *content* into the main file, but neither ever shrinks the file
 // itself back down. A connection that briefly holds an older snapshot open (an MCP client,
@@ -2846,8 +2858,39 @@ async function start() {
   // twenty.
   startWriteLivenessWatchdog();
 
-  runAtsSync().catch((error) => {
-    console.error("[OpenPostings API] initial sync failed:", error);
+  // An empty database is the exception: there is no cache to protect and nothing to serve,
+  // so waiting two minutes would just be two minutes of an empty app. This is the desktop
+  // build's first launch. The check is a single indexed row read, not a count.
+  const startInitialSync = async () => {
+    let delayMs = SYNC_STARTUP_DELAY_MS;
+    try {
+      const seeded = await getStatusReadDb().get("SELECT id FROM Postings LIMIT 1;");
+      if (!seeded) delayMs = 0;
+    } catch {
+      // Cannot tell -- treat it as seeded and take the safe, delayed path.
+    }
+
+    if (delayMs <= 0) {
+      runAtsSync().catch((error) => {
+        console.error("[OpenPostings API] initial sync failed:", error);
+      });
+      return;
+    }
+
+    console.log(
+      `[OpenPostings API] initial sync starts in ${Math.round(delayMs / 1000)}s (letting the page cache warm first)`
+    );
+    const timer = setTimeout(() => {
+      runAtsSync().catch((error) => {
+        console.error("[OpenPostings API] initial sync failed:", error);
+      });
+    }, delayMs);
+    // Never hold the process open for it.
+    if (typeof timer.unref === "function") timer.unref();
+  };
+
+  startInitialSync().catch((error) => {
+    console.error("[OpenPostings API] initial sync scheduling failed:", error);
   });
 
   setInterval(() => {
