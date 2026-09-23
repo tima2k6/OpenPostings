@@ -1749,6 +1749,7 @@ export default function App() {
   });
   const [postingFilterOptionsLoading, setPostingFilterOptionsLoading] = useState(false);
   const [postingsFilterPanelOpen, setPostingsFilterPanelOpen] = useState(false);
+  const [syncStatusExpanded, setSyncStatusExpanded] = useState(false);
   // Listing descriptions are large and are not needed to scan titles/locations. Keep the
   // initial request lightweight; users can still opt into them with the existing toggle.
   const [showPostingDescriptions, setShowPostingDescriptions] = useState(false);
@@ -2065,8 +2066,11 @@ export default function App() {
     }));
   }, [postingFilterOptions.ats]);
 
+  // Every field below is worth having, but pipe-joined into one paragraph they ran to a
+  // dozen lines on a phone -- more of the viewport than the first posting card. Split into a
+  // headline that answers "running? how far?" and a detail body kept behind a tap.
   const statusText = useMemo(() => {
-    if (!status) return "No sync status yet.";
+    if (!status) return { headline: "No sync status yet.", detail: "" };
     // last_sync_at only gets set when a pass *completes*, so it stays null for the entire
     // duration of the first pass after a restart -- which used to read as "No sync has run
     // yet" even while a pass was 40% done and actively storing postings. status.running
@@ -2111,9 +2115,14 @@ export default function App() {
       const companyProgressHint = companyProgress
         ? ` | Companies this pass: ${Number(companyProgress.current || 0).toLocaleString()}/${Number(companyProgress.total || 0).toLocaleString()}`
         : "";
-      return `${base} | Syncing targets ${Number(status.progress.current || 0).toLocaleString()}/${Number(status.progress.total || 0).toLocaleString()} (${progressPercent.toFixed(1)}%)${companyProgressHint} | New: ${newPostings.toLocaleString()} | Refreshed: ${refreshedPostings.toLocaleString()} | Collected: ${collectedCount.toLocaleString()} | Rate: ${targetsPerMinute.toFixed(1)} targets/min | ETA: ${formatDurationCompact(etaSeconds)} | Last write: ${formatDurationCompact(lastWriteAge)} ago | Last completed target: ${syncingCompanyName}${coverageHint}`;
+      const detail = `${base} | Syncing targets ${Number(status.progress.current || 0).toLocaleString()}/${Number(status.progress.total || 0).toLocaleString()} (${progressPercent.toFixed(1)}%)${companyProgressHint} | New: ${newPostings.toLocaleString()} | Refreshed: ${refreshedPostings.toLocaleString()} | Collected: ${collectedCount.toLocaleString()} | Rate: ${targetsPerMinute.toFixed(1)} targets/min | ETA: ${formatDurationCompact(etaSeconds)} | Last write: ${formatDurationCompact(lastWriteAge)} ago | Last completed target: ${syncingCompanyName}${coverageHint}`;
+      const headline = `Syncing ${progressPercent.toFixed(1)}% | ETA ${formatDurationCompact(etaSeconds)} | ${Number(status.posting_count || 0).toLocaleString()} listed`;
+      return { headline, detail };
     }
-    return `${base}${coverageHint}`;
+    return {
+      headline: `Last sync: ${syncTime} | ${Number(status.posting_count || 0).toLocaleString()} listed`,
+      detail: `${base}${coverageHint}`
+    };
   }, [status, syncServiceSettings.active_posting_freshness_hours, syncServiceSettings.posting_freshness_hours]);
 
   const syncProgressFraction = useMemo(() => {
@@ -3888,17 +3897,27 @@ export default function App() {
           );
         })}
       </View>
-      <Text style={styles.reviewQueueHelp}>
-        {postingReviewQueue === "new"
-          ? "Unseen roles with a recent confirmed date or recent discovery. Opening one marks it viewed."
-          : postingReviewQueue === "shortlisted"
-            ? "Roles you set aside for closer consideration."
-            : "Viewed and ignored roles; ignored roles remain visibly marked."}
-      </Text>
+      {/* On a phone this paragraph costs more of the viewport than the first posting card.
+          Once results are on screen the tabs speak for themselves; keep the explainer for the
+          empty queue, where it is the only thing that says why nothing is here. */}
+      {postings.length === 0 ? (
+        <Text style={styles.reviewQueueHelp}>
+          {postingReviewQueue === "new"
+            ? "Unseen roles with a recent confirmed date or recent discovery. Opening one marks it viewed."
+            : postingReviewQueue === "shortlisted"
+              ? "Roles you set aside for closer consideration."
+              : "Viewed and ignored roles; ignored roles remain visibly marked."}
+        </Text>
+      ) : null}
 
       {/* Sorting is not a filter: it is changed constantly while scanning results, so it
           stays visible rather than living behind the collapsed filter panel. */}
-      <View style={styles.postingsSortRow}>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        style={styles.postingsSortRow}
+        contentContainerStyle={styles.postingsSortRowContent}
+      >
         <Text style={styles.postingsSortLabel}>Sort</Text>
         {POSTING_SORT_OPTIONS.map((option) => {
           const selected = String(postingsFilters.sort_by || "recent") === option.value;
@@ -3919,12 +3938,17 @@ export default function App() {
             </Pressable>
           );
         })}
-      </View>
+      </ScrollView>
 
       {/* Only worth showing once a second resume actually exists to rank against -- with
           just one uploaded, "Rank by" would offer a single, permanently-selected option. */}
       {resumeMatchOptions.length > 1 ? (
-        <View style={styles.postingsSortRow}>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          style={styles.postingsSortRow}
+          contentContainerStyle={styles.postingsSortRowContent}
+        >
           <Text style={styles.postingsSortLabel}>Rank by</Text>
           {resumeMatchOptions.map((option) => {
             const selected = String(postingsFilters.resume || "resume") === option.value;
@@ -3945,7 +3969,7 @@ export default function App() {
               </Pressable>
             );
           })}
-        </View>
+        </ScrollView>
       ) : null}
 
       <View style={styles.postingsFiltersHeaderRow}>
@@ -3964,10 +3988,6 @@ export default function App() {
           >
             <Text style={styles.postingsFiltersToggleText}>Browse DB</Text>
           </Pressable>
-          <View style={styles.postingDescriptionToggleRow}>
-            <Text style={styles.postingDescriptionToggleLabel}>Load descriptions</Text>
-            <Switch value={showPostingDescriptions} onValueChange={setShowPostingDescriptions} />
-          </View>
         </View>
         <Pressable onPress={clearAllPostingFilters} style={styles.postingsFiltersClearBtn}>
           <Text style={styles.postingsFiltersClearText}>Clear</Text>
@@ -3982,6 +4002,13 @@ export default function App() {
             nestedScrollEnabled
             keyboardShouldPersistTaps="handled"
           >
+            {/* Lives here rather than in the header row: it is a display option rather than a
+                constant action, and inline it pushed Clear off a phone-width screen. */}
+            <View style={styles.remoteNoDateToggleRow}>
+              <Text style={styles.remoteNoDateToggleLabel}>Load descriptions</Text>
+              <Switch value={showPostingDescriptions} onValueChange={setShowPostingDescriptions} />
+            </View>
+
             {postingFilterOptionsLoading ? (
               <Text style={styles.small}>Loading filter options...</Text>
             ) : (
@@ -4169,7 +4196,14 @@ export default function App() {
         </View>
       ) : null}
 
-      <Text style={styles.status}>{statusText}</Text>
+      <Pressable onPress={() => setSyncStatusExpanded((prev) => !prev)}>
+        <Text style={styles.status}>
+          {syncStatusExpanded ? statusText.detail : statusText.headline}
+          {statusText.detail ? (
+            <Text style={styles.statusToggleHint}>{syncStatusExpanded ? "  \u25b4 less" : "  \u25be more"}</Text>
+          ) : null}
+        </Text>
+      </Pressable>
       {status?.running && status?.progress ? (
         <View style={styles.syncProgressTrack} accessibilityLabel={`Sync ${Math.round(syncProgressFraction * 100)} percent complete`}>
           <View style={[styles.syncProgressFill, { width: `${Math.max(1, syncProgressFraction * 100)}%` }]} />
@@ -5823,7 +5857,11 @@ export default function App() {
             <Text style={styles.small}>API: {API_BASE_URL}</Text>
           </View>
         ) : null}
-        <Text style={styles.pageTitle}>{pageTitle}</Text>
+        {/* Every other page needs naming; Postings sits under the logo and directly above the
+            New/Shortlisted/Reviewed tabs, so the title is a third label for the same thing. */}
+        {effectiveActivePage !== PAGE_KEYS.POSTINGS ? (
+          <Text style={styles.pageTitle}>{pageTitle}</Text>
+        ) : null}
       </View>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
@@ -5979,24 +6017,19 @@ const styles = StyleSheet.create({
   postingsFiltersHeaderRow: {
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
+    // Views do not shrink by default, so on a phone-width screen this row's contents
+    // overflowed the viewport and carried Clear off the right edge. Wrap instead, and push
+    // Clear over with an auto margin -- space-between puts a lone wrapped item at the start.
+    flexWrap: "wrap",
+    rowGap: 6,
     paddingHorizontal: 16,
     paddingBottom: 6
   },
   postingsFiltersLeftGroup: {
     flexDirection: "row",
     alignItems: "center",
+    flexWrap: "wrap",
     gap: 10
-  },
-  postingDescriptionToggleRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8
-  },
-  postingDescriptionToggleLabel: {
-    color: "#334e68",
-    fontSize: 12,
-    fontWeight: "600"
   },
   postingsFiltersToggleBtn: {
     borderWidth: 1,
@@ -6011,7 +6044,13 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     fontSize: 12
   },
+  statusToggleHint: {
+    color: "#7a8798",
+    fontSize: 11,
+    fontWeight: "600"
+  },
   postingsFiltersClearBtn: {
+    marginLeft: "auto",
     borderWidth: 1,
     borderColor: "#dbe2ea",
     borderRadius: 10,
@@ -6025,12 +6064,19 @@ const styles = StyleSheet.create({
     fontWeight: "600"
   },
   savedSearchesRow: {
-    paddingHorizontal: 16,
+    // A horizontal ScrollView ships with flexGrow/flexShrink: 1, so as a sibling of the
+    // postings FlatList this one-line chip row splits the column's free height with the list:
+    // a tall empty band when the list is short, vertically clipped chips when it is long.
+    flexGrow: 0,
+    flexShrink: 0,
+    flexBasis: "auto",
     marginBottom: 8
   },
   savedSearchesRowContent: {
     flexDirection: "row",
     alignItems: "center",
+    // Inset lives on the content so the last chip keeps its trailing gap at the scroll end.
+    paddingHorizontal: 16,
     gap: 8
   },
   savedSearchesLoader: {
@@ -6196,12 +6242,18 @@ const styles = StyleSheet.create({
     flexWrap: "wrap"
   },
   postingsSortRow: {
+    // Pinned like savedSearchesRow -- a ScrollView carries flexGrow/flexShrink: 1 with it.
+    // Wrapping these chips instead cost two rows of height on any phone-width screen.
+    flexGrow: 0,
+    flexShrink: 0,
+    flexBasis: "auto",
+    paddingBottom: 8
+  },
+  postingsSortRowContent: {
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
-    flexWrap: "wrap",
-    paddingHorizontal: 16,
-    paddingBottom: 8
+    paddingHorizontal: 16
   },
   postingsSortLabel: {
     color: "#334e68",

@@ -835,7 +835,53 @@ async function getLastSyncWriteEpoch() {
   }
 }
 
+// /sync/status is polled every 3s by every open client, and the two reads below each SCAN
+// the whole companies table (61,612 rows) through a correlated NOT EXISTS that no index can
+// serve. Warm, that is ~150ms. With those pages evicted -- the database is several times this
+// box's page cache and the sync churns it constantly -- one poll measured 33.6s and 849MB of
+// disk, which is what fires the client's 30s deadline and blanks the postings page. Neither
+// answer changes meaningfully between polls, so amortize the scan: same stale-while-revalidate
+// + single-flight shape as getCounts in postings.js.
+const STATUS_SCAN_CACHE_TTL_MS = Number(process.env.STATUS_SCAN_CACHE_TTL_MS || 30000);
+
+function createCachedScan(read, ttlMs = STATUS_SCAN_CACHE_TTL_MS) {
+  const state = new Map();
+  return function cached(key, ...args) {
+    let entry = state.get(key);
+    if (!entry) {
+      entry = { value: undefined, atMs: 0, inFlight: null };
+      state.set(key, entry);
+    }
+    if (entry.value !== undefined && Date.now() - entry.atMs < ttlMs) return Promise.resolve(entry.value);
+    if (!entry.inFlight) {
+      entry.inFlight = read(...args)
+        .then((value) => {
+          entry.value = value;
+          entry.atMs = Date.now();
+          return value;
+        })
+        .finally(() => {
+          entry.inFlight = null;
+        });
+    }
+    // A stale answer beats a fresh one that arrives after the client has given up. Only the
+    // very first caller, with nothing cached to serve, waits for the scan.
+    if (entry.value !== undefined) {
+      entry.inFlight.catch(() => {});
+      return Promise.resolve(entry.value);
+    }
+    return entry.inFlight;
+  };
+}
+
+// Keyed on the enabled set as well as the window: the ATS list is inside the query's WHERE,
+// so a settings change has to produce a different answer immediately, not 30s later.
 async function getSyncCoverageStats(withinSeconds = 24 * 60 * 60) {
+  const enabledKey = normalizeSyncEnabledAts(Array.from(getSyncEnabledAts())).slice().sort().join(",");
+  return cachedSyncCoverageStats(`${withinSeconds}|${enabledKey}`, withinSeconds);
+}
+
+async function readSyncCoverageStats(withinSeconds) {
   const db = getStatusReadDb();
   if (!db) return null;
 
@@ -889,6 +935,8 @@ async function getSyncCoverageStats(withinSeconds = 24 * 60 * 60) {
     window_seconds: withinSeconds
   };
 }
+
+const cachedSyncCoverageStats = createCachedScan(readSyncCoverageStats);
 
 async function getCompaniesForSync() {
   const db = getDb();
@@ -2303,7 +2351,9 @@ async function rebuildPostingsTableStorage() {
 }
 
 
-async function getSyncScopeStats() {
+// Only the scan is cached, reduced to a per-ATS tally. The enabled-set arithmetic below stays
+// live on every call, so toggling an ATS in settings is reflected at once.
+async function readCompanyCountsByNormalizedAts() {
   const db = getStatusReadDb()
 
   const rows = await db.all(
@@ -2318,13 +2368,25 @@ async function getSyncScopeStats() {
     `
   );
 
-  const enabledAts = new Set(normalizeSyncEnabledAts(Array.from(getSyncEnabledAts())));
-  let syncEnabledCompanyCount = 0;
+  const counts = new Map();
   for (const row of rows) {
     const normalizedAts = normalizeAtsFilterValue(row?.ATS_name);
     if (!ATS_FILTER_OPTIONS.has(normalizedAts)) continue;
+    counts.set(normalizedAts, (counts.get(normalizedAts) || 0) + 1);
+  }
+  return counts;
+}
+
+const cachedCompanyCountsByNormalizedAts = createCachedScan(readCompanyCountsByNormalizedAts);
+
+async function getSyncScopeStats() {
+  const companyCountsByAts = await cachedCompanyCountsByNormalizedAts("companies");
+
+  const enabledAts = new Set(normalizeSyncEnabledAts(Array.from(getSyncEnabledAts())));
+  let syncEnabledCompanyCount = 0;
+  for (const [normalizedAts, count] of companyCountsByAts) {
     if (enabledAts.has(normalizedAts)) {
-      syncEnabledCompanyCount += 1;
+      syncEnabledCompanyCount += count;
     }
   }
   if (enabledAts.has("governmentjobs")) {

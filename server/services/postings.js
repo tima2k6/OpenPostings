@@ -516,6 +516,16 @@ const MAX_WIDE_SCAN_CANDIDATE_ROWS = Number(process.env.POSTINGS_WIDE_SCAN_MAX_C
 // that exists, this keeps a rare search from taking the whole process down with it.
 const MAX_WIDE_SCAN_MILLIS = Number(process.env.POSTINGS_WIDE_SCAN_MAX_MILLIS || 15000);
 
+// The 15s above is sized against the client's 30s deadline, but that arithmetic only holds
+// for a query that runs immediately: each queued scan used to start its own fresh 15s once it
+// reached the front, so three of them cost 45s and the client gave up before the last one
+// answered -- the timeout observed on 2026-09-04, with "filtered query waiting; 2 queued" in
+// the journal at the exact moment every endpoint went slow. The budget now runs from when the
+// request was *enqueued*, which is when the client started its own clock. A scan that waited
+// out most of its budget still gets this floor, because returning an empty page reads as
+// broken in a way a short one does not.
+const MIN_WIDE_SCAN_MILLIS = Number(process.env.POSTINGS_WIDE_SCAN_MIN_MILLIS || 3000);
+
 // Which of the runtime location map's URLs could let an empty-location row match this search
 // term. The map is this process's own memory (postings whose location is known at runtime but
 // not yet stored), so the answer is exact -- see the empty-location clause in
@@ -668,6 +678,7 @@ function yieldToEventLoop() {
 
 function runExclusiveWideScan(task, signal) {
   if (signal?.aborted) return Promise.reject(createRequestAbortedError());
+  const enqueuedAtMs = Date.now();
   wideScanQueued += 1;
   if (wideScanQueued > wideScanPeakQueued) wideScanPeakQueued = wideScanQueued;
   if (wideScanActive) {
@@ -679,7 +690,7 @@ function runExclusiveWideScan(task, signal) {
       wideScanActive = true;
       try {
         throwIfAborted(signal);
-        return await task();
+        return await task(enqueuedAtMs);
       } finally {
         wideScanActive = false;
         wideScanQueued -= 1;
@@ -690,7 +701,7 @@ function runExclusiveWideScan(task, signal) {
       wideScanActive = true;
       try {
         throwIfAborted(signal);
-        return await task();
+        return await task(enqueuedAtMs);
       } finally {
         wideScanActive = false;
         wideScanQueued -= 1;
@@ -861,7 +872,9 @@ async function listPostingsWithFilters(options = {}) {
         .slice(-1000)
     : [];
 
-  const runPostingsQuery = async () => {
+  // enqueuedAtMs is supplied by runExclusiveWideScan; a query that never queued passes none
+  // and is measured from now, which is the same thing.
+  const runPostingsQuery = async (enqueuedAtMs) => {
   let rows = [];
   let candidateQuery = null;
   if (!search && !hasStructuredFilters && !reviewQueue && !needsMatchJoin) {
@@ -1370,7 +1383,10 @@ async function listPostingsWithFilters(options = {}) {
     let phaseIndex = 0;
     let cursor = null;
     let candidatesScanned = 0;
-    const scanStartedAt = Date.now();
+    const scanDeadlineAt = Math.max(
+      Date.now() + MIN_WIDE_SCAN_MILLIS,
+      Number(enqueuedAtMs || Date.now()) + MAX_WIDE_SCAN_MILLIS
+    );
 
     while (matchingRows.length < targetMatchCount && phaseIndex < candidateQuery.phases.length) {
       // Two bounds, because they fail in opposite directions: the row cap catches a walk
@@ -1381,7 +1397,7 @@ async function listPostingsWithFilters(options = {}) {
         scanBounded = true;
         break;
       }
-      if (Date.now() - scanStartedAt >= MAX_WIDE_SCAN_MILLIS) {
+      if (Date.now() >= scanDeadlineAt) {
         scanBounded = true;
         break;
       }
