@@ -359,6 +359,14 @@ async function openDatabase() {
   // DDL below died with SQLITE_BUSY at startup and the client reported the whole server as
   // failed. Waiting is the right behavior; 15s comfortably outlasts a sync commit.
   await db.exec("PRAGMA busy_timeout = 15000;");
+  // The MCP process can be the first process to open a brand-new database. Select the same
+  // reclaimable file layout as the API before ensureTables creates the first table.
+  const schemaCount = await db.get(
+    `SELECT COUNT(*) AS count FROM sqlite_master WHERE type IN ('table', 'index', 'view', 'trigger');`
+  );
+  if (Number(schemaCount?.count || 0) === 0) {
+    await db.exec(`PRAGMA auto_vacuum = INCREMENTAL;`);
+  }
   // The shared services read their handle from the runtime context rather than taking one.
   setDb(db);
   await ensureTables();

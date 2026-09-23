@@ -43,6 +43,14 @@ async function withSeededDb(run) {
   try {
     await createCanonicalPostingsTable();
     const db = getDb();
+    await db.exec(`
+      CREATE TABLE posting_application_state (
+        job_posting_url TEXT NOT NULL PRIMARY KEY,
+        applied INTEGER NOT NULL DEFAULT 0,
+        ignored INTEGER NOT NULL DEFAULT 0,
+        review_state TEXT NOT NULL DEFAULT 'unseen'
+      );
+    `);
     await seed(db);
     await run(db);
   } finally {
@@ -112,7 +120,16 @@ async function testRetentionSweepUsesIndex() {
   await withSeededDb(async (db) => {
     const plan = await planFor(
       db,
-      `SELECT id FROM Postings WHERE hidden = 1 AND hidden_at_epoch IS NOT NULL AND hidden_at_epoch < ?`,
+      `SELECT p.id
+       FROM Postings p
+       WHERE p.hidden = 1 AND p.hidden_at_epoch IS NOT NULL AND p.hidden_at_epoch < ?
+         AND NOT EXISTS (
+           SELECT 1 FROM posting_application_state state
+           WHERE state.job_posting_url = p.job_posting_url
+             AND (COALESCE(state.applied, 0) = 1
+               OR COALESCE(state.ignored, 0) = 1
+               OR COALESCE(state.review_state, 'unseen') <> 'unseen')
+         )`,
       [NOW]
     );
     assert.ok(

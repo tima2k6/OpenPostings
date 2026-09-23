@@ -178,11 +178,44 @@ async function ensureFtsRankConfigured() {
   await db.run(`INSERT INTO ${FTS_TABLE}(${FTS_TABLE}, rank) VALUES ('rank', 'bm25(${BM25_COLUMN_WEIGHTS})');`);
 }
 
+// An external-content FTS5 row can only be removed by supplying the exact text that was
+// originally indexed. Once the retention pruner clears job_description that text is gone,
+// which is how the semantic index accumulated more than a million hidden documents. These
+// triggers run while OLD still carries the text. The docsize membership guard matters:
+// issuing FTS5's special delete command for a posting that was never indexed can damage the
+// index's term counts.
+async function ensureFtsCleanupTriggers() {
+  const db = getDb();
+  await db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_postings_fts_clear_description
+    AFTER UPDATE OF job_description ON Postings
+    WHEN OLD.job_description IS NOT NULL
+      AND TRIM(OLD.job_description) <> ''
+      AND (NEW.job_description IS NULL OR TRIM(NEW.job_description) = '')
+      AND EXISTS (SELECT 1 FROM postings_fts_docsize WHERE id = OLD.id)
+    BEGIN
+      INSERT INTO ${FTS_TABLE}(${FTS_TABLE}, rowid, position_name, company_name, job_description)
+      VALUES ('delete', OLD.id, OLD.position_name, OLD.company_name, OLD.job_description);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_postings_fts_delete
+    AFTER DELETE ON Postings
+    WHEN OLD.job_description IS NOT NULL
+      AND TRIM(OLD.job_description) <> ''
+      AND EXISTS (SELECT 1 FROM postings_fts_docsize WHERE id = OLD.id)
+    BEGIN
+      INSERT INTO ${FTS_TABLE}(${FTS_TABLE}, rowid, position_name, company_name, job_description)
+      VALUES ('delete', OLD.id, OLD.position_name, OLD.company_name, OLD.job_description);
+    END;
+  `);
+}
+
 async function ensureFtsIndex() {
   const db = getDb();
   await ensureIndexStateTable();
   if (await ftsIndexExists()) {
     await ensureFtsRankConfigured();
+    await ensureFtsCleanupTriggers();
     return false;
   }
   // External content: the index stores only the inverted terms and points back at
@@ -198,6 +231,7 @@ async function ensureFtsIndex() {
     );
   `);
   await ensureFtsRankConfigured();
+  await ensureFtsCleanupTriggers();
   return true;
 }
 
@@ -254,8 +288,9 @@ async function rebuildSemanticIndex({
     // them out of every result, and nothing ever removes them from the index once they are
     // in, so they accumulate forever. Sampling the live index put hidden postings at ~87.7%
     // of 1.59M indexed documents -- roughly 1.39M documents that no query could ever return.
-    // They cannot be deleted retroactively either (see pruneHiddenFromIndex below), so the
-    // only way to keep the index from re-filling is never to add them.
+    // They cannot be deleted retroactively, so rebuild=true is what clears the historical
+    // backlog. The cleanup triggers installed by ensureFtsIndex remove newly hidden rows;
+    // this predicate ensures a rebuild never adds them in the first place.
     // NOT INDEXED is load-bearing, not a micro-optimisation. Adding `hidden = 0` to this
     // query made the planner prefer idx_postings_hidden_last_seen_epoch and then sort the
     // result by id in a temp b-tree -- materialising every visible row, descriptions and all,

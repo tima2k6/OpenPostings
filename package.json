@@ -43,6 +43,7 @@
     "test:backend:posting-page-fetcher": "node server/tests/posting-page-fetcher.test.js",
     "test:backend:db-facets": "node server/tests/db-facets.test.js",
     "test:backend:saved-queries": "node server/tests/saved-queries.test.js",
+    "test:backend:database-compaction": "node server/tests/database-compaction.test.js",
     "test:backend:posting-retention": "node server/tests/posting-retention.test.js",
     "test:backend:posting-query-plan": "node server/tests/posting-query-plan.test.js",
     "test:backend:posting-filter-pushdown": "node server/tests/posting-filter-pushdown.test.js",
@@ -58,6 +59,8 @@
     "apply": "./scripts/apply.sh",
     "apply:status": "./scripts/apply.sh status",
     "logs:server": "journalctl -u openpostings-server -n 50 -f",
+    "maintenance:rebuild-semantic-index": "node server/scripts/build-semantic-index.js --rebuild",
+    "maintenance:compact-db": "node server/scripts/compact-database.js",
     "lite:build-chunks": "node ./scripts/lite/build-lite-chunks.mjs",
     "lite:benchmark": "node ./scripts/lite/benchmark-lite-pipeline.mjs",
     "ios": "expo run:ios"

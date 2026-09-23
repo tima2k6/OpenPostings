@@ -1997,10 +1997,12 @@ async function upsertPostings(postings, lastSeenEpoch) {
   }
 }
 
-// Hidden rows are kept as tombstones rather than deleted immediately: job_posting_url is
-// UNIQUE, so the row is what lets a delisted posting be recognised (and its original
-// first_seen_epoch preserved) if the ATS lists it again inside the retention window.
-const HIDDEN_POSTING_RETENTION_SECONDS = 30 * 24 * 60 * 60;
+// Hidden rows are kept briefly as tombstones rather than deleted immediately:
+// job_posting_url is UNIQUE, so the row is what lets a delisted posting be recognised (and
+// its original first_seen_epoch preserved) if the ATS lists it again inside the retention
+// window. Seven days is enough time to absorb short-lived board/API omissions without
+// carrying millions of listings that nobody reviewed for a month.
+const HIDDEN_POSTING_RETENTION_SECONDS = 7 * 24 * 60 * 60;
 
 // Descriptions are dropped at the moment of hiding. They are the bulk of the database
 // (on a 658k-row instance, 435MB of 931MB lived in 96k descriptions) and nothing reads
@@ -2036,44 +2038,85 @@ async function pruneExpiredPostings(referenceEpoch = nowEpochSeconds()) {
   return Number(result?.changes || 0);
 }
 
-// Rows are collected and deleted in chunks so a backlog (the first run after this ships
-// clears every posting hidden more than the retention window ago) cannot hold one huge
-// write transaction open for the length of the delete.
+// Delete only untouched rows. Review/application state is keyed by URL and survives a
+// posting's lifecycle, but keeping the posting itself is useful for anything the user has
+// viewed, shortlisted, ignored or applied to. It is also the conservative interpretation
+// of retention: automated crawl data expires; user-owned history does not.
+//
+// Select and delete one chunk at a time. The first seven-day sweep can cover millions of
+// rows, and materialising every id before the first DELETE used hundreds of MB of memory.
+// Derived match/search rows are cache data, not user data, and must go in the same
+// transaction or they become permanent orphans that defeat the storage cleanup.
 async function deleteExpiredHiddenPostings(referenceEpoch = nowEpochSeconds()) {
   const resolvedReferenceEpoch = Number(referenceEpoch || nowEpochSeconds());
   const cutoffEpoch = resolvedReferenceEpoch - HIDDEN_POSTING_RETENTION_SECONDS;
   const db = getDb();
-
-  const rows = await db.all(
-    `
-      SELECT id
-      FROM Postings
-      WHERE hidden = 1
-        AND hidden_at_epoch IS NOT NULL
-        AND hidden_at_epoch < ?;
-    `,
-    [cutoffEpoch]
-  );
-  if (!Array.isArray(rows) || rows.length === 0) return 0;
-
-  const idsToDelete = rows
-    .map((row) => Number(row?.id || 0))
-    .filter((postingId) => Number.isFinite(postingId) && postingId > 0);
-  if (idsToDelete.length === 0) return 0;
-
   let totalDeleted = 0;
   const chunkSize = 800;
-  for (let offset = 0; offset < idsToDelete.length; offset += chunkSize) {
-    const chunk = idsToDelete.slice(offset, offset + chunkSize);
-    if (chunk.length === 0) continue;
+  const derivedTableRows = await db.all(
+    `SELECT name FROM sqlite_master
+     WHERE type = 'table' AND name IN ('posting_match_scores', 'postings_search_fts');`
+  );
+  const derivedTables = new Set(derivedTableRows.map((row) => String(row?.name || "")));
+
+  while (true) {
+    const rows = await db.all(
+      `
+        SELECT p.id
+        FROM Postings p
+        WHERE p.hidden = 1
+          AND p.hidden_at_epoch IS NOT NULL
+          AND p.hidden_at_epoch < ?
+          AND NOT EXISTS (
+            SELECT 1
+            FROM posting_application_state state
+            WHERE state.job_posting_url = p.job_posting_url
+              AND (
+                COALESCE(state.applied, 0) = 1
+                OR COALESCE(state.ignored, 0) = 1
+                OR COALESCE(state.review_state, 'unseen') <> 'unseen'
+              )
+          )
+        LIMIT ?;
+      `,
+      [cutoffEpoch, chunkSize]
+    );
+    if (!Array.isArray(rows) || rows.length === 0) break;
+
+    const chunk = rows
+      .map((row) => Number(row?.id || 0))
+      .filter((postingId) => Number.isFinite(postingId) && postingId > 0);
+    if (chunk.length === 0) break;
+
     const placeholders = chunk.map(() => "?").join(", ");
     totalDeleted += await runInWriteTransaction(async (handle) => {
+      if (derivedTables.has("posting_match_scores")) {
+        await handle.run(
+          `DELETE FROM posting_match_scores WHERE posting_id IN (${placeholders});`,
+          chunk
+        );
+      }
+      if (derivedTables.has("postings_search_fts")) {
+        await handle.run(
+          `DELETE FROM postings_search_fts WHERE rowid IN (${placeholders});`,
+          chunk
+        );
+      }
       const result = await handle.run(
         `DELETE FROM Postings WHERE id IN (${placeholders});`,
         chunk
       );
       return Number(result?.changes || 0);
     });
+  }
+
+  if (totalDeleted > 0) {
+    const autoVacuumRow = await db.get(`PRAGMA auto_vacuum;`);
+    if (Number(autoVacuumRow?.auto_vacuum || 0) === 2) {
+      // At 4 KiB/page this returns at most 64 MiB per sync. Bounding the work avoids
+      // turning a cleanup pass into a long exclusive maintenance window.
+      await db.exec(`PRAGMA incremental_vacuum(16384);`);
+    }
   }
 
   return totalDeleted;

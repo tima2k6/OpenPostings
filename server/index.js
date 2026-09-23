@@ -768,6 +768,19 @@ async function initDb() {
   setDb(await openDatabase({
     filename: DB_PATH
   }));
+  const db = getDb();
+
+  // Incremental auto-vacuum has to be selected before the first table is created. It lets
+  // the retention sweep return freed pages to the filesystem in bounded slices instead of
+  // letting the database keep its all-time high-water mark forever. Existing databases
+  // need the one-time maintenance:compact-db command to switch modes, because SQLite can
+  // only add the pointer map to a populated database during a full VACUUM.
+  const schemaCount = await db.get(
+    `SELECT COUNT(*) AS count FROM sqlite_master WHERE type IN ('table', 'index', 'view', 'trigger');`
+  );
+  if (Number(schemaCount?.count || 0) === 0) {
+    await db.exec(`PRAGMA auto_vacuum = INCREMENTAL;`);
+  }
 
   // A second connection on the same file, read-only, for the endpoints the app polls.
   // Registered explicitly with DB_PATH rather than letting the helper guess, because a
@@ -826,8 +839,6 @@ async function initDb() {
     console.error("[OpenPostings API] WAL checkpoint connection unavailable, periodic truncation disabled:", error?.message || error);
     walCheckpointDb = null;
   }
-
-  const db = getDb();
 
   await db.exec(`
     -- Other processes legitimately hold the write lock for moments at a time (the MCP

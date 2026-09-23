@@ -34,6 +34,14 @@ async function withDb(run) {
   setDb(await openDatabase({ filename }));
   try {
     await createCanonicalPostingsTable();
+    await getDb().exec(`
+      CREATE TABLE posting_application_state (
+        job_posting_url TEXT NOT NULL PRIMARY KEY,
+        applied INTEGER NOT NULL DEFAULT 0,
+        ignored INTEGER NOT NULL DEFAULT 0,
+        review_state TEXT NOT NULL DEFAULT 'unseen'
+      );
+    `);
     await run(getDb());
   } finally {
     setDb(null);
@@ -142,7 +150,7 @@ async function testDeleteRespectsRetentionWindow() {
   await withDb(async (db) => {
     await seedPosting(db, { url: "https://x/visible", firstSeen: NOW - 60 });
     await seedPosting(db, { url: "https://x/hidden-recent", firstSeen: NOW - 5 * DAY_SECONDS, hidden: 1, hiddenAt: NOW - 5 * DAY_SECONDS });
-    await seedPosting(db, { url: "https://x/hidden-old", firstSeen: NOW - 60 * DAY_SECONDS, hidden: 1, hiddenAt: NOW - 31 * DAY_SECONDS });
+    await seedPosting(db, { url: "https://x/hidden-old", firstSeen: NOW - 60 * DAY_SECONDS, hidden: 1, hiddenAt: NOW - 8 * DAY_SECONDS });
     await seedPosting(db, { url: "https://x/hidden-no-stamp", firstSeen: NOW - 60 * DAY_SECONDS, hidden: 1, hiddenAt: null });
 
     const deleted = await deleteExpiredHiddenPostings(NOW);
@@ -157,6 +165,77 @@ async function testDeleteRespectsRetentionWindow() {
   });
 }
 
+async function testDeletePreservesUserReviewedPostings() {
+  await withDb(async (db) => {
+    const protectedPostings = [
+      { url: "https://x/applied", applied: 1, ignored: 0, reviewState: "unseen" },
+      { url: "https://x/viewed", applied: 0, ignored: 0, reviewState: "viewed" },
+      { url: "https://x/shortlisted", applied: 0, ignored: 0, reviewState: "shortlisted" },
+      { url: "https://x/ignored", applied: 0, ignored: 1, reviewState: "ignored" }
+    ];
+
+    for (const posting of protectedPostings) {
+      await seedPosting(db, {
+        url: posting.url,
+        firstSeen: NOW - 60 * DAY_SECONDS,
+        hidden: 1,
+        hiddenAt: NOW - 8 * DAY_SECONDS
+      });
+      await db.run(
+        `INSERT INTO posting_application_state (job_posting_url, applied, ignored, review_state)
+         VALUES (?, ?, ?, ?);`,
+        [posting.url, posting.applied, posting.ignored, posting.reviewState]
+      );
+    }
+    await seedPosting(db, {
+      url: "https://x/untouched",
+      firstSeen: NOW - 60 * DAY_SECONDS,
+      hidden: 1,
+      hiddenAt: NOW - 8 * DAY_SECONDS
+    });
+
+    const deleted = await deleteExpiredHiddenPostings(NOW);
+    assert.strictEqual(deleted, 1, "only the untouched posting should expire");
+
+    const remaining = await db.all(`SELECT job_posting_url FROM Postings ORDER BY job_posting_url;`);
+    assert.deepStrictEqual(
+      remaining.map((row) => row.job_posting_url),
+      protectedPostings.map((posting) => posting.url).sort(),
+      "every posting with user-owned review or application state must survive"
+    );
+  });
+}
+
+async function testDeleteClearsDerivedRows() {
+  await withDb(async (db) => {
+    await db.exec(`
+      CREATE TABLE posting_match_scores (
+        posting_id INTEGER NOT NULL,
+        resume_key TEXT NOT NULL,
+        PRIMARY KEY (posting_id, resume_key)
+      );
+      CREATE VIRTUAL TABLE postings_search_fts USING fts5(company_name, position_name, location);
+    `);
+    await seedPosting(db, {
+      url: "https://x/with-derived-data",
+      firstSeen: NOW - 60 * DAY_SECONDS,
+      hidden: 1,
+      hiddenAt: NOW - 8 * DAY_SECONDS
+    });
+    const posting = await db.get(`SELECT id FROM Postings WHERE job_posting_url = 'https://x/with-derived-data';`);
+    await db.run(`INSERT INTO posting_match_scores (posting_id, resume_key) VALUES (?, 'resume');`, [posting.id]);
+    await db.run(
+      `INSERT INTO postings_search_fts(rowid, company_name, position_name, location)
+       VALUES (?, 'Acme', 'Engineer', 'Remote');`,
+      [posting.id]
+    );
+
+    assert.strictEqual(await deleteExpiredHiddenPostings(NOW), 1);
+    assert.strictEqual(Number((await db.get(`SELECT COUNT(*) AS count FROM posting_match_scores;`)).count), 0);
+    assert.strictEqual(Number((await db.get(`SELECT COUNT(*) AS count FROM postings_search_fts;`)).count), 0);
+  });
+}
+
 async function testDeleteChunksBeyondOneBatch() {
   await withDb(async (db) => {
     const total = 1900;
@@ -165,7 +244,7 @@ async function testDeleteChunksBeyondOneBatch() {
         url: `https://x/bulk/${index}`,
         firstSeen: NOW - 60 * DAY_SECONDS,
         hidden: 1,
-        hiddenAt: NOW - 40 * DAY_SECONDS
+        hiddenAt: NOW - 8 * DAY_SECONDS
       });
     }
     await seedPosting(db, { url: "https://x/keep", firstSeen: NOW - 60 });
@@ -194,6 +273,8 @@ async function main() {
   await testPruneKeepsPostingsStillListed();
   await testResightRevivesHiddenPosting();
   await testDeleteRespectsRetentionWindow();
+  await testDeletePreservesUserReviewedPostings();
+  await testDeleteClearsDerivedRows();
   await testDeleteChunksBeyondOneBatch();
   await testDeleteIsNoOpWhenNothingExpired();
   console.log("posting-retention tests passed");

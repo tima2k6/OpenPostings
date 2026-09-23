@@ -6,7 +6,8 @@
 //    query could return. They cannot be deleted retroactively either -- postings_fts is an
 //    FTS5 external content table, so deleting a row requires re-supplying the exact text
 //    that was indexed, and hidden postings have had their descriptions cleared (5,000 of
-//    5,000 sampled were empty). The only defence is never to index them.
+//    5,000 sampled were empty). Rebuilding clears that historical backlog; new hides are
+//    removed while the old description is still available.
 //
 // 2. It lost visible postings permanently. The forward cursor skipped rows with no
 //    description but still advanced past them, and the description backfill then filled
@@ -61,6 +62,34 @@ async function testForwardPassSkipsHiddenPostings() {
     await rebuildSemanticIndex({ batch_size: 10, max_batches: 5 });
 
     assert.deepStrictEqual(await indexedIds(db), [1, 3], "hidden postings must never be indexed");
+  });
+}
+
+async function testIndexEntryIsRemovedWhenDescriptionIsCleared() {
+  await withDb(async (db) => {
+    await insert(db, 1);
+    await insert(db, 2);
+    await rebuildSemanticIndex({ batch_size: 10, max_batches: 5 });
+    assert.deepStrictEqual(await indexedIds(db), [1, 2]);
+
+    // This is the retention pruner's write shape. The trigger must use OLD here because the
+    // external-content index cannot remove the document after this statement has finished.
+    await db.run(`UPDATE Postings SET hidden = 1, job_description = NULL WHERE id = 1;`);
+    assert.deepStrictEqual(await indexedIds(db), [2]);
+
+    const matches = await db.all(
+      `SELECT rowid FROM postings_fts WHERE postings_fts MATCH 'alphaword' ORDER BY rowid;`
+    );
+    assert.deepStrictEqual(matches.map((row) => row.rowid), [2]);
+  });
+}
+
+async function testIndexEntryIsRemovedWithPosting() {
+  await withDb(async (db) => {
+    await insert(db, 1);
+    await rebuildSemanticIndex({ batch_size: 10, max_batches: 5 });
+    await db.run(`DELETE FROM Postings WHERE id = 1;`);
+    assert.deepStrictEqual(await indexedIds(db), []);
   });
 }
 
@@ -160,6 +189,8 @@ async function testGapScanCyclesBackToTheBottom() {
 
 async function run() {
   await testForwardPassSkipsHiddenPostings();
+  await testIndexEntryIsRemovedWhenDescriptionIsCleared();
+  await testIndexEntryIsRemovedWithPosting();
   await testGapScanRecoversADescriptionFilledAfterTheCursorPassed();
   await testGapScanSkipsHiddenAndDescriptionlessRows();
   await testGapScanDoesNotDoubleIndex();
