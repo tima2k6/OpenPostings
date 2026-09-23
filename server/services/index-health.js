@@ -59,7 +59,7 @@ async function sampleCoverage(db, maxId) {
     const rows = await db.all(
       `SELECT id, job_description IS NOT NULL AND TRIM(job_description) <> '' AS has_description
        FROM Postings NOT INDEXED
-       WHERE id > ? AND hidden = 0
+       WHERE id > ? AND hidden = 0 AND cold_at_epoch IS NULL
        ORDER BY id
        LIMIT ?;`,
       [from, SAMPLE_PER_BAND]

@@ -32,7 +32,8 @@ async function withIndexedPostings(postings, run) {
         location TEXT, city TEXT, state_region TEXT, country TEXT, is_remote INTEGER DEFAULT 0,
         pay_min REAL, pay_max REAL, pay_currency TEXT, pay_period TEXT,
         status TEXT DEFAULT 'unverified', location_conflict INTEGER DEFAULT 0,
-        posting_date TEXT, first_seen_epoch INTEGER, last_seen_epoch INTEGER, hidden INTEGER DEFAULT 0
+        posting_date TEXT, first_seen_epoch INTEGER, last_seen_epoch INTEGER, hidden INTEGER DEFAULT 0,
+        cold_at_epoch INTEGER
       );
     `);
     for (const posting of postings) {

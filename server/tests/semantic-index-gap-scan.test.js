@@ -33,7 +33,8 @@ async function withDb(run) {
         position_name TEXT,
         company_name TEXT,
         job_description TEXT,
-        hidden INTEGER NOT NULL DEFAULT 0
+        hidden INTEGER NOT NULL DEFAULT 0,
+        cold_at_epoch INTEGER
       );
     `);
     await run(db);

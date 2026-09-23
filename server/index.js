@@ -89,7 +89,7 @@ const { upsertSeededCompanySource } = require("./services/seeded-source.js");
 const { getMcpSettings, upsertMcpSettings, buildMcpRunbook } = require("./services/mcp.js");
 const { buildCoverLetterDraft, buildCoverLetterBrief } = require("./services/cover-letter.js");
 const { listApplications, createApplication, updateApplicationStatus, updateApplicationFit, deleteApplicationById, getApplicationDenialStats } = require("./services/applications.js");
-const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable, ensurePostingLocationStateIndex, startSyncStallWatchdog, getSyncCoverageStats, getLastSyncWriteEpoch } = require("./services/sync-runtime.js");
+const { runAtsSync, getSyncScopeStats, syncStatus, createCanonicalPostingsTable, ensurePostingLocationStateIndex, startSyncStallWatchdog, getSyncCoverageStats, getLastSyncWriteEpoch, runPostingStorageMaintenance, getPostingStorageMaintenanceStatus } = require("./services/sync-runtime.js");
 const {
   startEnrichmentLoops,
   getEnrichmentStatus,
@@ -147,6 +147,19 @@ const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS || 10 * 60 * 1000);
 // Delaying the first pass costs almost nothing: the interval below still fires on schedule,
 // and runAtsSync is single-flight, so nothing overlaps or is skipped.
 const SYNC_STARTUP_DELAY_MS = Number(process.env.SYNC_STARTUP_DELAY_MS || 2 * 60 * 1000);
+// Retention cannot depend on a full sync pass completing: the host intentionally recycles
+// this process every 12 hours, while a rate-limited pass can take longer. This independent,
+// single-flight loop processes a bounded number of rows and then yields. Ten thousand rows
+// measured far better than a 50k slice on production: the latter produced a ~695MB WAL
+// burst even though its individual transactions were small. Shorter slices give PASSIVE
+// checkpoints time to drain between runs while preserving roughly 40k rows/hour of catch-up.
+const POSTING_MAINTENANCE_INTERVAL_MS = Number(
+  process.env.POSTING_MAINTENANCE_INTERVAL_MS || 15 * 60 * 1000
+);
+const POSTING_MAINTENANCE_INITIAL_DELAY_MS = Number(
+  process.env.POSTING_MAINTENANCE_INITIAL_DELAY_MS || 5 * 60 * 1000
+);
+const POSTING_MAINTENANCE_MAX_ROWS = Number(process.env.POSTING_MAINTENANCE_MAX_ROWS || 10000);
 // wal_autocheckpoint and journal_size_limit (set in initDb) bound how large the WAL can grow
 // and passively reclaim its *content* into the main file, but neither ever shrinks the file
 // itself back down. A connection that briefly holds an older snapshot open (an MCP client,
@@ -977,6 +990,13 @@ async function ensurePostingsTable() {
     await db.exec(`ALTER TABLE Postings ADD COLUMN hidden_at_epoch INTEGER;`);
   }
 
+  // NULL means fully hydrated/hot. Old untouched listings keep their compact metadata but
+  // have description-derived payloads removed; the epoch prevents every sync from putting
+  // those payloads straight back.
+  if (!existingColumns.has("cold_at_epoch")) {
+    await db.exec(`ALTER TABLE Postings ADD COLUMN cold_at_epoch INTEGER;`);
+  }
+
   if (!existingColumns.has("job_description")) {
     await db.exec(`ALTER TABLE Postings ADD COLUMN job_description TEXT;`);
   }
@@ -1101,8 +1121,9 @@ async function ensurePostingsTable() {
   }
 
   await db.exec(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_postings_job_posting_url
-      ON Postings(job_posting_url);
+    -- job_posting_url already has the UNIQUE constraint's sqlite_autoindex. The explicit
+    -- copy held another full URL b-tree (~114MB on production) and doubled its write work.
+    DROP INDEX IF EXISTS idx_postings_job_posting_url;
 
     CREATE INDEX IF NOT EXISTS idx_postings_company_name
       ON Postings(company_name);
@@ -1124,6 +1145,9 @@ async function ensurePostingsTable() {
 
     CREATE INDEX IF NOT EXISTS idx_postings_hidden_last_seen_epoch
       ON Postings(hidden, last_seen_epoch);
+
+    CREATE INDEX IF NOT EXISTS idx_postings_cold_first_seen_epoch
+      ON Postings(cold_at_epoch, hidden, first_seen_epoch);
 
     CREATE INDEX IF NOT EXISTS idx_postings_location
       ON Postings(location);
@@ -1277,6 +1301,33 @@ async function ensureApplicationsTable() {
       ON posting_application_state(ignored);
   `);
   await ensurePostingReviewSchema(db);
+  // Any real user interaction promotes a cold listing back to the hydrated tier. Clearing
+  // the marker lets the normal on-demand/backfill path fetch its description again; the
+  // historical viewed/shortlisted timestamps keep later maintenance from cooling it twice.
+  await db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_posting_state_warms_posting_insert
+    AFTER INSERT ON posting_application_state
+    WHEN COALESCE(NEW.applied, 0) = 1
+      OR COALESCE(NEW.ignored, 0) = 1
+      OR COALESCE(NEW.review_state, 'unseen') <> 'unseen'
+      OR NEW.viewed_at_epoch IS NOT NULL
+      OR NEW.shortlisted_at_epoch IS NOT NULL
+    BEGIN
+      UPDATE Postings SET cold_at_epoch = NULL WHERE job_posting_url = NEW.job_posting_url;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_posting_state_warms_posting_update
+    AFTER UPDATE OF applied, ignored, review_state, viewed_at_epoch, shortlisted_at_epoch
+    ON posting_application_state
+    WHEN COALESCE(NEW.applied, 0) = 1
+      OR COALESCE(NEW.ignored, 0) = 1
+      OR COALESCE(NEW.review_state, 'unseen') <> 'unseen'
+      OR NEW.viewed_at_epoch IS NOT NULL
+      OR NEW.shortlisted_at_epoch IS NOT NULL
+    BEGIN
+      UPDATE Postings SET cold_at_epoch = NULL WHERE job_posting_url = NEW.job_posting_url;
+    END;
+  `);
 
   // These columns used to hold the agent's login email and password in plaintext, handed
   // to the agent so it could create accounts and sign in as the user. That capability is
@@ -1868,6 +1919,7 @@ function createServer() {
         wal_size_mb: Math.round(walSizeBytes / 1048576),
         host_memory: hostMemory,
         health_warnings: healthWarnings,
+        posting_storage_maintenance: getPostingStorageMaintenanceStatus(),
         scraper_request_queue: getAtsRequestQueueStats(),
         ...syncScopeStats,
         filtered_query_queue: filteredQueryQueue,
@@ -2862,6 +2914,28 @@ function startWalCheckpointTasks() {
   return { passiveTimer, truncateTimer };
 }
 
+function startPostingStorageMaintenanceLoop() {
+  const schedule = (delayMs) => {
+    const timer = setTimeout(async () => {
+      try {
+        const summary = await runPostingStorageMaintenance({ max_rows: POSTING_MAINTENANCE_MAX_ROWS });
+        if (summary.pruned + summary.archived + summary.deleted > 0) {
+          console.log(
+            `[OpenPostings API] posting storage maintenance: ${summary.pruned} stale hidden, ` +
+              `${summary.archived} cold archived, ${summary.deleted} expired deleted`
+          );
+        }
+      } catch (error) {
+        console.error("[OpenPostings API] posting storage maintenance failed:", error?.message || error);
+      }
+      schedule(POSTING_MAINTENANCE_INTERVAL_MS);
+    }, delayMs);
+    if (typeof timer.unref === "function") timer.unref();
+    return timer;
+  };
+  return schedule(POSTING_MAINTENANCE_INITIAL_DELAY_MS);
+}
+
 async function start() {
   await initDb();
 
@@ -2901,6 +2975,7 @@ async function start() {
   // does not leave the cached promise in place and stop syncing until a restart.
   startSyncStallWatchdog();
   startWalCheckpointTasks();
+  startPostingStorageMaintenanceLoop();
 
   // Fetching posting pages and keeping the semantic index current run on their own
   // clocks, deliberately not tied to a sync pass finishing.

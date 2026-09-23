@@ -306,6 +306,7 @@ async function rebuildSemanticIndex({
        FROM Postings NOT INDEXED
        WHERE id > ?
          AND hidden = 0
+         AND cold_at_epoch IS NULL
          AND job_description IS NOT NULL AND TRIM(job_description) <> ''
        ORDER BY id
        LIMIT ?;`,
@@ -410,6 +411,7 @@ async function gapScanSemanticIndex({
        FROM Postings NOT INDEXED
        WHERE id > ? AND id <= ?
          AND hidden = 0
+         AND cold_at_epoch IS NULL
        ORDER BY id
        LIMIT ?;`,
       [cursor, ceiling, batchSize]
