@@ -1658,8 +1658,8 @@ async function runAtsSyncInternal() {
         message: `post-sync prunePostingsOutsideDateWindow failed: ${String(error?.message || error)}`
       });
     }
-    // Only after the pass, not before: the delete is the one irreversible step here, and
-    // running it once per pass on rows hidden a month ago is not worth doing twice.
+    // The independent storage-maintenance loop also runs this in bounded slices. Keeping
+    // the pass-end sweep preserves eager cleanup on installations whose passes are short.
     try {
       hiddenDeleted = await deleteExpiredHiddenPostings(syncReferenceEpoch);
     } catch (error) {
@@ -1909,14 +1909,21 @@ async function upsertPostingsBatch(postings, seenEpoch) {
             country = CASE WHEN excluded.location IS NOT NULL OR Postings.location IS NULL THEN excluded.country ELSE Postings.country END,
             is_remote = CASE WHEN excluded.location IS NOT NULL OR Postings.location IS NULL THEN excluded.is_remote ELSE Postings.is_remote END,
             locations_json = CASE WHEN excluded.location IS NOT NULL OR Postings.location IS NULL THEN excluded.locations_json ELSE Postings.locations_json END,
-            job_description = COALESCE(excluded.job_description, Postings.job_description),
+            -- Cold rows deliberately retain only compact listing metadata. A board that
+            -- returns the full body on every crawl must not immediately undo the storage
+            -- maintenance that cleared it. User activity clears cold_at_epoch through the
+            -- posting_application_state triggers, at which point normal hydration resumes.
+            job_description = CASE
+              WHEN Postings.cold_at_epoch IS NOT NULL THEN NULL
+              ELSE COALESCE(excluded.job_description, Postings.job_description)
+            END,
             compensation_type = COALESCE(excluded.compensation_type, Postings.compensation_type),
             education_levels = COALESCE(excluded.education_levels, Postings.education_levels),
-            pay_min = CASE WHEN excluded.job_description IS NULL THEN Postings.pay_min ELSE excluded.pay_min END,
-            pay_max = CASE WHEN excluded.job_description IS NULL THEN Postings.pay_max ELSE excluded.pay_max END,
-            pay_currency = CASE WHEN excluded.job_description IS NULL THEN Postings.pay_currency ELSE excluded.pay_currency END,
-            pay_period = CASE WHEN excluded.job_description IS NULL THEN Postings.pay_period ELSE excluded.pay_period END,
-            pay_raw = CASE WHEN excluded.job_description IS NULL THEN Postings.pay_raw ELSE excluded.pay_raw END,
+            pay_min = CASE WHEN Postings.cold_at_epoch IS NOT NULL OR excluded.job_description IS NULL THEN Postings.pay_min ELSE excluded.pay_min END,
+            pay_max = CASE WHEN Postings.cold_at_epoch IS NOT NULL OR excluded.job_description IS NULL THEN Postings.pay_max ELSE excluded.pay_max END,
+            pay_currency = CASE WHEN Postings.cold_at_epoch IS NOT NULL OR excluded.job_description IS NULL THEN Postings.pay_currency ELSE excluded.pay_currency END,
+            pay_period = CASE WHEN Postings.cold_at_epoch IS NOT NULL OR excluded.job_description IS NULL THEN Postings.pay_period ELSE excluded.pay_period END,
+            pay_raw = CASE WHEN Postings.cold_at_epoch IS NOT NULL OR excluded.job_description IS NULL THEN Postings.pay_raw ELSE excluded.pay_raw END,
             first_seen_epoch = COALESCE(Postings.first_seen_epoch, Postings.last_seen_epoch, excluded.first_seen_epoch),
             last_seen_epoch = excluded.last_seen_epoch,
             -- Seeing a posting again means the ATS still lists it, so it is open and must
@@ -2003,6 +2010,36 @@ async function upsertPostings(postings, lastSeenEpoch) {
 // window. Seven days is enough time to absorb short-lived board/API omissions without
 // carrying millions of listings that nobody reviewed for a month.
 const HIDDEN_POSTING_RETENTION_SECONDS = 7 * 24 * 60 * 60;
+// Still-live listings have a different lifecycle from delisted tombstones. Keeping their
+// title/company/location lets them remain discoverable, but retaining a full description
+// and two description-derived indexes indefinitely is the bulk of the database. After this
+// window an untouched listing becomes cold: metadata stays, description-derived data goes.
+const COLD_POSTING_RETENTION_SECONDS = 7 * 24 * 60 * 60;
+const POSTING_MAINTENANCE_CHUNK_SIZE = 800;
+
+function normalizeMaintenanceMaxRows(value) {
+  if (value === undefined || value === null || value === Number.POSITIVE_INFINITY) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : Number.POSITIVE_INFINITY;
+}
+
+async function getDerivedPostingCacheTables() {
+  const rows = await getDb().all(
+    `SELECT name FROM sqlite_master
+     WHERE type = 'table' AND name IN ('posting_match_scores', 'postings_search_fts');`
+  );
+  return new Set(rows.map((row) => String(row?.name || "")));
+}
+
+async function reclaimFreelistPages(maxPages = 16384) {
+  const db = getDb();
+  const autoVacuumRow = await db.get(`PRAGMA auto_vacuum;`);
+  if (Number(autoVacuumRow?.auto_vacuum || 0) === 2) {
+    await db.exec(`PRAGMA incremental_vacuum(${Math.max(1, Math.floor(Number(maxPages) || 1))});`);
+  }
+}
 
 // Descriptions are dropped at the moment of hiding. They are the bulk of the database
 // (on a 658k-row instance, 435MB of 931MB lived in 96k descriptions) and nothing reads
@@ -2016,26 +2053,141 @@ const HIDDEN_POSTING_RETENTION_SECONDS = 7 * 24 * 60 * 60;
 // range scan on idx_postings_hidden_last_seen_epoch; wrapping it narrows nothing and makes
 // this walk every visible row. The upsert always stamps last_seen_epoch, so it is never
 // NULL in practice -- a NULL would simply never be pruned, and the read path hides it too.
-async function pruneExpiredPostings(referenceEpoch = nowEpochSeconds()) {
+async function pruneExpiredPostings(referenceEpoch = nowEpochSeconds(), options = {}) {
   const resolvedReferenceEpoch = Number(referenceEpoch || nowEpochSeconds());
   const cutoffEpoch = resolvedReferenceEpoch - getPostingFreshnessWindowSeconds();
-  const db = getDb()
-  const result = await db.run(
-    `
-      UPDATE Postings
-      SET
-        hidden = 1,
-        hidden_at_epoch = COALESCE(hidden_at_epoch, ?),
-        -- The ATS has stopped listing this. Distinct from a posting that is still listed
-        -- but older than the date window; only this kind is genuinely gone.
-        hidden_reason = 'delisted',
-        job_description = NULL
-      WHERE hidden = 0
-        AND last_seen_epoch < ?;
-    `,
-    [resolvedReferenceEpoch, cutoffEpoch]
-  );
-  return Number(result?.changes || 0);
+  const db = getDb();
+  const maxRows = normalizeMaintenanceMaxRows(options.max_rows);
+  if (maxRows === 0) return 0;
+  const derivedTables = await getDerivedPostingCacheTables();
+  let totalPruned = 0;
+
+  while (totalPruned < maxRows) {
+    const limit = Math.min(POSTING_MAINTENANCE_CHUNK_SIZE, maxRows - totalPruned);
+    const rows = await db.all(
+      `SELECT id
+       FROM Postings
+       WHERE hidden = 0 AND last_seen_epoch < ?
+       ORDER BY last_seen_epoch, id
+       LIMIT ?;`,
+      [cutoffEpoch, limit]
+    );
+    const ids = rows.map((row) => Number(row?.id || 0)).filter((id) => id > 0);
+    if (ids.length === 0) break;
+    const placeholders = ids.map(() => "?").join(", ");
+
+    totalPruned += await runInWriteTransaction(async (handle) => {
+      if (derivedTables.has("posting_match_scores")) {
+        await handle.run(`DELETE FROM posting_match_scores WHERE posting_id IN (${placeholders});`, ids);
+      }
+      if (derivedTables.has("postings_search_fts")) {
+        await handle.run(`DELETE FROM postings_search_fts WHERE rowid IN (${placeholders});`, ids);
+      }
+      const result = await handle.run(
+        `UPDATE Postings
+         SET hidden = 1,
+             hidden_at_epoch = COALESCE(hidden_at_epoch, ?),
+             hidden_reason = 'delisted',
+             job_description = NULL
+         WHERE hidden = 0 AND id IN (${placeholders});`,
+        [resolvedReferenceEpoch, ...ids]
+      );
+      return Number(result?.changes || 0);
+    });
+  }
+
+  return totalPruned;
+}
+
+// Move old, untouched, still-live postings into a compact tier. The row remains visible and
+// searchable through postings_search_fts, so this is not a product-level deletion. Only the
+// bulky description and the caches derived from it are removed. first_seen_epoch is the
+// clock here: last_seen_epoch keeps advancing for a role that remains listed, while the
+// policy is specifically about how long it has sat without any user interaction.
+async function archiveColdUntouchedPostings(referenceEpoch = nowEpochSeconds(), options = {}) {
+  const resolvedReferenceEpoch = Number(referenceEpoch || nowEpochSeconds());
+  const cutoffEpoch = resolvedReferenceEpoch - COLD_POSTING_RETENTION_SECONDS;
+  const db = getDb();
+  const maxRows = normalizeMaintenanceMaxRows(options.max_rows);
+  if (maxRows === 0) return 0;
+  const derivedTables = await getDerivedPostingCacheTables();
+  let totalArchived = 0;
+
+  while (totalArchived < maxRows) {
+    const limit = Math.min(POSTING_MAINTENANCE_CHUNK_SIZE, maxRows - totalArchived);
+    const rows = await db.all(
+      `SELECT p.id
+       FROM Postings p
+       WHERE p.hidden = 0
+         AND p.cold_at_epoch IS NULL
+         AND p.first_seen_epoch IS NOT NULL
+         AND p.first_seen_epoch < ?
+         AND NOT EXISTS (
+           SELECT 1
+           FROM posting_application_state state
+           WHERE state.job_posting_url = p.job_posting_url
+             AND (
+               COALESCE(state.applied, 0) = 1
+               OR COALESCE(state.ignored, 0) = 1
+               OR COALESCE(state.review_state, 'unseen') <> 'unseen'
+               OR state.viewed_at_epoch IS NOT NULL
+               OR state.shortlisted_at_epoch IS NOT NULL
+             )
+         )
+       ORDER BY p.first_seen_epoch, p.id
+       LIMIT ?;`,
+      [cutoffEpoch, limit]
+    );
+    const ids = rows.map((row) => Number(row?.id || 0)).filter((id) => id > 0);
+    if (ids.length === 0) break;
+    const placeholders = ids.map(() => "?").join(", ");
+
+    totalArchived += await runInWriteTransaction(async (handle) => {
+      if (derivedTables.has("posting_match_scores")) {
+        await handle.run(
+          `DELETE FROM posting_match_scores
+           WHERE posting_id IN (
+             SELECT p.id FROM Postings p
+             WHERE p.id IN (${placeholders})
+               AND NOT EXISTS (
+                 SELECT 1 FROM posting_application_state state
+                 WHERE state.job_posting_url = p.job_posting_url
+                   AND (COALESCE(state.applied, 0) = 1
+                     OR COALESCE(state.ignored, 0) = 1
+                     OR COALESCE(state.review_state, 'unseen') <> 'unseen'
+                     OR state.viewed_at_epoch IS NOT NULL
+                     OR state.shortlisted_at_epoch IS NOT NULL)
+               )
+           );`,
+          ids
+        );
+      }
+      const result = await handle.run(
+        `UPDATE Postings
+         SET cold_at_epoch = COALESCE(cold_at_epoch, ?),
+             job_description = NULL,
+             description_fetched_at = NULL,
+             description_fetch_failed_at = NULL
+         WHERE cold_at_epoch IS NULL AND id IN (${placeholders})
+           AND NOT EXISTS (
+             SELECT 1 FROM posting_application_state state
+             WHERE state.job_posting_url = Postings.job_posting_url
+               AND (COALESCE(state.applied, 0) = 1
+                 OR COALESCE(state.ignored, 0) = 1
+                 OR COALESCE(state.review_state, 'unseen') <> 'unseen'
+                 OR state.viewed_at_epoch IS NOT NULL
+                 OR state.shortlisted_at_epoch IS NOT NULL)
+           );`,
+        [resolvedReferenceEpoch, ...ids]
+      );
+      return Number(result?.changes || 0);
+    });
+  }
+
+  if (totalArchived > 0 && options.vacuum !== false) {
+    await reclaimFreelistPages(options.vacuum_pages);
+  }
+  return totalArchived;
 }
 
 // Delete only untouched rows. Review/application state is keyed by URL and survives a
@@ -2047,19 +2199,17 @@ async function pruneExpiredPostings(referenceEpoch = nowEpochSeconds()) {
 // rows, and materialising every id before the first DELETE used hundreds of MB of memory.
 // Derived match/search rows are cache data, not user data, and must go in the same
 // transaction or they become permanent orphans that defeat the storage cleanup.
-async function deleteExpiredHiddenPostings(referenceEpoch = nowEpochSeconds()) {
+async function deleteExpiredHiddenPostings(referenceEpoch = nowEpochSeconds(), options = {}) {
   const resolvedReferenceEpoch = Number(referenceEpoch || nowEpochSeconds());
   const cutoffEpoch = resolvedReferenceEpoch - HIDDEN_POSTING_RETENTION_SECONDS;
   const db = getDb();
   let totalDeleted = 0;
-  const chunkSize = 800;
-  const derivedTableRows = await db.all(
-    `SELECT name FROM sqlite_master
-     WHERE type = 'table' AND name IN ('posting_match_scores', 'postings_search_fts');`
-  );
-  const derivedTables = new Set(derivedTableRows.map((row) => String(row?.name || "")));
+  const maxRows = normalizeMaintenanceMaxRows(options.max_rows);
+  if (maxRows === 0) return 0;
+  const derivedTables = await getDerivedPostingCacheTables();
 
-  while (true) {
+  while (totalDeleted < maxRows) {
+    const chunkSize = Math.min(POSTING_MAINTENANCE_CHUNK_SIZE, maxRows - totalDeleted);
     const rows = await db.all(
       `
         SELECT p.id
@@ -2075,6 +2225,8 @@ async function deleteExpiredHiddenPostings(referenceEpoch = nowEpochSeconds()) {
                 COALESCE(state.applied, 0) = 1
                 OR COALESCE(state.ignored, 0) = 1
                 OR COALESCE(state.review_state, 'unseen') <> 'unseen'
+                OR state.viewed_at_epoch IS NOT NULL
+                OR state.shortlisted_at_epoch IS NOT NULL
               )
           )
         LIMIT ?;
@@ -2103,23 +2255,82 @@ async function deleteExpiredHiddenPostings(referenceEpoch = nowEpochSeconds()) {
         );
       }
       const result = await handle.run(
-        `DELETE FROM Postings WHERE id IN (${placeholders});`,
+        `DELETE FROM Postings
+         WHERE id IN (${placeholders})
+           AND NOT EXISTS (
+             SELECT 1 FROM posting_application_state state
+             WHERE state.job_posting_url = Postings.job_posting_url
+               AND (COALESCE(state.applied, 0) = 1
+                 OR COALESCE(state.ignored, 0) = 1
+                 OR COALESCE(state.review_state, 'unseen') <> 'unseen'
+                 OR state.viewed_at_epoch IS NOT NULL
+                 OR state.shortlisted_at_epoch IS NOT NULL)
+           );`,
         chunk
       );
       return Number(result?.changes || 0);
     });
   }
 
-  if (totalDeleted > 0) {
-    const autoVacuumRow = await db.get(`PRAGMA auto_vacuum;`);
-    if (Number(autoVacuumRow?.auto_vacuum || 0) === 2) {
-      // At 4 KiB/page this returns at most 64 MiB per sync. Bounding the work avoids
-      // turning a cleanup pass into a long exclusive maintenance window.
-      await db.exec(`PRAGMA incremental_vacuum(16384);`);
-    }
+  if (totalDeleted > 0 && options.vacuum !== false) {
+    // At 4 KiB/page the default returns at most 64 MiB per run. Bounding the work avoids
+    // turning cleanup into a long exclusive maintenance window.
+    await reclaimFreelistPages(options.vacuum_pages);
   }
 
   return totalDeleted;
+}
+
+const postingStorageMaintenanceStatus = {
+  running: false,
+  last_run_at: null,
+  last_summary: null,
+  last_error: null
+};
+let postingStorageMaintenancePromise = null;
+
+function getPostingStorageMaintenanceStatus() {
+  return { ...postingStorageMaintenanceStatus };
+}
+
+// Independent of a sync pass completing. The production service deliberately recycles on
+// a shorter clock than a worst-case pass, so a pass-bound cleanup can otherwise be postponed
+// forever. Every phase is row-bounded and chunked into short transactions.
+function runPostingStorageMaintenance({
+  reference_epoch = nowEpochSeconds(),
+  max_rows = 10000,
+  vacuum_pages = 16384
+} = {}) {
+  if (postingStorageMaintenancePromise) return postingStorageMaintenancePromise;
+  postingStorageMaintenanceStatus.running = true;
+  postingStorageMaintenancePromise = (async () => {
+    try {
+      const referenceEpoch = Number(reference_epoch || nowEpochSeconds());
+      const boundedRows = normalizeMaintenanceMaxRows(max_rows);
+      const pruned = await pruneExpiredPostings(referenceEpoch, { max_rows: boundedRows });
+      const archived = await archiveColdUntouchedPostings(referenceEpoch, {
+        max_rows: boundedRows,
+        vacuum: false
+      });
+      const deleted = await deleteExpiredHiddenPostings(referenceEpoch, {
+        max_rows: boundedRows,
+        vacuum: false
+      });
+      if (pruned + archived + deleted > 0) await reclaimFreelistPages(vacuum_pages);
+      const summary = { pruned, archived, deleted, reference_epoch: referenceEpoch };
+      postingStorageMaintenanceStatus.last_summary = summary;
+      postingStorageMaintenanceStatus.last_error = null;
+      return summary;
+    } catch (error) {
+      postingStorageMaintenanceStatus.last_error = String(error?.message || error);
+      throw error;
+    } finally {
+      postingStorageMaintenanceStatus.running = false;
+      postingStorageMaintenanceStatus.last_run_at = new Date().toISOString();
+      postingStorageMaintenancePromise = null;
+    }
+  })();
+  return postingStorageMaintenancePromise;
 }
 
 async function prunePostingsOutsideDateWindow(referenceEpoch = nowEpochSeconds()) {
@@ -2236,7 +2447,8 @@ async function createCanonicalPostingsTable() {
       status TEXT NOT NULL DEFAULT 'unverified',
       dead_since_epoch INTEGER,
       requires_account INTEGER,
-      hidden_reason TEXT NOT NULL DEFAULT ''
+      hidden_reason TEXT NOT NULL DEFAULT '',
+      cold_at_epoch INTEGER
     );
 
     CREATE INDEX IF NOT EXISTS idx_postings_company_name
@@ -2259,6 +2471,9 @@ async function createCanonicalPostingsTable() {
 
     CREATE INDEX IF NOT EXISTS idx_postings_hidden_last_seen_epoch
       ON Postings(hidden, last_seen_epoch);
+
+    CREATE INDEX IF NOT EXISTS idx_postings_cold_first_seen_epoch
+      ON Postings(cold_at_epoch, hidden, first_seen_epoch);
 
     CREATE INDEX IF NOT EXISTS idx_postings_state_region
       ON Postings(state_region);
@@ -2499,4 +2714,4 @@ module.exports = {
   // observable through the ordering plus the progress marks.
   getCompaniesForSync,
   markCompanySynced,
-  flushCompanySyncMarks, runAtsSync, getSyncScopeStats, pruneExpiredPostings, deleteExpiredHiddenPostings, createCanonicalPostingsTable, ensurePostingLocationStateIndex, upsertPostingsBatch, syncStatus, startSyncStallWatchdog, recoverStalledSync, createSerialFlushQueue, isRetryableWriteLockError };
+  flushCompanySyncMarks, runAtsSync, getSyncScopeStats, pruneExpiredPostings, archiveColdUntouchedPostings, deleteExpiredHiddenPostings, runPostingStorageMaintenance, getPostingStorageMaintenanceStatus, createCanonicalPostingsTable, ensurePostingLocationStateIndex, upsertPostingsBatch, syncStatus, startSyncStallWatchdog, recoverStalledSync, createSerialFlushQueue, isRetryableWriteLockError };

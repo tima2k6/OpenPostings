@@ -291,7 +291,8 @@ async function rescoreMatches({
     const rows = await db.all(
       `SELECT id, position_name, company_name, job_description
        FROM Postings
-       WHERE id > ? AND job_description IS NOT NULL AND TRIM(job_description) <> ''
+       WHERE id > ? AND cold_at_epoch IS NULL
+         AND job_description IS NOT NULL AND TRIM(job_description) <> ''
        ORDER BY id
        LIMIT ?;`,
       [lastId, batchSize]
@@ -332,6 +333,7 @@ async function rescoreMatches({
          FROM Postings p
          LEFT JOIN posting_match_scores m ON m.posting_id = p.id AND m.resume_key = ?
          WHERE p.id > ? AND p.id <= ? AND m.posting_id IS NULL
+           AND p.cold_at_epoch IS NULL
            AND p.job_description IS NOT NULL AND TRIM(p.job_description) <> ''
          ORDER BY p.id
          LIMIT ?;`,

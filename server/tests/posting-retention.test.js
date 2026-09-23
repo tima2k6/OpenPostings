@@ -8,23 +8,25 @@ const { setDb, getDb } = require("../services/runtime-context.js");
 const {
   createCanonicalPostingsTable,
   pruneExpiredPostings,
+  archiveColdUntouchedPostings,
   deleteExpiredHiddenPostings,
+  runPostingStorageMaintenance,
   upsertPostingsBatch
 } = require("../services/sync-runtime.js");
 
 const DAY_SECONDS = 24 * 60 * 60;
 const NOW = 1800000000;
 
-async function seedPosting(db, { url, firstSeen, lastSeen, hidden = 0, hiddenAt = null, description = "body" }) {
+async function seedPosting(db, { url, firstSeen, lastSeen, hidden = 0, hiddenAt = null, coldAt = null, description = "body" }) {
   await db.run(
     `
       INSERT INTO Postings (
         company_name, position_name, job_posting_url, job_description,
-        first_seen_epoch, last_seen_epoch, hidden, hidden_at_epoch
+        first_seen_epoch, last_seen_epoch, hidden, hidden_at_epoch, cold_at_epoch
       )
-      VALUES ('Acme', 'Engineer', ?, ?, ?, ?, ?, ?);
+      VALUES ('Acme', 'Engineer', ?, ?, ?, ?, ?, ?, ?);
     `,
-    [url, description, firstSeen, lastSeen === undefined ? firstSeen : lastSeen, hidden, hiddenAt]
+    [url, description, firstSeen, lastSeen === undefined ? firstSeen : lastSeen, hidden, hiddenAt, coldAt]
   );
 }
 
@@ -39,7 +41,9 @@ async function withDb(run) {
         job_posting_url TEXT NOT NULL PRIMARY KEY,
         applied INTEGER NOT NULL DEFAULT 0,
         ignored INTEGER NOT NULL DEFAULT 0,
-        review_state TEXT NOT NULL DEFAULT 'unseen'
+        review_state TEXT NOT NULL DEFAULT 'unseen',
+        viewed_at_epoch INTEGER,
+        shortlisted_at_epoch INTEGER
       );
     `);
     await run(getDb());
@@ -165,6 +169,128 @@ async function testDeleteRespectsRetentionWindow() {
   });
 }
 
+async function testColdArchiveKeepsMetadataAndClearsDerivedPayloads() {
+  await withDb(async (db) => {
+    await db.exec(`
+      CREATE TABLE posting_match_scores (
+        posting_id INTEGER NOT NULL,
+        resume_key TEXT NOT NULL,
+        PRIMARY KEY (posting_id, resume_key)
+      );
+      CREATE VIRTUAL TABLE postings_search_fts USING fts5(company_name, position_name, location);
+    `);
+    await seedPosting(db, {
+      url: "https://x/old-live",
+      firstSeen: NOW - 8 * DAY_SECONDS,
+      lastSeen: NOW - 60,
+      description: "large description"
+    });
+    const posting = await db.get(`SELECT id FROM Postings WHERE job_posting_url = 'https://x/old-live';`);
+    await db.run(`INSERT INTO posting_match_scores (posting_id, resume_key) VALUES (?, 'resume');`, [posting.id]);
+    await db.run(
+      `INSERT INTO postings_search_fts(rowid, company_name, position_name, location)
+       VALUES (?, 'Acme', 'Engineer', 'Remote');`,
+      [posting.id]
+    );
+
+    assert.strictEqual(await archiveColdUntouchedPostings(NOW), 1);
+    const row = await db.get(
+      `SELECT company_name, position_name, job_posting_url, hidden, cold_at_epoch, job_description
+       FROM Postings WHERE id = ?;`,
+      [posting.id]
+    );
+    assert.strictEqual(row.company_name, "Acme", "compact listing metadata must remain");
+    assert.strictEqual(Number(row.hidden), 0, "cold listings remain visible in metadata search");
+    assert.strictEqual(Number(row.cold_at_epoch), NOW);
+    assert.strictEqual(row.job_description, null);
+    assert.strictEqual(Number((await db.get(`SELECT COUNT(*) AS count FROM posting_match_scores;`)).count), 0);
+    assert.strictEqual(
+      Number((await db.get(`SELECT COUNT(*) AS count FROM postings_search_fts;`)).count),
+      1,
+      "metadata search remains available for cold listings"
+    );
+  });
+}
+
+async function testColdArchivePreservesRecentAndUserTouchedDescriptions() {
+  await withDb(async (db) => {
+    await seedPosting(db, { url: "https://x/recent", firstSeen: NOW - DAY_SECONDS });
+    await seedPosting(db, { url: "https://x/viewed", firstSeen: NOW - 30 * DAY_SECONDS });
+    await seedPosting(db, { url: "https://x/untouched", firstSeen: NOW - 30 * DAY_SECONDS });
+    await db.run(
+      `INSERT INTO posting_application_state
+         (job_posting_url, applied, ignored, review_state, viewed_at_epoch)
+       VALUES ('https://x/viewed', 0, 0, 'viewed', ?);`,
+      [NOW - DAY_SECONDS]
+    );
+
+    assert.strictEqual(await archiveColdUntouchedPostings(NOW), 1);
+    const rows = await db.all(
+      `SELECT job_posting_url, cold_at_epoch, job_description FROM Postings ORDER BY job_posting_url;`
+    );
+    const byUrl = new Map(rows.map((row) => [row.job_posting_url, row]));
+    assert.strictEqual(byUrl.get("https://x/untouched").job_description, null);
+    assert.strictEqual(Number(byUrl.get("https://x/untouched").cold_at_epoch), NOW);
+    assert.strictEqual(byUrl.get("https://x/recent").job_description, "body");
+    assert.strictEqual(byUrl.get("https://x/viewed").job_description, "body");
+  });
+}
+
+async function testColdArchiveIsBoundedAndSyncDoesNotRehydrateIt() {
+  await withDb(async (db) => {
+    for (let index = 0; index < 5; index += 1) {
+      await seedPosting(db, {
+        url: `https://x/cold/${index}`,
+        firstSeen: NOW - 30 * DAY_SECONDS,
+        lastSeen: NOW - 60
+      });
+    }
+    assert.strictEqual(await archiveColdUntouchedPostings(NOW, { max_rows: 2 }), 2);
+    assert.strictEqual(Number((await db.get(`SELECT COUNT(*) AS count FROM Postings WHERE cold_at_epoch IS NOT NULL;`)).count), 2);
+
+    const cold = await db.get(`SELECT job_posting_url FROM Postings WHERE cold_at_epoch IS NOT NULL LIMIT 1;`);
+    await upsertPostingsBatch(
+      [{
+        company_name: "Acme",
+        position_name: "Engineer",
+        job_posting_url: cold.job_posting_url,
+        job_description: "sync tried to restore this"
+      }],
+      NOW
+    );
+    const row = await db.get(`SELECT job_description FROM Postings WHERE job_posting_url = ?;`, [cold.job_posting_url]);
+    assert.strictEqual(row.job_description, null, "normal sync must not rehydrate a cold posting");
+  });
+}
+
+async function testIndependentMaintenanceRunsEveryPhaseWithBounds() {
+  await withDb(async (db) => {
+    await seedPosting(db, {
+      url: "https://x/stale-visible",
+      firstSeen: NOW - 30 * DAY_SECONDS,
+      lastSeen: NOW - 3 * DAY_SECONDS
+    });
+    await seedPosting(db, {
+      url: "https://x/old-live",
+      firstSeen: NOW - 30 * DAY_SECONDS,
+      lastSeen: NOW - 60
+    });
+    await seedPosting(db, {
+      url: "https://x/expired-hidden",
+      firstSeen: NOW - 30 * DAY_SECONDS,
+      lastSeen: NOW - 20 * DAY_SECONDS,
+      hidden: 1,
+      hiddenAt: NOW - 8 * DAY_SECONDS
+    });
+
+    const summary = await runPostingStorageMaintenance({ reference_epoch: NOW, max_rows: 1 });
+    assert.deepStrictEqual(
+      { pruned: summary.pruned, archived: summary.archived, deleted: summary.deleted },
+      { pruned: 1, archived: 1, deleted: 1 }
+    );
+  });
+}
+
 async function testDeletePreservesUserReviewedPostings() {
   await withDb(async (db) => {
     const protectedPostings = [
@@ -273,6 +399,10 @@ async function main() {
   await testPruneKeepsPostingsStillListed();
   await testResightRevivesHiddenPosting();
   await testDeleteRespectsRetentionWindow();
+  await testColdArchiveKeepsMetadataAndClearsDerivedPayloads();
+  await testColdArchivePreservesRecentAndUserTouchedDescriptions();
+  await testColdArchiveIsBoundedAndSyncDoesNotRehydrateIt();
+  await testIndependentMaintenanceRunsEveryPhaseWithBounds();
   await testDeletePreservesUserReviewedPostings();
   await testDeleteClearsDerivedRows();
   await testDeleteChunksBeyondOneBatch();

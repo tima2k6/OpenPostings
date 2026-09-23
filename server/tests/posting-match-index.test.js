@@ -525,6 +525,23 @@ async function testMatchScoringStatusReportsProgressWithoutScanningPostings() {
   });
 }
 
+async function testColdPostingsAreNotScored() {
+  await withDb(async (db) => {
+    await saveApplicantDocument({ kind: "resume", file_name: "resume.txt", content: Buffer.from(RESUME, "utf8") });
+    await seedPosting(db, { url: "https://x/hot", position: "Hot Role", description: HIGH_MATCH_DESCRIPTION });
+    await seedPosting(db, { url: "https://x/cold", position: "Cold Role", description: HIGH_MATCH_DESCRIPTION });
+    await db.run(`UPDATE Postings SET cold_at_epoch = ? WHERE job_posting_url = 'https://x/cold';`, [
+      Math.floor(Date.now() / 1000)
+    ]);
+
+    await rescoreMatches({ rebuild: true });
+    const rows = await db.all(`SELECT p.job_posting_url
+      FROM posting_match_scores m JOIN Postings p ON p.id = m.posting_id
+      ORDER BY p.job_posting_url;`);
+    assert.deepStrictEqual(rows.map((row) => row.job_posting_url), ["https://x/hot"]);
+  });
+}
+
 async function main() {
   testTooFewRequirementsWithholdsThePercentRatherThanCoinFlipping();
   testComputeMatchForPostingMatchesTheApplicationFormula();
@@ -538,6 +555,7 @@ async function main() {
   await testGapSweepIsANoOpDuringARebuild();
   await testMatchStatusDistinguishesScoredPendingAndNoRequirements();
   await testMatchScoringStatusReportsProgressWithoutScanningPostings();
+  await testColdPostingsAreNotScored();
   console.log("posting-match-index tests passed");
 }
 

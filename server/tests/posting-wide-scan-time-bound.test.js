@@ -15,6 +15,10 @@
 // test would pass for the reason the other file already covers.
 process.env.POSTINGS_WIDE_SCAN_MAX_CANDIDATES = "1000000";
 process.env.POSTINGS_WIDE_SCAN_MAX_MILLIS = "1";
+// Production keeps a three-second floor so a request that waited in the queue still gets a
+// fair chance to fill a page. Pin it to the same tiny value here: the cold-retention covering
+// index makes this in-memory fixture fast enough to finish under the production floor.
+process.env.POSTINGS_WIDE_SCAN_MIN_MILLIS = "1";
 
 const assert = require("assert");
 const fs = require("fs");

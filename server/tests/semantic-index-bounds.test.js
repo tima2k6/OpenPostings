@@ -17,7 +17,8 @@ async function testBoundedIndexingResumesFromPersistedState() {
         position_name TEXT,
         company_name TEXT,
         job_description TEXT,
-        hidden INTEGER NOT NULL DEFAULT 0
+        hidden INTEGER NOT NULL DEFAULT 0,
+        cold_at_epoch INTEGER
       );
     `);
     for (let id = 1; id <= 5; id += 1) {
@@ -27,6 +28,10 @@ async function testBoundedIndexingResumesFromPersistedState() {
         [id, `Role ${id}`, "Example", `alphaword duties for posting ${id}`]
       );
     }
+    await db.run(
+      `INSERT INTO Postings (id, position_name, company_name, job_description, cold_at_epoch)
+       VALUES (6, 'Cold Role', 'Example', 'alphaword archived duties', 1800000000);`
+    );
 
     const first = await rebuildSemanticIndex({ batch_size: 2, max_batches: 1 });
     assert.deepStrictEqual(

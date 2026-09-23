@@ -495,13 +495,14 @@ async function runDescriptionBackfill({ limit = 200, concurrency = 4, refresh_al
     refresh_all
       ? `SELECT id, job_posting_url, locations_json, pay_min, pay_max
          FROM Postings
-         WHERE hidden = 0 AND (description_fetched_at IS NULL OR description_fetched_at < ?)
+         WHERE hidden = 0 AND cold_at_epoch IS NULL
+           AND (description_fetched_at IS NULL OR description_fetched_at < ?)
            AND (description_fetch_failed_at IS NULL OR description_fetch_failed_at < ?)
          ORDER BY (description_fetched_at IS NOT NULL), last_seen_epoch DESC
          LIMIT ?;`
       : `SELECT id, job_posting_url, locations_json, pay_min, pay_max
          FROM Postings
-         WHERE hidden = 0 AND description_fetched_at IS NULL
+         WHERE hidden = 0 AND cold_at_epoch IS NULL AND description_fetched_at IS NULL
            AND (job_description IS NULL OR TRIM(job_description) = '')
            AND (description_fetch_failed_at IS NULL OR description_fetch_failed_at < ?)
          ORDER BY last_seen_epoch DESC

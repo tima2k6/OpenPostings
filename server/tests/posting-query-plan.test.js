@@ -48,7 +48,9 @@ async function withSeededDb(run) {
         job_posting_url TEXT NOT NULL PRIMARY KEY,
         applied INTEGER NOT NULL DEFAULT 0,
         ignored INTEGER NOT NULL DEFAULT 0,
-        review_state TEXT NOT NULL DEFAULT 'unseen'
+        review_state TEXT NOT NULL DEFAULT 'unseen',
+        viewed_at_epoch INTEGER,
+        shortlisted_at_epoch INTEGER
       );
     `);
     await seed(db);
@@ -128,7 +130,9 @@ async function testRetentionSweepUsesIndex() {
            WHERE state.job_posting_url = p.job_posting_url
              AND (COALESCE(state.applied, 0) = 1
                OR COALESCE(state.ignored, 0) = 1
-               OR COALESCE(state.review_state, 'unseen') <> 'unseen')
+               OR COALESCE(state.review_state, 'unseen') <> 'unseen'
+               OR state.viewed_at_epoch IS NOT NULL
+               OR state.shortlisted_at_epoch IS NOT NULL)
          )`,
       [NOW]
     );
@@ -137,6 +141,23 @@ async function testRetentionSweepUsesIndex() {
       `retention sweep should use the hidden_at index, got: ${plan}`
     );
     assert.ok(!plan.includes("SCAN Postings"), `retention sweep must not scan the table, got: ${plan}`);
+  });
+}
+
+async function testColdSweepUsesIndex() {
+  await withSeededDb(async (db) => {
+    const plan = await planFor(
+      db,
+      `SELECT p.id
+       FROM Postings p
+       WHERE p.hidden = 0 AND p.cold_at_epoch IS NULL AND p.first_seen_epoch < ?`,
+      [NOW]
+    );
+    assert.ok(
+      plan.includes("idx_postings_cold_first_seen_epoch"),
+      `cold retention sweep should use its covering index, got: ${plan}`
+    );
+    assert.ok(!plan.includes("SCAN Postings"), `cold retention sweep must not scan the table, got: ${plan}`);
   });
 }
 
@@ -150,6 +171,7 @@ async function main() {
   await testFirstSeenSortStreamsFromIndex();
   await testPrunePredicateUsesIndex();
   await testRetentionSweepUsesIndex();
+  await testColdSweepUsesIndex();
   console.log("posting-query-plan tests passed");
 }
 
